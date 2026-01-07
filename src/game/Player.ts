@@ -1,7 +1,10 @@
 // Player entity for CS-CLI
 
 import { Vector3 } from '../engine/math/Vector3.js';
-import { WeaponState, WeaponSlot, createWeaponState, canFireWeapon, fireWeapon, startReload, updateReload } from './Weapon.js';
+import { WeaponState, WeaponSlot, createWeaponState, canFireWeapon, fireWeapon, startReload, updateReload, WEAPONS } from './Weapon.js';
+import { TeamId } from './Team.js';
+import { PlayerEconomy, DEFAULT_ECONOMY_CONFIG } from './Economy.js';
+import { getDroppedWeaponManager } from './DroppedWeapon.js';
 
 export interface PlayerConfig {
   maxHealth: number;
@@ -45,8 +48,14 @@ export class Player {
   public deaths: number = 0;
 
   // Team
-  public team: string = 'DM';
+  public team: TeamId = 'SPECTATOR';
   public name: string = 'Player';
+
+  // Economy
+  public economy: PlayerEconomy;
+
+  // Saved inventory for round transitions
+  private savedWeapons: Map<WeaponSlot, WeaponState> | null = null;
 
   // Cheats
   public godMode: boolean = false;
@@ -61,6 +70,9 @@ export class Player {
     this.health = config.maxHealth;
     this.armor = 0;
     this.isAlive = true;
+
+    // Initialize economy
+    this.economy = new PlayerEconomy(DEFAULT_ECONOMY_CONFIG);
 
     // Start with knife and pistol
     this.weapons = new Map();
@@ -143,7 +155,7 @@ export class Player {
     this.deaths++;
   }
 
-  respawn(spawnPosition: Vector3, spawnAngle: number): void {
+  respawn(spawnPosition: Vector3, spawnAngle: number, keepInventory: boolean = false): void {
     this.position = spawnPosition.clone();
     this.position.y += this.config.eyeHeight;
     this.yaw = spawnAngle;
@@ -154,12 +166,141 @@ export class Player {
     this.armor = 0;
     this.isAlive = true;
 
-    // Reset ammo
+    if (keepInventory && this.savedWeapons) {
+      // Restore saved inventory
+      this.weapons = new Map(this.savedWeapons);
+      this.savedWeapons = null;
+    } else if (!keepInventory) {
+      // Reset to default loadout
+      this.weapons.clear();
+      this.weapons.set(2, createWeaponState('pistol'));
+      this.weapons.set(3, createWeaponState('knife'));
+    }
+
+    // Reset ammo and reload state
     this.weapons.forEach(weapon => {
       weapon.currentAmmo = weapon.def.magazineSize;
       weapon.reserveAmmo = weapon.def.reserveAmmo;
       weapon.isReloading = false;
     });
+
+    // Switch to best weapon
+    if (this.weapons.has(1)) {
+      this.currentSlot = 1;
+    } else {
+      this.currentSlot = 2;
+    }
+  }
+
+  // Save current inventory (for round transitions when alive)
+  saveInventory(): void {
+    this.savedWeapons = new Map();
+    for (const [slot, weapon] of this.weapons) {
+      // Clone the weapon state
+      this.savedWeapons.set(slot, {
+        ...weapon,
+        def: weapon.def,
+      });
+    }
+  }
+
+  // Clear saved inventory
+  clearSavedInventory(): void {
+    this.savedWeapons = null;
+  }
+
+  // Clear current inventory to defaults
+  resetInventory(): void {
+    this.weapons.clear();
+    this.weapons.set(2, createWeaponState('pistol'));
+    this.weapons.set(3, createWeaponState('knife'));
+    this.currentSlot = 2;
+  }
+
+  // Drop current weapon at position (returns true if dropped)
+  dropCurrentWeapon(now: number): boolean {
+    const weapon = this.getCurrentWeapon();
+    if (!weapon) return false;
+
+    // Can't drop knife
+    if (weapon.def.type === 'knife') return false;
+
+    const slot = weapon.def.slot;
+    const dropPos = this.getFeetPosition();
+
+    // Drop the weapon
+    getDroppedWeaponManager().dropWeaponState(weapon, dropPos, now);
+
+    // Remove from inventory
+    this.weapons.delete(slot);
+
+    // Switch to another weapon
+    if (this.weapons.has(2)) {
+      this.currentSlot = 2;
+    } else {
+      this.currentSlot = 3;
+    }
+
+    return true;
+  }
+
+  // Drop all droppable weapons on death
+  dropAllWeapons(now: number): void {
+    const dropPos = this.getFeetPosition();
+    const dropManager = getDroppedWeaponManager();
+
+    for (const [slot, weapon] of this.weapons) {
+      // Don't drop knife
+      if (weapon.def.type === 'knife') continue;
+
+      dropManager.dropWeaponState(weapon, dropPos, now);
+    }
+  }
+
+  // Drop weapon in a specific slot (for picking up a weapon in that slot)
+  dropWeaponInSlot(slot: WeaponSlot, now: number): boolean {
+    const weapon = this.weapons.get(slot);
+    if (!weapon) return false;
+
+    // Can't drop knife
+    if (weapon.def.type === 'knife') return false;
+
+    const dropPos = this.getFeetPosition();
+    getDroppedWeaponManager().dropWeaponState(weapon, dropPos, now);
+    this.weapons.delete(slot);
+    return true;
+  }
+
+  // Pick up a weapon (add to inventory)
+  pickupWeapon(weapon: WeaponState): void {
+    this.weapons.set(weapon.def.slot, weapon);
+    this.currentSlot = weapon.def.slot;
+  }
+
+  // Check if player can afford a weapon
+  canAfford(weaponName: string): boolean {
+    const weapon = WEAPONS[weaponName.toLowerCase()];
+    if (!weapon) return false;
+    return this.economy.canAfford(weapon.cost);
+  }
+
+  // Buy a weapon (returns true if purchased)
+  buyWeapon(weaponName: string): boolean {
+    const weaponDef = WEAPONS[weaponName.toLowerCase()];
+    if (!weaponDef) return false;
+
+    if (!this.economy.spendMoney(weaponDef.cost)) {
+      return false;
+    }
+
+    this.giveWeapon(weaponName);
+    return true;
+  }
+
+  // Award kill credits
+  awardKill(weaponType: string): number {
+    this.kills++;
+    return this.economy.awardKill(weaponType);
   }
 
   getEyePosition(): Vector3 {

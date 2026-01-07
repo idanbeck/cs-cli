@@ -6,6 +6,8 @@ import { Player } from '../game/Player.js';
 import { AABB } from '../maps/MapFormat.js';
 import { SpawnPoint } from '../maps/MapFormat.js';
 import { rayAABBIntersection } from '../physics/Collision.js';
+import { TeamId, getTeamManager } from '../game/Team.js';
+import { getDroppedWeaponManager } from '../game/DroppedWeapon.js';
 
 // Callback for tracer spawning
 export type TracerCallback = (origin: Vector3, endpoint: Vector3) => void;
@@ -19,7 +21,10 @@ export type BotSoundCallback = (soundType: string, position: Vector3) => void;
 export class BotManager {
   private bots: Bot[] = [];
   private spawnPoints: Vector3[] = [];
+  private tSpawnPoints: Vector3[] = [];
+  private ctSpawnPoints: Vector3[] = [];
   private respawnDelay: number = 3000; // ms
+  private respawnEnabled: boolean = true; // Disable for round-based mode
   private onTracerSpawn: TracerCallback | null = null;
   private onKill: KillCallback | null = null;
   private onPlayerDamage: PlayerDamageCallback | null = null;
@@ -50,6 +55,129 @@ export class BotManager {
   // Initialize with spawn points from map
   setSpawnPoints(spawns: SpawnPoint[]): void {
     this.spawnPoints = spawns.map(s => new Vector3(s.position[0], s.position[1], s.position[2]));
+  }
+
+  // Set spawn points by team
+  setTeamSpawnPoints(spawns: SpawnPoint[]): void {
+    this.tSpawnPoints = [];
+    this.ctSpawnPoints = [];
+    this.spawnPoints = [];
+
+    for (const s of spawns) {
+      const pos = new Vector3(s.position[0], s.position[1], s.position[2]);
+      if (s.team === 'T') {
+        this.tSpawnPoints.push(pos);
+      } else if (s.team === 'CT') {
+        this.ctSpawnPoints.push(pos);
+      } else {
+        // DM spawns go to both
+        this.spawnPoints.push(pos);
+        this.tSpawnPoints.push(pos);
+        this.ctSpawnPoints.push(pos);
+      }
+    }
+  }
+
+  // Enable/disable automatic respawns (disable for round-based)
+  setRespawnEnabled(enabled: boolean): void {
+    this.respawnEnabled = enabled;
+  }
+
+  // Get spawn points for a team
+  getSpawnPointsForTeam(team: TeamId): Vector3[] {
+    if (team === 'T') return this.tSpawnPoints.length > 0 ? this.tSpawnPoints : this.spawnPoints;
+    if (team === 'CT') return this.ctSpawnPoints.length > 0 ? this.ctSpawnPoints : this.spawnPoints;
+    return this.spawnPoints;
+  }
+
+  // Assign bots to teams (balances between T and CT)
+  assignBotsToTeams(playerName: string): void {
+    const teamManager = getTeamManager();
+    const botNames = this.bots.map(b => b.name);
+
+    // Auto-balance teams (player + bots)
+    teamManager.autoBalance(playerName, botNames);
+
+    // Update bot team assignments
+    for (const bot of this.bots) {
+      const team = teamManager.getTeam(bot.name);
+      if (team) {
+        bot.team = team;
+      }
+    }
+  }
+
+  // Execute buy phase for all bots
+  executeBotBuyPhase(): void {
+    for (const bot of this.bots) {
+      if (bot.isAlive) {
+        bot.executeBuyPhase();
+      }
+    }
+  }
+
+  // Respawn all bots for a new round
+  respawnAllBots(now: number): void {
+    for (const bot of this.bots) {
+      const spawnPoints = this.getSpawnPointsForTeam(bot.team);
+      if (spawnPoints.length > 0) {
+        const spawnIndex = Math.floor(Math.random() * spawnPoints.length);
+        const spawn = spawnPoints[spawnIndex];
+        // keepInventory = true if bot was alive, false if dead
+        bot.respawn(spawn, Math.random() * Math.PI * 2, bot.isAlive);
+        bot.setState('idle', now);
+      }
+    }
+  }
+
+  // Reset bots for a new match (reset economy, inventory)
+  resetBotsForMatch(): void {
+    for (const bot of this.bots) {
+      bot.economy.resetForMatch();
+      bot.resetInventory();
+      bot.kills = 0;
+      bot.deaths = 0;
+    }
+  }
+
+  // Award round end money to all bots
+  awardBotRoundMoney(winningTeam: TeamId): void {
+    for (const bot of this.bots) {
+      if (bot.team === winningTeam) {
+        bot.economy.awardRoundWin();
+      } else {
+        bot.economy.awardRoundLoss();
+      }
+    }
+  }
+
+  // Handle bot death with weapon drops
+  handleBotDeathWithDrops(bot: Bot, now: number): void {
+    if (!bot.isAlive) return;
+
+    // Drop weapons before dying
+    bot.dropAllWeapons(now);
+
+    // Mark as dead (don't call die() as it increments deaths, which is done elsewhere)
+    bot.isAlive = false;
+    bot.setState('dead', now);
+
+    // Play death sound
+    if (this.onBotSound) {
+      this.onBotSound('bot_death', bot.position);
+    }
+  }
+
+  // Get alive count per team
+  getAliveCountByTeam(): { T: number; CT: number } {
+    let t = 0, ct = 0;
+    for (const bot of this.bots) {
+      if (bot.isAlive) {
+        if (bot.team === 'T') t++;
+        else if (bot.team === 'CT') ct++;
+      }
+    }
+    return { T: t, CT: ct };
   }
 
   // Spawn a new bot
@@ -101,19 +229,30 @@ export class BotManager {
   }
 
   // Update all bots
-  update(player: Player, colliders: AABB[], now: number, deltaTime: number): void {
+  update(
+    player: Player,
+    colliders: AABB[],
+    now: number,
+    deltaTime: number,
+    isFrozen: boolean = false,
+    teamMode: boolean = false
+  ): void {
     const ctx: BotThinkContext = {
       player,
       allBots: this.bots,
       colliders,
       now,
       deltaTime,
+      isFrozen,
+      teamMode,
     };
 
     for (const bot of this.bots) {
       if (!bot.isAlive) {
-        // Handle respawn
-        this.handleRespawn(bot, now);
+        // Handle respawn (only if enabled)
+        if (this.respawnEnabled) {
+          this.handleRespawn(bot, now);
+        }
         continue;
       }
 
@@ -129,9 +268,9 @@ export class BotManager {
       // Update weapon state
       bot.updateWeapon(now);
 
-      // Handle bot shooting (check if bot just fired)
-      if (bot.lastFireTime === now) {
-        this.handleBotShot(bot, player, colliders, now);
+      // Handle bot shooting (check if bot just fired) - only if not frozen
+      if (!isFrozen && bot.lastFireTime === now) {
+        this.handleBotShot(bot, player, colliders, now, teamMode);
       }
     }
   }
@@ -176,12 +315,15 @@ export class BotManager {
   }
 
   // Handle a bot shooting - check hits and spawn tracers
-  private handleBotShot(bot: Bot, player: Player, colliders: AABB[], now: number): void {
+  private handleBotShot(bot: Bot, player: Player, colliders: AABB[], now: number, teamMode: boolean = false): void {
     const weapon = bot.getCurrentWeapon();
     if (!weapon) return;
 
     const target = bot.target;
     if (!target || !target.isAlive) return;
+
+    // In team mode, don't shoot teammates
+    if (teamMode && !bot.isEnemy(target)) return;
 
     const origin = bot.getEyePosition();
     const targetPos = target.getEyePosition();

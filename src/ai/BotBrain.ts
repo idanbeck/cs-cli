@@ -16,16 +16,25 @@ export interface BotThinkContext {
   colliders: AABB[];           // Map collision
   now: number;                 // Current timestamp
   deltaTime: number;           // Time since last frame
+  isFrozen?: boolean;          // Whether bots are frozen (freeze phase)
+  teamMode?: boolean;          // Whether team mode is active (filter targets)
 }
 
 export class BotBrain {
   // Main think function - called every frame for each bot
   static think(bot: Bot, ctx: BotThinkContext): Vector3 {
-    const { player, allBots, colliders, now, deltaTime } = ctx;
+    const { player, allBots, colliders, now, deltaTime, isFrozen, teamMode } = ctx;
 
     // Don't think if dead
     if (!bot.isAlive) {
       bot.setState('dead', now);
+      return Vector3.zero();
+    }
+
+    // If frozen (freeze phase), no movement or combat
+    if (isFrozen) {
+      bot.setState('idle', now);
+      bot.moveTarget = null;
       return Vector3.zero();
     }
 
@@ -36,8 +45,8 @@ export class BotBrain {
     }
     bot.lastThinkTime = now;
 
-    // Find closest visible target (player or other bot)
-    const { target: visibleTarget, canSee } = this.findClosestTarget(bot, player, allBots, colliders);
+    // Find closest visible target (player or other bot), respecting team mode
+    const { target: visibleTarget, canSee } = this.findClosestTarget(bot, player, allBots, colliders, teamMode);
 
     // Update target tracking
     if (canSee && visibleTarget) {
@@ -68,28 +77,35 @@ export class BotBrain {
     bot: Bot,
     player: Player,
     allBots: Bot[],
-    colliders: AABB[]
+    colliders: AABB[],
+    teamMode?: boolean
   ): { target: Player | null; canSee: boolean } {
     let closestTarget: Player | null = null;
     let closestDistance = Infinity;
 
-    // Check player
+    // Check player - in team mode, only target if enemy
     if (player.isAlive) {
-      const canSeePlayer = bot.canSeePlayer(player, (from, to) => {
-        return this.hasLineOfSight(from, to, colliders);
-      });
-      if (canSeePlayer) {
-        const dist = Vector3.sub(player.position, bot.position).length();
-        if (dist < closestDistance) {
-          closestDistance = dist;
-          closestTarget = player;
+      const isValidTarget = !teamMode || bot.isEnemy(player);
+      if (isValidTarget) {
+        const canSeePlayer = bot.canSeePlayer(player, (from, to) => {
+          return this.hasLineOfSight(from, to, colliders);
+        });
+        if (canSeePlayer) {
+          const dist = Vector3.sub(player.position, bot.position).length();
+          if (dist < closestDistance) {
+            closestDistance = dist;
+            closestTarget = player;
+          }
         }
       }
     }
 
-    // Check other bots
+    // Check other bots - in team mode, only target enemies
     for (const otherBot of allBots) {
       if (otherBot === bot || !otherBot.isAlive) continue;
+
+      // In team mode, skip teammates
+      if (teamMode && !bot.isEnemy(otherBot)) continue;
 
       const canSeeBot = bot.canSeePlayer(otherBot, (from, to) => {
         return this.hasLineOfSight(from, to, colliders);

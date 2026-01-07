@@ -18,6 +18,8 @@ export interface WeaponDef {
   pellets?: number;      // For shotgun
   isAutomatic: boolean;
   headshotMultiplier: number;
+  cost: number;          // Purchase price
+  killReward: number;    // Credits awarded for kill with this weapon
 }
 
 export interface WeaponState {
@@ -46,6 +48,8 @@ export const WEAPONS: Record<string, WeaponDef> = {
     moveSpeed: 1.0,
     isAutomatic: false,
     headshotMultiplier: 1.0,
+    cost: 0,
+    killReward: 1500,
   },
 
   pistol: {
@@ -62,6 +66,8 @@ export const WEAPONS: Record<string, WeaponDef> = {
     moveSpeed: 1.0,
     isAutomatic: false,
     headshotMultiplier: 2.0,
+    cost: 200,
+    killReward: 300,
   },
 
   rifle: {
@@ -78,6 +84,8 @@ export const WEAPONS: Record<string, WeaponDef> = {
     moveSpeed: 0.9,
     isAutomatic: true,
     headshotMultiplier: 2.5,
+    cost: 2700,
+    killReward: 300,
   },
 
   shotgun: {
@@ -95,6 +103,8 @@ export const WEAPONS: Record<string, WeaponDef> = {
     pellets: 8,
     isAutomatic: false,
     headshotMultiplier: 1.5,
+    cost: 1200,
+    killReward: 900,
   },
 
   sniper: {
@@ -111,8 +121,26 @@ export const WEAPONS: Record<string, WeaponDef> = {
     moveSpeed: 0.8,
     isAutomatic: false,
     headshotMultiplier: 4.0,
+    cost: 4750,
+    killReward: 100,
   },
 };
+
+// Helper to get weapon cost
+export function getWeaponCost(weaponName: string): number {
+  const def = WEAPONS[weaponName.toLowerCase()];
+  return def?.cost ?? 0;
+}
+
+// Helper to get all buyable weapons (excludes knife)
+export function getBuyableWeapons(): WeaponDef[] {
+  return Object.values(WEAPONS).filter(w => w.cost > 0);
+}
+
+// Helper to get weapons by slot
+export function getWeaponsBySlot(slot: WeaponSlot): WeaponDef[] {
+  return Object.values(WEAPONS).filter(w => w.slot === slot);
+}
 
 export function createWeaponState(weaponName: string): WeaponState {
   const def = WEAPONS[weaponName];

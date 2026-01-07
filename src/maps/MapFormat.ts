@@ -31,11 +31,24 @@ export interface LightDef {
   radius: number;
 }
 
+// Buy zone definition - area where players can purchase weapons
+export interface BuyZoneDef {
+  position: [number, number, number];
+  size: [number, number, number];
+  team: 'T' | 'CT';
+}
+
+// Game mode type
+export type MapGameMode = 'deathmatch' | 'competitive';
+
 // Complete map definition
 export interface MapDef {
   name: string;
   author?: string;
   description?: string;
+
+  // Supported game modes
+  supportedModes?: MapGameMode[];
 
   // World bounds (for AI navigation, etc.)
   bounds: {
@@ -55,6 +68,9 @@ export interface MapDef {
 
   // Spawn points
   spawns: SpawnPoint[];
+
+  // Buy zones (optional, for competitive mode)
+  buyZones?: BuyZoneDef[];
 
   // Lights (optional)
   lights?: LightDef[];

@@ -1,6 +1,8 @@
 // Bot entity - AI-controlled player
 import { Vector3 } from '../engine/math/Vector3.js';
 import { Player, PlayerConfig, DEFAULT_PLAYER_CONFIG } from '../game/Player.js';
+import { TeamId, getTeamManager } from '../game/Team.js';
+import { WEAPONS, getBuyableWeapons, WeaponDef } from '../game/Weapon.js';
 
 export type BotState = 'idle' | 'patrol' | 'chase' | 'attack' | 'flee' | 'dead';
 export type BotDifficulty = 'easy' | 'medium' | 'hard';
@@ -203,6 +205,87 @@ export class Bot extends Player {
       const j = Math.floor(Math.random() * (i + 1));
       [this.patrolWaypoints[i], this.patrolWaypoints[j]] =
         [this.patrolWaypoints[j], this.patrolWaypoints[i]];
+    }
+  }
+
+  // Check if another player is an enemy
+  isEnemy(other: Player): boolean {
+    // Same entity check
+    if (other === this) return false;
+
+    // Use team manager for team mode
+    const teamManager = getTeamManager();
+    return teamManager.areEnemies(this.name, other.name);
+  }
+
+  // Check if another player is a teammate
+  isTeammate(other: Player): boolean {
+    if (other === this) return false;
+    const teamManager = getTeamManager();
+    return teamManager.areTeammates(this.name, other.name);
+  }
+
+  // Make buy decision based on money and current loadout
+  decidePurchase(): string | null {
+    const money = this.economy.getMoney();
+
+    // Check if we already have a primary weapon (slot 1)
+    const hasPrimary = this.weapons.has(1);
+
+    // Get buyable weapons sorted by cost descending
+    const weapons = getBuyableWeapons()
+      .filter(w => w.slot === 1) // Only primary weapons
+      .sort((a, b) => b.cost - a.cost);
+
+    // Buy strategy based on difficulty
+    if (!hasPrimary) {
+      // Need a primary weapon
+      // Hard bots: buy best affordable
+      // Medium bots: buy mid-tier
+      // Easy bots: random affordable weapon
+
+      let candidates: WeaponDef[];
+
+      switch (this.botConfig.difficulty) {
+        case 'hard':
+          // Buy the best weapon we can afford
+          candidates = weapons.filter(w => w.cost <= money);
+          break;
+
+        case 'medium':
+          // Prefer mid-tier weapons (rifle, shotgun)
+          candidates = weapons.filter(w => w.cost <= money && w.cost <= 3000);
+          if (candidates.length === 0) {
+            candidates = weapons.filter(w => w.cost <= money);
+          }
+          break;
+
+        case 'easy':
+        default:
+          // Random affordable weapon, prefer cheaper
+          candidates = weapons.filter(w => w.cost <= money && w.cost <= 1500);
+          if (candidates.length === 0) {
+            candidates = weapons.filter(w => w.cost <= money);
+          }
+          break;
+      }
+
+      if (candidates.length > 0) {
+        // Pick from candidates (favor better weapons for harder bots)
+        const index = this.botConfig.difficulty === 'hard' ? 0 :
+                      Math.floor(Math.random() * candidates.length);
+        return candidates[index].name.toLowerCase();
+      }
+    }
+
+    return null; // No purchase
+  }
+
+  // Execute buy decision
+  executeBuyPhase(): void {
+    const weaponToBuy = this.decidePurchase();
+    if (weaponToBuy) {
+      this.buyWeapon(weaponToBuy);
     }
   }
 }

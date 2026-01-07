@@ -16,11 +16,18 @@ import { Player } from './game/Player.js';
 import { WeaponSlot } from './game/Weapon.js';
 import { getWeaponSprite } from './game/WeaponSprites.js';
 import { BotManager } from './ai/BotManager.js';
-import { GameMode, DEFAULT_DEATHMATCH_CONFIG } from './game/GameMode.js';
+import { GameMode, DEFAULT_DEATHMATCH_CONFIG, DEFAULT_COMPETITIVE_CONFIG, GameModeType } from './game/GameMode.js';
 import { getSoundEngine, playSound, playSoundAt, SoundType } from './audio/SoundEngine.js';
 import { getGameConsole, consoleLog, consoleWarn, consoleError, consoleDebug } from './ui/Console.js';
+import { getMainMenu, MainMenu } from './ui/MainMenu.js';
+import { getBuyMenu, BuyMenu } from './ui/BuyMenu.js';
+import { getTeamManager, resetTeamManager, TeamId } from './game/Team.js';
+import { getDroppedWeaponManager, resetDroppedWeaponManager } from './game/DroppedWeapon.js';
+
+type AppMode = 'menu' | 'playing';
 
 interface GameState {
+  appMode: AppMode;
   fps: number;
   frameTime: number;
   cameraPos: Vector3;
@@ -33,6 +40,8 @@ interface GameState {
   reserveAmmo: number;
   weaponName: string;
   isReloading: boolean;
+  money: number;
+  team: TeamId;
 }
 
 interface KeyTiming {
@@ -71,6 +80,7 @@ function Game() {
   });
 
   const [gameState, setGameState] = useState<GameState>({
+    appMode: 'menu',
     fps: 0,
     frameTime: 0,
     cameraPos: new Vector3(0, 2, 5),
@@ -83,7 +93,21 @@ function Game() {
     reserveAmmo: 36,
     weaponName: 'Pistol',
     isReloading: false,
+    money: 800,
+    team: 'SPECTATOR',
   });
+
+  // App mode ref for quick access
+  const appModeRef = useRef<AppMode>('menu');
+
+  // Selected game mode type
+  const gameModeTypeRef = useRef<GameModeType>('deathmatch');
+
+  // Main menu
+  const [mainMenu] = useState(() => getMainMenu());
+
+  // Buy menu
+  const [buyMenu] = useState(() => getBuyMenu());
 
   // Player ref
   const playerRef = useRef<Player>(new Player());
@@ -131,11 +155,11 @@ function Game() {
     return manager;
   });
 
-  // Game mode
-  const [gameMode] = useState(() => new GameMode({
+  // Game mode ref (can be reconfigured when starting a new game)
+  const gameModeRef = useRef<GameMode>(new GameMode({
     ...DEFAULT_DEATHMATCH_CONFIG,
-    killLimit: 15,      // First to 15 kills wins
-    timeLimit: 300,     // 5 minutes
+    roundsToWin: 10,    // First to 10 round wins
+    roundTime: 120,     // 2 minutes per round
     warmupTime: 3,      // 3 seconds warmup
   }));
 
@@ -192,7 +216,7 @@ function Game() {
       renderer.spawnTracer(origin, endpoint, 150);
     });
     botManager.setKillCallback((killer, victim, weapon, headshot) => {
-      gameMode.registerKill(killer, victim, weapon, headshot, performance.now());
+      gameModeRef.current.registerKill(killer, victim, weapon, headshot, performance.now());
       consoleLog(`${killer} killed ${victim} with ${weapon}${headshot ? ' (headshot)' : ''}`);
     });
     botManager.setPlayerDamageCallback((attackerPos, damage, headshot) => {
@@ -207,8 +231,9 @@ function Game() {
     // Spawn more bots for larger map
     botManager.spawnBots(6, 'medium'); // Spawn 6 medium difficulty bots
 
-    // Start game mode
-    gameMode.start(performance.now());
+    // Set up main menu display (don't start game yet)
+    renderer.setMainMenu(mainMenu, true);
+    renderer.setBuyMenu(buyMenu);
 
     // Register console commands
     const gameConsole = getGameConsole();
@@ -344,7 +369,7 @@ function Game() {
       renderer.clearObjects();
       botManager.clear();
     };
-  }, [renderer, scene, loadedMap, botManager, gameMode]);
+  }, [renderer, scene, loadedMap, botManager]);
 
   // Track if we should exit
   const exitingRef = useRef(false);
@@ -386,6 +411,101 @@ function Game() {
         return;
       }
 
+      // Main menu handling
+      if (appModeRef.current === 'menu') {
+        let key = str;
+        // Map arrow keys
+        if (str === '\x1b[A') key = 'up';
+        else if (str === '\x1b[B') key = 'down';
+        else if (str === '\r') key = 'enter';
+        else if (str === '\x1b' && !str.startsWith('\x1b[')) key = 'escape';
+
+        const result = mainMenu.handleKey(key);
+        if (result.action === 'start_game' && result.mode && result.map) {
+          // Start the game with selected mode
+          appModeRef.current = 'playing';
+          gameModeTypeRef.current = result.mode;
+
+          // Configure game mode based on selection
+          const config = result.mode === 'competitive'
+            ? { ...DEFAULT_COMPETITIVE_CONFIG }
+            : { ...DEFAULT_DEATHMATCH_CONFIG, killLimit: 15, timeLimit: 300, warmupTime: 3 };
+          gameModeRef.current = new GameMode(config);
+
+          // Reset team manager
+          resetTeamManager();
+          resetDroppedWeaponManager();
+
+          // Set up teams if competitive mode
+          const isTeamMode = result.mode === 'competitive';
+          if (isTeamMode) {
+            botManager.setTeamSpawnPoints(loadedMap.spawns);
+            botManager.assignBotsToTeams(playerRef.current.name);
+            const playerTeam = getTeamManager().getTeam(playerRef.current.name);
+            playerRef.current.team = playerTeam || 'T';
+          }
+
+          // Respawn player at team spawn
+          const player = playerRef.current;
+          const spawns = isTeamMode
+            ? loadedMap.spawns.filter(s => s.team === player.team || s.team === 'DM')
+            : loadedMap.spawns;
+          const spawn = spawns[Math.floor(Math.random() * spawns.length)];
+          player.respawn(
+            new Vector3(spawn.position[0], spawn.position[1], spawn.position[2]),
+            degToRad(spawn.angle)
+          );
+
+          // Update camera
+          const camera = renderer.getCamera();
+          camera.setPosition(spawn.position[0], spawn.position[1] + PLAYER_HEIGHT, spawn.position[2]);
+          camera.setYaw(degToRad(spawn.angle));
+          camera.setPitch(0);
+
+          // Respawn bots at team spawns
+          if (isTeamMode) {
+            botManager.respawnAllBots(now);
+          }
+
+          // Disable respawns for round-based mode
+          botManager.setRespawnEnabled(!isTeamMode);
+
+          // Start game mode
+          gameModeRef.current.startMatch(now);
+
+          // Hide main menu
+          renderer.setMainMenu(mainMenu, false);
+
+          consoleLog(`Starting ${result.mode} game on ${result.map}`);
+        } else if (result.action === 'quit') {
+          exitingRef.current = true;
+          mouseHandler.disable();
+          getSoundEngine().destroy();
+          process.stdin.setRawMode(false);
+          process.stdin.pause();
+          process.stdout.write(CURSOR_SHOW + ALT_SCREEN_OFF + RESET);
+          process.exit(0);
+        }
+        return;
+      }
+
+      // Buy menu handling (during freeze phase)
+      if (buyMenu.isOpen()) {
+        let key = str;
+        if (str === '\x1b[A') key = 'up';
+        else if (str === '\x1b[B') key = 'down';
+        else if (str === '\x1b[C') key = 'right';
+        else if (str === '\x1b[D') key = 'left';
+        else if (str === '\r') key = 'enter';
+        else if (str === '\x1b' && !str.startsWith('\x1b[')) key = 'escape';
+
+        const result = buyMenu.handleKey(key);
+        if (result.action === 'purchase' && result.result?.success) {
+          consoleLog(result.result.message);
+        }
+        return;
+      }
+
       // Check for quit (q key always quits, Esc releases mouse or quits if not captured)
       if (str === 'q') {
         exitingRef.current = true;
@@ -398,9 +518,11 @@ function Game() {
         return;
       }
 
-      // Escape key - release mouse capture or quit if not captured
+      // Escape key - close buy menu, release mouse, or quit
       if (str === '\x1b' && !str.startsWith('\x1b[')) {
-        if (mouseHandler.isCaptured()) {
+        if (buyMenu.isOpen()) {
+          buyMenu.close();
+        } else if (mouseHandler.isCaptured()) {
           mouseHandler.release();
         } else {
           exitingRef.current = true;
@@ -411,6 +533,12 @@ function Game() {
           process.stdout.write(CURSOR_SHOW + ALT_SCREEN_OFF + RESET);
           process.exit(0);
         }
+        return;
+      }
+
+      // B key for buy menu (only during freeze phase)
+      if ((str === 'b' || str === 'B') && gameModeRef.current.canBuy()) {
+        buyMenu.toggle(playerRef.current);
         return;
       }
 
@@ -474,8 +602,26 @@ function Game() {
         showScoreboardRef.current = !showScoreboardRef.current;
       }
 
+      // E key for weapon pickup
+      if (str === 'e' || str === 'E') {
+        const player = playerRef.current;
+        const droppedWeaponManager = getDroppedWeaponManager();
+        const nearby = droppedWeaponManager.getWeaponsNear(player.position, 2.5);
+        if (nearby.length > 0) {
+          const weaponState = droppedWeaponManager.toWeaponState(nearby[0]);
+          if (weaponState) {
+            // Drop current weapon in the same slot if any
+            player.dropWeaponInSlot(weaponState.def.slot, now);
+            // Pick up the new weapon
+            player.pickupWeapon(weaponState);
+            droppedWeaponManager.removeWeapon(nearby[0].id);
+            consoleLog(`Picked up ${weaponState.def.name}`);
+          }
+        }
+      }
+
       // N key for restart when game is over
-      if ((str === 'n' || str === 'N') && gameMode.phase === 'ended') {
+      if ((str === 'n' || str === 'N') && gameModeRef.current.phase === 'match_end') {
         // Restart the game
         const spawn = loadedMap.spawns[Math.floor(Math.random() * loadedMap.spawns.length)];
         const player = playerRef.current;
@@ -497,11 +643,12 @@ function Game() {
         botManager.spawnBots(6, 'medium');
 
         // Restart game mode
-        gameMode.restart(player, botManager.getBots(), performance.now());
+        gameModeRef.current.restart(player, botManager.getBots(), performance.now());
       }
 
       // Fire (left click handled in mouse handler, but also allow F key)
-      if (str === 'f' || str === 'F') {
+      // Block shooting during freeze phase
+      if ((str === 'f' || str === 'F') && !gameModeRef.current.isPlayerFrozen()) {
         const player = playerRef.current;
         const weapon = player.getCurrentWeapon();
 
@@ -548,8 +695,9 @@ function Game() {
               // Award kill if bot died
               if (wasAlive && !botHit.bot.isAlive) {
                 player.kills++;
+                player.awardKill(weapon.def.type);
                 playSound('bot_death');
-                gameMode.registerKill(
+                gameModeRef.current.registerKill(
                   player.name,
                   botHit.bot.name,
                   weapon.def.name,
@@ -607,9 +755,10 @@ function Game() {
               // Award kill if bot died
               if (wasAlive && !botHit.bot.isAlive) {
                 player.kills++;
+                player.awardKill(weapon.def.type);
                 playSound('bot_death');
                 // Register kill in game mode for kill feed
-                gameMode.registerKill(
+                gameModeRef.current.registerKill(
                   player.name,
                   botHit.bot.name,
                   weapon.def.name,
@@ -702,13 +851,18 @@ function Game() {
       if (isKeyHeld(keys.lookUp, now)) camera.rotate(TURN_SPEED * deltaTime, 0);
       if (isKeyHeld(keys.lookDown, now)) camera.rotate(-TURN_SPEED * deltaTime, 0);
 
-      // Calculate movement direction
+      // Check if player is frozen (freeze phase in competitive mode)
+      const playerFrozen = gameModeRef.current.isPlayerFrozen();
+
+      // Calculate movement direction (blocked during freeze phase)
       let moveForward = 0;
       let moveRight = 0;
-      if (isKeyHeld(keys.forward, now)) moveForward += MOVE_SPEED * deltaTime;
-      if (isKeyHeld(keys.backward, now)) moveForward -= MOVE_SPEED * deltaTime;
-      if (isKeyHeld(keys.left, now)) moveRight -= MOVE_SPEED * deltaTime;
-      if (isKeyHeld(keys.right, now)) moveRight += MOVE_SPEED * deltaTime;
+      if (!playerFrozen) {
+        if (isKeyHeld(keys.forward, now)) moveForward += MOVE_SPEED * deltaTime;
+        if (isKeyHeld(keys.backward, now)) moveForward -= MOVE_SPEED * deltaTime;
+        if (isKeyHeld(keys.left, now)) moveRight -= MOVE_SPEED * deltaTime;
+        if (isKeyHeld(keys.right, now)) moveRight += MOVE_SPEED * deltaTime;
+      }
 
       // Get movement vector in world space
       const yaw = camera.yaw;
@@ -786,8 +940,13 @@ function Game() {
         renderer.setWeaponSprite(sprite);
       }
 
-      // Update bots
-      botManager.update(player, collidersRef.current, now, deltaTime);
+      // Check if player is frozen (freeze phase)
+      const gameMode = gameModeRef.current;
+      const isTeamMode = gameModeTypeRef.current === 'competitive';
+      const isFrozen = gameMode.isPlayerFrozen();
+
+      // Update bots (pass freeze and team mode info)
+      botManager.update(player, collidersRef.current, now, deltaTime, isFrozen, isTeamMode);
 
       // Bot combat is now handled by BotManager.update() via callbacks
 
@@ -797,10 +956,15 @@ function Game() {
       // Handle death camera effect
       renderer.setPlayerDead(!player.isAlive, deltaTime);
       if (!player.isAlive) {
-        // Play death sound on transition to dead
+        // Play death sound and drop weapons on transition to dead
         if (wasAliveRef.current) {
           playSound('player_death');
           wasAliveRef.current = false;
+
+          // Drop weapons on death in competitive mode
+          if (isTeamMode) {
+            player.dropAllWeapons(now);
+          }
         }
         // Apply death camera roll
         camera.setRoll(renderer.getDeathCameraRoll());
@@ -852,21 +1016,38 @@ function Game() {
       // Set game mode UI data
       renderer.setKillFeed(gameMode.getKillFeed(now));
       renderer.setScoreboard(gameMode.getScoreboard(player, botManager.getBots()));
-      renderer.setShowScoreboard(showScoreboardRef.current || gameMode.phase === 'ended');
+      renderer.setShowScoreboard(showScoreboardRef.current || gameMode.phase === 'match_end');
       renderer.setGameState(
         gameMode.phase,
-        gameMode.formatTime(gameMode.getTimeRemaining(now)),
-        gameMode.config.killLimit,
-        gameMode.winner,
+        gameMode.formatTime(gameMode.getRoundTimeRemaining(now)),
+        gameMode.config.roundsToWin,
+        gameMode.matchWinner,
         gameMode.getRespawnCountdown(now),
         Math.ceil(gameMode.getWarmupRemaining(now))
       );
+
+      // Set competitive mode UI data
+      if (isTeamMode) {
+        renderer.setTeamScores(gameMode.round.tScore, gameMode.round.ctScore, gameMode.round.roundNumber);
+        renderer.setPlayerTeam(player.team);
+        renderer.setPlayerMoney(player.economy.getMoney());
+        renderer.setFreezeTime(gameMode.getFreezeTimeRemaining(now));
+      } else {
+        // Reset competitive UI for deathmatch
+        renderer.setFreezeTime(0);
+      }
+
+      // Update dropped weapons in renderer
+      const droppedWeaponManager = getDroppedWeaponManager();
+      droppedWeaponManager.update(now);
+      renderer.setDroppedWeapons(droppedWeaponManager.getAll());
 
       // Render
       const stats = renderer.render();
 
       // Update React state (for any React-based UI elements)
       setGameState({
+        appMode: appModeRef.current,
         fps: stats.fps,
         frameTime: stats.frameTime,
         cameraPos: camera.position.clone(),
@@ -879,6 +1060,8 @@ function Game() {
         reserveAmmo: weapon?.reserveAmmo ?? 0,
         weaponName: weapon?.def.name ?? 'None',
         isReloading: weapon?.isReloading ?? false,
+        money: player.economy.getMoney(),
+        team: player.team,
       });
 
       // Target ~60 FPS for smoother input
@@ -914,6 +1097,8 @@ async function main() {
   console.log('  Space       - Jump');
   console.log('  F           - Fire weapon');
   console.log('  R           - Reload');
+  console.log('  E           - Pick up weapon');
+  console.log('  B           - Open buy menu (freeze phase)');
   console.log('  1-5         - Select weapon');
   console.log('  Tab         - Show scoreboard');
   console.log('  ~           - Open debug console');

@@ -7,6 +7,8 @@ export const dm_arena: MapDef = {
   author: 'CS-CLI',
   description: 'A large deathmatch arena with cover and elevated positions',
 
+  supportedModes: ['deathmatch', 'competitive'],
+
   bounds: {
     min: [-60, 0, -60],
     max: [60, 20, 60]
@@ -140,6 +142,7 @@ export const dm_arena: MapDef = {
   ],
 
   spawns: [
+    // === DEATHMATCH SPAWNS (spread throughout map) ===
     // Corner spawns
     { position: [-48, 0.1, -48], angle: 45, team: 'DM' },
     { position: [48, 0.1, -48], angle: 135, team: 'DM' },
@@ -173,7 +176,31 @@ export const dm_arena: MapDef = {
     // Center area spawns
     { position: [-8, 0.1, -8], angle: 45, team: 'DM' },
     { position: [8, 0.1, 8], angle: -135, team: 'DM' },
-  ]
+
+    // === TERRORIST SPAWNS (South side - near blue marker) ===
+    { position: [-20, 0.1, 48], angle: 0, team: 'T' },
+    { position: [0, 0.1, 50], angle: 0, team: 'T' },
+    { position: [20, 0.1, 48], angle: 0, team: 'T' },
+    { position: [-35, 0.1, 42], angle: 0, team: 'T' },
+    { position: [35, 0.1, 42], angle: 0, team: 'T' },
+    { position: [0, 4.1, 42], angle: 0, team: 'T' },  // Platform spawn
+
+    // === COUNTER-TERRORIST SPAWNS (North side - near red marker) ===
+    { position: [-20, 0.1, -48], angle: 180, team: 'CT' },
+    { position: [0, 0.1, -50], angle: 180, team: 'CT' },
+    { position: [20, 0.1, -48], angle: 180, team: 'CT' },
+    { position: [-35, 0.1, -42], angle: 180, team: 'CT' },
+    { position: [35, 0.1, -42], angle: 180, team: 'CT' },
+    { position: [0, 4.1, -42], angle: 180, team: 'CT' },  // Platform spawn
+  ],
+
+  // === BUY ZONES ===
+  buyZones: [
+    // T buy zone (south)
+    { position: [0, 2, 52], size: [50, 4, 10], team: 'T' },
+    // CT buy zone (north)
+    { position: [0, 2, -52], size: [50, 4, 10], team: 'CT' },
+  ],
 };
 
 export default dm_arena;

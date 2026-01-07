@@ -12,6 +12,10 @@ import { TracerPool, getTracerChar } from '../game/Tracer.js';
 import { Bot } from '../ai/Bot.js';
 import { KillEvent, ScoreEntry, GamePhase } from '../game/GameMode.js';
 import { getGameConsole, ConsoleMessage } from '../ui/Console.js';
+import { MainMenu, MainMenuState } from '../ui/MainMenu.js';
+import { BuyMenu, BuyMenuItem } from '../ui/BuyMenu.js';
+import { TeamId, TEAMS } from '../game/Team.js';
+import { DroppedWeapon } from '../game/DroppedWeapon.js';
 
 export interface RenderObject {
   mesh: Mesh;
@@ -78,7 +82,7 @@ export class Renderer {
   private killFeed: KillEvent[] = [];
   private scoreboard: ScoreEntry[] = [];
   private showScoreboard: boolean = false;
-  private gamePhase: GamePhase = 'playing';
+  private gamePhase: GamePhase = 'live';
   private gameTimer: string = '';
   private winner: string | null = null;
   private respawnCountdown: number = 0;
@@ -97,6 +101,24 @@ export class Renderer {
   private deathCameraRoll: number = 0;
   private deathCameraY: number = 0;
   private isPlayerDead: boolean = false;
+
+  // Team-based display data
+  private playerTeam: TeamId = 'SPECTATOR';
+  private tScore: number = 0;
+  private ctScore: number = 0;
+  private playerMoney: number = 0;
+  private freezeTimeRemaining: number = 0;
+  private roundNumber: number = 0;
+
+  // Main menu state
+  private mainMenu: MainMenu | null = null;
+  private showMainMenu: boolean = false;
+
+  // Buy menu state
+  private buyMenu: BuyMenu | null = null;
+
+  // Dropped weapons to render
+  private droppedWeapons: DroppedWeapon[] = [];
 
   constructor(width?: number, height?: number) {
     // Get terminal size if not specified
@@ -257,6 +279,9 @@ export class Renderer {
     this.drawRespawnOverlay();
     this.drawScoreboardOverlay();
     this.drawGameOverOverlay();
+    this.drawFreezeTimeOverlay();
+    this.drawBuyMenuOverlay();
+    this.drawMainMenuOverlay();
     this.drawConsoleOverlay();
 
     // Output to terminal
@@ -850,6 +875,13 @@ export class Renderer {
       this.framebuffer.drawText(2, this.height - 3, `AR: ${armor}`, new Color(100, 150, 255), bgDark);
     }
 
+    // Money (bottom left, above health)
+    if (this.playerMoney > 0) {
+      const moneyText = `$${this.playerMoney}`;
+      const moneyColor = new Color(100, 255, 100);
+      this.framebuffer.drawText(2, this.height - 4, moneyText, moneyColor, bgDark);
+    }
+
     // Ammo (bottom right)
     const ammoText = isReloading ? 'RELOADING...' : `${ammo} / ${reserveAmmo}`;
     const ammoColor = isReloading ? new Color(255, 200, 0) : (ammo > 0 ? Color.white() : new Color(255, 0, 0));
@@ -858,6 +890,39 @@ export class Renderer {
     // Weapon name (bottom center)
     const weaponX = Math.floor((this.width - weaponName.length) / 2);
     this.framebuffer.drawText(weaponX, this.height - 2, weaponName, fg, bgDark);
+
+    // Team scores (top center) if in team mode
+    if (this.tScore > 0 || this.ctScore > 0 || this.roundNumber > 0) {
+      this.drawTeamScores();
+    }
+  }
+
+  // Draw team scores at top center
+  private drawTeamScores(): void {
+    const bgDark = new Color(0, 0, 0, 0.8);
+    const tColor = new Color(255, 180, 80);  // Orange for T
+    const ctColor = new Color(100, 150, 255); // Blue for CT
+
+    // Format: T 3 : 5 CT  Round 8
+    const scoreText = `T ${this.tScore} : ${this.ctScore} CT`;
+    const roundText = `Round ${this.roundNumber}`;
+    const fullText = `${scoreText}  ${roundText}`;
+
+    const startX = Math.floor((this.width - fullText.length) / 2);
+
+    // Draw with colors
+    let x = startX;
+    this.framebuffer.drawText(x, 1, 'T', tColor, bgDark);
+    x += 2;
+    this.framebuffer.drawText(x, 1, `${this.tScore}`, this.playerTeam === 'T' ? new Color(255, 255, 100) : tColor, bgDark);
+    x += this.tScore.toString().length + 1;
+    this.framebuffer.drawText(x, 1, ':', Color.white(), bgDark);
+    x += 2;
+    this.framebuffer.drawText(x, 1, `${this.ctScore}`, this.playerTeam === 'CT' ? new Color(255, 255, 100) : ctColor, bgDark);
+    x += this.ctScore.toString().length + 1;
+    this.framebuffer.drawText(x, 1, 'CT', ctColor, bgDark);
+    x += 4;
+    this.framebuffer.drawText(x, 1, roundText, new Color(200, 200, 200), bgDark);
   }
 
   // Draw kill feed (top right corner)
@@ -1117,7 +1182,7 @@ export class Renderer {
 
   // Draw game over screen
   private drawGameOverOverlay(): void {
-    if (this.gamePhase !== 'ended') return;
+    if (this.gamePhase !== 'match_end') return;
 
     const centerX = Math.floor(this.width / 2);
     const centerY = Math.floor(this.height / 2);
@@ -1228,6 +1293,245 @@ export class Renderer {
     this.framebuffer.drawText(3, consoleHeight - 1, displayInput, Color.white(), bgDark);
     // Draw cursor
     this.framebuffer.setPixel(3 + displayInput.length, consoleHeight - 1, '█', new Color(100, 255, 100), bgDark);
+  }
+
+  // Draw freeze time overlay (during buy phase)
+  private drawFreezeTimeOverlay(): void {
+    if (this.freezeTimeRemaining <= 0) return;
+    if (this.showMainMenu) return; // Don't show when main menu is open
+
+    const bgDark = new Color(0, 0, 0, 0.8);
+    const centerX = Math.floor(this.width / 2);
+
+    // Draw freeze time countdown
+    const timeText = `FREEZE TIME: ${this.freezeTimeRemaining}s`;
+    const buyHint = 'Press B to open Buy Menu';
+
+    this.framebuffer.drawText(centerX - Math.floor(timeText.length / 2), 3, timeText, new Color(100, 200, 255), bgDark);
+    this.framebuffer.drawText(centerX - Math.floor(buyHint.length / 2), 4, buyHint, new Color(200, 200, 200), bgDark);
+  }
+
+  // Draw buy menu overlay
+  private drawBuyMenuOverlay(): void {
+    if (!this.buyMenu || !this.buyMenu.isOpen()) return;
+
+    const bgDark = new Color(20, 20, 30);
+    const borderColor = new Color(100, 100, 150);
+    const selectedColor = new Color(255, 215, 0);  // Gold
+    const affordColor = new Color(100, 255, 100);  // Green
+    const cantAffordColor = new Color(150, 150, 150);  // Gray
+    const ownedColor = new Color(100, 200, 255);  // Cyan
+
+    // Menu dimensions
+    const menuWidth = 50;
+    const menuHeight = 18;
+    const startX = Math.floor((this.width - menuWidth) / 2);
+    const startY = Math.floor((this.height - menuHeight) / 2);
+
+    // Draw background
+    for (let y = startY; y < startY + menuHeight; y++) {
+      for (let x = startX; x < startX + menuWidth; x++) {
+        if (x >= 0 && x < this.width && y >= 0 && y < this.height) {
+          this.framebuffer.setPixel(x, y, ' ', Color.white(), bgDark);
+        }
+      }
+    }
+
+    // Draw border
+    for (let x = startX; x < startX + menuWidth; x++) {
+      this.framebuffer.setPixel(x, startY, '─', borderColor, bgDark);
+      this.framebuffer.setPixel(x, startY + menuHeight - 1, '─', borderColor, bgDark);
+    }
+    for (let y = startY; y < startY + menuHeight; y++) {
+      this.framebuffer.setPixel(startX, y, '│', borderColor, bgDark);
+      this.framebuffer.setPixel(startX + menuWidth - 1, y, '│', borderColor, bgDark);
+    }
+    // Corners
+    this.framebuffer.setPixel(startX, startY, '┌', borderColor, bgDark);
+    this.framebuffer.setPixel(startX + menuWidth - 1, startY, '┐', borderColor, bgDark);
+    this.framebuffer.setPixel(startX, startY + menuHeight - 1, '└', borderColor, bgDark);
+    this.framebuffer.setPixel(startX + menuWidth - 1, startY + menuHeight - 1, '┘', borderColor, bgDark);
+
+    // Title
+    const title = 'BUY MENU';
+    this.framebuffer.drawText(startX + Math.floor((menuWidth - title.length) / 2), startY + 1, title, selectedColor, bgDark);
+
+    // Money display
+    const moneyText = `Money: $${this.buyMenu.getPlayerMoney()}`;
+    this.framebuffer.drawText(startX + 2, startY + 2, moneyText, affordColor, bgDark);
+
+    // Category tabs
+    const categories = this.buyMenu.getCategoriesWithCounts();
+    let tabX = startX + 2;
+    for (const cat of categories) {
+      const tabText = `[${cat.label}]`;
+      const tabColor = cat.isSelected ? selectedColor : new Color(150, 150, 150);
+      this.framebuffer.drawText(tabX, startY + 4, tabText, tabColor, bgDark);
+      tabX += tabText.length + 2;
+    }
+
+    // Separator
+    for (let x = startX + 1; x < startX + menuWidth - 1; x++) {
+      this.framebuffer.setPixel(x, startY + 5, '─', borderColor, bgDark);
+    }
+
+    // Weapon list
+    const items = this.buyMenu.getMenuItems();
+    const selectedIndex = this.buyMenu.getState().selectedItem;
+
+    for (let i = 0; i < items.length && i < 8; i++) {
+      const item = items[i];
+      const y = startY + 6 + i;
+      const isSelected = i === selectedIndex;
+
+      // Format: [n] WeaponName    $cost  [OWNED/status]
+      const prefix = isSelected ? '>' : ' ';
+      const numKey = `${i + 1}`;
+      const name = item.def.name.padEnd(15);
+      const cost = `$${item.def.cost}`.padStart(6);
+      const status = item.owned ? '[OWNED]' : (item.canAfford ? '' : '[$$]');
+
+      let lineColor: Color;
+      if (item.owned) {
+        lineColor = ownedColor;
+      } else if (item.canAfford) {
+        lineColor = isSelected ? selectedColor : affordColor;
+      } else {
+        lineColor = cantAffordColor;
+      }
+
+      const line = `${prefix}${numKey}. ${name} ${cost} ${status}`;
+      this.framebuffer.drawText(startX + 2, y, line, lineColor, bgDark);
+    }
+
+    // Controls hint
+    const hint = 'Arrow keys: navigate | Enter: buy | B/Esc: close';
+    this.framebuffer.drawText(startX + 2, startY + menuHeight - 2, hint, new Color(150, 150, 150), bgDark);
+  }
+
+  // Draw main menu overlay
+  private drawMainMenuOverlay(): void {
+    if (!this.showMainMenu || !this.mainMenu) return;
+
+    const bgDark = new Color(15, 15, 25);
+    const borderColor = new Color(80, 80, 120);
+    const titleColor = new Color(255, 215, 0);  // Gold
+    const selectedColor = new Color(100, 255, 100);  // Green
+    const normalColor = new Color(200, 200, 200);
+    const descColor = new Color(150, 150, 150);
+
+    // Full screen background
+    for (let y = 0; y < this.height; y++) {
+      for (let x = 0; x < this.width; x++) {
+        this.framebuffer.setPixel(x, y, ' ', Color.white(), bgDark);
+      }
+    }
+
+    // ASCII art title (simple)
+    const titleLines = [
+      '  ██████╗███████╗     ██████╗██╗     ██╗',
+      ' ██╔════╝██╔════╝    ██╔════╝██║     ██║',
+      ' ██║     ███████╗    ██║     ██║     ██║',
+      ' ██║     ╚════██║    ██║     ██║     ██║',
+      ' ╚██████╗███████║    ╚██████╗███████╗██║',
+      '  ╚═════╝╚══════╝     ╚═════╝╚══════╝╚═╝',
+    ];
+
+    const titleStartY = 3;
+    for (let i = 0; i < titleLines.length; i++) {
+      const line = titleLines[i];
+      const x = Math.floor((this.width - line.length) / 2);
+      this.framebuffer.drawText(x, titleStartY + i, line, titleColor, bgDark);
+    }
+
+    // Screen title
+    const screenTitle = this.mainMenu.getScreenTitle();
+    const titleY = titleStartY + titleLines.length + 2;
+    this.framebuffer.drawText(
+      Math.floor((this.width - screenTitle.length) / 2),
+      titleY,
+      screenTitle,
+      normalColor,
+      bgDark
+    );
+
+    // Menu items
+    const items = this.mainMenu.getCurrentItems();
+    const selectedIndex = this.mainMenu.getSelectedIndex();
+    const itemsStartY = titleY + 3;
+
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      const isSelected = i === selectedIndex;
+      const prefix = isSelected ? '> ' : '  ';
+      const text = prefix + item;
+      const color = isSelected ? selectedColor : normalColor;
+      const x = Math.floor((this.width - text.length) / 2);
+      this.framebuffer.drawText(x, itemsStartY + i * 2, text, color, bgDark);
+    }
+
+    // Description for selected item
+    const description = this.mainMenu.getSelectionDescription();
+    if (description) {
+      const descY = itemsStartY + items.length * 2 + 2;
+      this.framebuffer.drawText(
+        Math.floor((this.width - description.length) / 2),
+        descY,
+        description,
+        descColor,
+        bgDark
+      );
+    }
+
+    // Controls hint
+    const hint = 'W/S or Arrow keys: navigate | Enter: select | Esc: back';
+    const hintY = this.height - 3;
+    this.framebuffer.drawText(
+      Math.floor((this.width - hint.length) / 2),
+      hintY,
+      hint,
+      descColor,
+      bgDark
+    );
+  }
+
+  // Set team-based display data
+  setTeamScores(tScore: number, ctScore: number, roundNumber: number): void {
+    this.tScore = tScore;
+    this.ctScore = ctScore;
+    this.roundNumber = roundNumber;
+  }
+
+  setPlayerTeam(team: TeamId): void {
+    this.playerTeam = team;
+  }
+
+  setPlayerMoney(money: number): void {
+    this.playerMoney = money;
+  }
+
+  setFreezeTime(seconds: number): void {
+    this.freezeTimeRemaining = seconds;
+  }
+
+  // Main menu
+  setMainMenu(menu: MainMenu | null, show: boolean): void {
+    this.mainMenu = menu;
+    this.showMainMenu = show;
+  }
+
+  isMainMenuShown(): boolean {
+    return this.showMainMenu;
+  }
+
+  // Buy menu
+  setBuyMenu(menu: BuyMenu | null): void {
+    this.buyMenu = menu;
+  }
+
+  // Dropped weapons
+  setDroppedWeapons(weapons: DroppedWeapon[]): void {
+    this.droppedWeapons = weapons;
   }
 
   // Enter fullscreen mode
