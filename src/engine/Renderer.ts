@@ -12,7 +12,7 @@ import { TracerPool, getTracerChar } from '../game/Tracer.js';
 import { Bot } from '../ai/Bot.js';
 import { KillEvent, ScoreEntry, GamePhase } from '../game/GameMode.js';
 import { getGameConsole, ConsoleMessage } from '../ui/Console.js';
-import { MainMenu, MainMenuState } from '../ui/MainMenu.js';
+import { MainMenu, MainMenuState, InputStatus } from '../ui/MainMenu.js';
 import { BuyMenu, BuyMenuItem } from '../ui/BuyMenu.js';
 import { TeamId, TEAMS } from '../game/Team.js';
 import { DroppedWeapon } from '../game/DroppedWeapon.js';
@@ -1529,6 +1529,31 @@ export class Renderer {
         bgDark
       );
     }
+
+    // Input status display
+    const inputStatus = this.mainMenu.getInputStatus();
+    const statusY = this.height - 5;
+    let statusText: string;
+    let statusColor: Color;
+
+    if (inputStatus.mode === 'native' && inputStatus.working) {
+      statusText = 'Input: Native (CGEventTap) - Working';
+      statusColor = new Color(100, 255, 100);  // Green
+    } else if (inputStatus.mode === 'native') {
+      statusText = 'Input: Native (checking...)';
+      statusColor = new Color(255, 255, 100);  // Yellow
+    } else {
+      statusText = 'Input: Stdin (fallback) - ' + inputStatus.message;
+      statusColor = new Color(255, 180, 100);  // Orange
+    }
+
+    this.framebuffer.drawText(
+      Math.floor((this.width - statusText.length) / 2),
+      statusY,
+      statusText,
+      statusColor,
+      bgDark
+    );
 
     // Controls hint
     const hint = 'W/S or Arrow keys: navigate | Enter: select | H: help | Esc: back';

@@ -717,9 +717,25 @@ function Game() {
     // Try to initialize native keyboard (falls back to stdin if unavailable)
     useNativeKeyboardRef.current = initNativeKeyboard();
 
-    // Log input mode to game console
+    // Log input mode to game console and set main menu status
     const inputMode = getInputMode();
-    consoleLog(`Input: ${inputMode === 'native' ? 'Native (CGEventTap)' : 'Stdin (fallback)'}`);
+    const mainMenu = getMainMenu();
+
+    if (inputMode === 'native') {
+      mainMenu.setInputStatus({
+        mode: 'native',
+        working: true,
+        message: 'CGEventTap active',
+      });
+      consoleLog('Input: Native (CGEventTap) - Ready');
+    } else {
+      mainMenu.setInputStatus({
+        mode: 'stdin',
+        working: true,
+        message: 'Native unavailable',
+      });
+      consoleLog('Input: Stdin (fallback) - Native keyboard unavailable');
+    }
 
     process.stdin.setRawMode(true);
     process.stdin.resume();

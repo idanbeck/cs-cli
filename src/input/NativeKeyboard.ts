@@ -1,6 +1,16 @@
 // Native keyboard input using CGEventTap on macOS
 // Falls back to stdin-based input if native module unavailable
 
+// ESM-compatible imports for native module loading
+import { createRequire } from 'module';
+import { fileURLToPath } from 'url';
+import path from 'path';
+import fs from 'fs';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const require = createRequire(import.meta.url);
+
 // macOS virtual key codes
 export const MacKeyCode = {
   // Letters
@@ -97,10 +107,6 @@ export function initNativeKeyboard(): boolean {
   if (nativeModule) return useNative;
 
   try {
-    // Dynamic import of native module
-    const path = require('path');
-    const fs = require('fs');
-
     // __dirname in compiled JS is dist/input, so go up to project root
     const projectRoot = path.resolve(__dirname, '../..');
     const modulePath = path.join(projectRoot, 'native/build/Release/keyboard.node');
