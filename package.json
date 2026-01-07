@@ -1,0 +1,26 @@
+{
+  "name": "cs-cli",
+  "version": "0.1.0",
+  "description": "Terminal-based Counter-Strike clone with true 3D rendering",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "play": "npx tsx src/index.tsx 2>/dev/null",
+    "dev": "bun run src/index.tsx 2>/dev/null",
+    "dev:tsx": "tsx src/index.tsx 2>/dev/null",
+    "build": "tsc",
+    "start": "bun dist/index.js 2>/dev/null"
+  },
+  "dependencies": {
+    "ink": "^5.0.1",
+    "react": "^18.3.1",
+    "speaker": "^0.5.5"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.12",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
