@@ -12,7 +12,7 @@
     "declaration": true,
     "resolveJsonModule": true,
     "paths": {
-      "@shared/*": ["../src/*"]
+      "@shared/*": ["../src/shared/*"]
     },
     "baseUrl": "."
   },

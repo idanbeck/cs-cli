@@ -272,9 +272,27 @@ export class Player {
   }
 
   // Pick up a weapon (add to inventory)
-  pickupWeapon(weapon: WeaponState): void {
+  // Returns 'picked_up' if new weapon was equipped, 'ammo_added' if ammo was merged
+  pickupWeapon(weapon: WeaponState): 'picked_up' | 'ammo_added' {
+    const existingWeapon = this.weapons.get(weapon.def.slot);
+
+    // If we already have the same weapon type, just add the ammo
+    if (existingWeapon && existingWeapon.def.type === weapon.def.type) {
+      existingWeapon.currentAmmo += weapon.currentAmmo;
+      existingWeapon.reserveAmmo += weapon.reserveAmmo;
+      return 'ammo_added';
+    }
+
+    // Otherwise, equip the new weapon
     this.weapons.set(weapon.def.slot, weapon);
     this.currentSlot = weapon.def.slot;
+    return 'picked_up';
+  }
+
+  // Check if picking up would just add ammo (same weapon type in slot)
+  wouldMergeAmmo(weapon: WeaponState): boolean {
+    const existingWeapon = this.weapons.get(weapon.def.slot);
+    return existingWeapon !== undefined && existingWeapon.def.type === weapon.def.type;
   }
 
   // Check if player can afford a weapon

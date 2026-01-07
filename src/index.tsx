@@ -697,10 +697,17 @@ function Game() {
         if (nearby.length > 0) {
           const weaponState = droppedWeaponManager.toWeaponState(nearby[0]);
           if (weaponState) {
-            player.dropWeaponInSlot(weaponState.def.slot, now);
-            player.pickupWeapon(weaponState);
+            // Only drop current weapon if we're not just adding ammo to same weapon type
+            if (!player.wouldMergeAmmo(weaponState)) {
+              player.dropWeaponInSlot(weaponState.def.slot, now);
+            }
+            const result = player.pickupWeapon(weaponState);
             droppedWeaponManager.removeWeapon(nearby[0].id);
-            consoleLog(`Picked up ${weaponState.def.name}`);
+            if (result === 'ammo_added') {
+              consoleLog(`Picked up ammo for ${weaponState.def.name}`);
+            } else {
+              consoleLog(`Picked up ${weaponState.def.name}`);
+            }
           }
         }
       }
@@ -830,10 +837,17 @@ function Game() {
           if (nearby.length > 0) {
             const weaponState = droppedWeaponManager.toWeaponState(nearby[0]);
             if (weaponState) {
-              player.dropWeaponInSlot(weaponState.def.slot, now);
-              player.pickupWeapon(weaponState);
+              // Only drop current weapon if we're not just adding ammo to same weapon type
+              if (!player.wouldMergeAmmo(weaponState)) {
+                player.dropWeaponInSlot(weaponState.def.slot, now);
+              }
+              const result = player.pickupWeapon(weaponState);
               droppedWeaponManager.removeWeapon(nearby[0].id);
-              consoleLog(`Picked up ${weaponState.def.name}`);
+              if (result === 'ammo_added') {
+                consoleLog(`Picked up ammo for ${weaponState.def.name}`);
+              } else {
+                consoleLog(`Picked up ${weaponState.def.name}`);
+              }
             }
           }
         }
