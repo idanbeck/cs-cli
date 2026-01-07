@@ -29,8 +29,19 @@ export const AVAILABLE_MAPS: MapInfo[] = [
   },
 ];
 
+export type InputStatus = {
+  mode: 'native' | 'stdin';
+  working: boolean;
+  message: string;
+};
+
 export class MainMenu {
   private state: MainMenuState;
+  private inputStatus: InputStatus = {
+    mode: 'stdin',
+    working: false,
+    message: 'Checking input...',
+  };
 
   // Menu items for each screen
   private mainMenuItems = ['Play', 'Help', 'Settings', 'Quit'];
@@ -76,6 +87,14 @@ export class MainMenu {
 
   getState(): MainMenuState {
     return this.state;
+  }
+
+  setInputStatus(status: InputStatus): void {
+    this.inputStatus = status;
+  }
+
+  getInputStatus(): InputStatus {
+    return this.inputStatus;
   }
 
   getCurrentScreen(): MenuScreen {

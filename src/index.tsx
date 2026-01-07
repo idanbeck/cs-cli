@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import React, { useState, useEffect, useRef } from 'react';
 import { render, useApp, useStdout } from 'ink';
 import { Renderer, RenderObject } from './engine/Renderer.js';
@@ -8,6 +9,22 @@ import { Vector3 } from './engine/math/Vector3.js';
 import { Color, Materials, CURSOR_HIDE, CURSOR_SHOW, ALT_SCREEN_ON, ALT_SCREEN_OFF, RESET } from './utils/Colors.js';
 import { degToRad } from './engine/math/MathUtils.js';
 import { MouseHandler } from './input/MouseHandler.js';
+import {
+  initNativeKeyboard,
+  stopNativeKeyboard,
+  isNativeKeyboardAvailable,
+  getInputMode,
+  getMovementInput as getNativeMovement,
+  getLookInput as getNativeLook,
+  getWeaponSlotPressed as getNativeWeaponSlot,
+  isGameKeyDown,
+  wasGameKeyJustPressed,
+  updateNativeKeyboard,
+} from './input/NativeKeyboard.js';
+
+// Stdin-based key state tracking with timing (fallback)
+// Keys are considered "held" for a short duration after each keypress
+const KEY_HOLD_MS = 120; // How long a key stays "pressed" after last stdin event
 import { MapLoader, LoadedMap } from './maps/MapLoader.js';
 import { dm_arena } from './maps/maps/dm_arena.js';
 import { AABB } from './maps/MapFormat.js';
@@ -44,26 +61,6 @@ interface GameState {
   team: TeamId;
 }
 
-interface KeyState {
-  lastPress: number;   // Last time key was pressed (for hold detection)
-  firstPress: number;  // When the key was first pressed (for ramp-up)
-}
-
-interface KeyTiming {
-  forward: KeyState;
-  backward: KeyState;
-  left: KeyState;
-  right: KeyState;
-  turnLeft: KeyState;
-  turnRight: KeyState;
-  lookUp: KeyState;
-  lookDown: KeyState;
-}
-
-const KEY_HOLD_TIME = 300; // ms to keep key "held" after press (needs to be longer than terminal key repeat)
-const KEY_RAMP_TIME = 150; // ms before full speed kicks in
-const KEY_TAP_MULTIPLIER = 0.25; // Movement multiplier for initial tap (fine control)
-
 interface PlayerPhysics {
   velocityY: number;
   onGround: boolean;
@@ -75,6 +72,8 @@ const TURN_SPEED = degToRad(120); // radians per second
 const GRAVITY = 20; // units per second^2
 const JUMP_VELOCITY = 8; // units per second
 const GROUND_Y = 1.7; // eye height
+const PLAYER_RADIUS = 0.4;
+const PLAYER_HEIGHT = 1.7;
 
 function Game() {
   const { exit } = useApp();
@@ -126,19 +125,6 @@ function Game() {
     return new MouseHandler(width, height);
   });
 
-  // Key timing ref - stores timestamp of last press and first press for each key
-  const defaultKeyState = (): KeyState => ({ lastPress: 0, firstPress: 0 });
-  const keysRef = useRef<KeyTiming>({
-    forward: defaultKeyState(),
-    backward: defaultKeyState(),
-    left: defaultKeyState(),
-    right: defaultKeyState(),
-    turnLeft: defaultKeyState(),
-    turnRight: defaultKeyState(),
-    lookUp: defaultKeyState(),
-    lookDown: defaultKeyState(),
-  });
-
   // Physics state ref
   const physicsRef = useRef<PlayerPhysics>({
     velocityY: 0,
@@ -177,9 +163,11 @@ function Game() {
   // Track player alive state for death sound
   const wasAliveRef = useRef(true);
 
-  // Player physics constants
-  const PLAYER_RADIUS = 0.4;
-  const PLAYER_HEIGHT = 1.7;
+  // Stdin-based key states (key -> last press timestamp) - fallback
+  const keyTimesRef = useRef<Map<string, number>>(new Map());
+
+  // Track if native keyboard is active
+  const useNativeKeyboardRef = useRef(false);
 
   const [scene] = useState(() => {
     const objects: RenderObject[] = [];
@@ -381,12 +369,119 @@ function Game() {
   // Track if we should exit
   const exitingRef = useRef(false);
 
-  // Set up raw input handling for smooth movement
+  // Helper function for player fire logic
+  const handlePlayerFire = (player: Player, weapon: ReturnType<Player['getCurrentWeapon']>, now: number) => {
+    if (!weapon) return;
+
+    const isKnife = weapon.def.type === 'knife';
+    const eyePos = player.getEyePosition();
+    const yaw = player.yaw;
+
+    // Play weapon sound
+    const weaponType = weapon.def.type;
+    if (weaponType === 'pistol') playSound('shoot_pistol');
+    else if (weaponType === 'rifle') playSound('shoot_rifle');
+    else if (weaponType === 'shotgun') playSound('shoot_shotgun');
+    else if (weaponType === 'sniper') playSound('shoot_sniper');
+
+    if (isKnife) {
+      // MELEE ATTACK
+      const meleeRange = weapon.def.range;
+      const spreadDir = player.getAimDirection();
+
+      const botHit = botManager.checkPlayerHit(eyePos, spreadDir, weapon.def.damage, meleeRange);
+
+      let wallHitDist = meleeRange + 1;
+      for (const collider of collidersRef.current) {
+        const result = rayAABBIntersection(eyePos, spreadDir, collider);
+        if (result.hit && result.distance < wallHitDist) {
+          wallHitDist = result.distance;
+        }
+      }
+
+      if (botHit && botHit.distance <= meleeRange && botHit.distance < wallHitDist) {
+        const damage = weapon.def.damage * (botHit.headshot ? weapon.def.headshotMultiplier : 1);
+        const wasAlive = botHit.bot.isAlive;
+        botHit.bot.takeDamage(damage, botHit.headshot);
+
+        renderer.triggerHitMarker();
+        playSound(botHit.headshot ? 'hit_headshot' : 'hit_enemy');
+
+        if (wasAlive && !botHit.bot.isAlive) {
+          player.kills++;
+          player.awardKill(weapon.def.type);
+          playSound('bot_death');
+          gameModeRef.current.registerKill(player.name, botHit.bot.name, weapon.def.name, botHit.headshot, now);
+          consoleLog(`You killed ${botHit.bot.name} with ${weapon.def.name}${botHit.headshot ? ' (headshot)' : ''}`);
+        }
+      }
+
+      renderer.triggerMuzzleFlash(100);
+    } else {
+      // RANGED ATTACK
+      renderer.triggerMuzzleFlash(80);
+
+      const spreadDir = player.getAimDirection();
+      const maxRange = weapon.def.range;
+
+      const botHit = botManager.checkPlayerHit(eyePos, spreadDir, weapon.def.damage, maxRange);
+
+      let wallHit: { distance: number; point: Vector3; normal: Vector3 } | null = null;
+      for (const collider of collidersRef.current) {
+        const result = rayAABBIntersection(eyePos, spreadDir, collider);
+        if (result.hit && (!wallHit || result.distance < wallHit.distance)) {
+          wallHit = { distance: result.distance, point: result.point, normal: result.normal };
+        }
+      }
+
+      let hitPoint: Vector3;
+      let hitWall = false;
+
+      if (botHit && (!wallHit || botHit.distance < wallHit.distance)) {
+        const damage = weapon.def.damage * (botHit.headshot ? weapon.def.headshotMultiplier : 1);
+        const wasAlive = botHit.bot.isAlive;
+        botHit.bot.takeDamage(damage, botHit.headshot);
+        hitPoint = Vector3.add(eyePos, Vector3.scale(spreadDir, botHit.distance));
+
+        renderer.triggerHitMarker();
+        playSound(botHit.headshot ? 'hit_headshot' : 'hit_enemy');
+
+        if (wasAlive && !botHit.bot.isAlive) {
+          player.kills++;
+          player.awardKill(weapon.def.type);
+          playSound('bot_death');
+          gameModeRef.current.registerKill(player.name, botHit.bot.name, weapon.def.name, botHit.headshot, now);
+          consoleLog(`You killed ${botHit.bot.name} with ${weapon.def.name}${botHit.headshot ? ' (headshot)' : ''}`);
+        }
+      } else if (wallHit) {
+        hitPoint = wallHit.point;
+        hitWall = true;
+      } else {
+        hitPoint = Vector3.add(eyePos, Vector3.scale(spreadDir, maxRange));
+      }
+
+      // Tracer
+      const cosYaw = Math.cos(yaw);
+      const sinYaw = Math.sin(yaw);
+      const muzzlePos = new Vector3(
+        eyePos.x + (-sinYaw * 0.8) + (cosYaw * 0.5),
+        eyePos.y - 0.5,
+        eyePos.z + (-cosYaw * 0.8) + (-sinYaw * 0.5)
+      );
+      renderer.spawnTracer(muzzlePos, hitPoint, 150);
+
+      if (hitWall && wallHit) {
+        renderer.spawnBulletDecal(wallHit.point, wallHit.normal);
+      }
+    }
+  };
+
+  // Set up raw input handling (mouse events, console, menu navigation)
+  // Game input is handled by uiohook-napi KeyboardHandler for true key state
   useEffect(() => {
     const handleData = (data: Buffer) => {
       if (exitingRef.current) return;
 
-      const keys = keysRef.current;
       const physics = physicsRef.current;
       const str = data.toString();
       const now = performance.now();
@@ -547,50 +642,46 @@ function Game() {
         return;
       }
 
-      // B key for buy menu (only during freeze phase)
-      if ((str === 'b' || str === 'B') && gameModeRef.current.canBuy()) {
-        buyMenu.toggle(playerRef.current);
-        return;
+      // Track key states for game controls via stdin
+      const keyTimes = keyTimesRef.current;
+      const key = str.toLowerCase();
+
+      // Movement keys (WASD + space)
+      if (key === 'w' || key === 'a' || key === 's' || key === 'd' || key === ' ') {
+        keyTimes.set(key, now);
       }
 
-      // Helper to update key state - tracks first press for ramp-up
-      const pressKey = (key: KeyState) => {
-        // If key wasn't held recently, this is a new press
-        if (now - key.lastPress > KEY_HOLD_TIME) {
-          key.firstPress = now;
+      // Arrow keys for look
+      if (str === '\x1b[A') keyTimes.set('up', now);
+      else if (str === '\x1b[B') keyTimes.set('down', now);
+      else if (str === '\x1b[C') keyTimes.set('right', now);
+      else if (str === '\x1b[D') keyTimes.set('left', now);
+
+      // Fire key (F)
+      if (key === 'f') {
+        keyTimes.set('f', now);
+      }
+
+      // Reload (R)
+      if (key === 'r') {
+        const player = playerRef.current;
+        if (player.reload(now)) {
+          playSound('reload');
         }
-        key.lastPress = now;
-      };
-
-      // Movement keys - store timestamp
-      if (str === 'w' || str === 'W') {
-        pressKey(keys.forward);
-      }
-      if (str === 's' || str === 'S') {
-        pressKey(keys.backward);
-      }
-      if (str === 'a' || str === 'A') {
-        pressKey(keys.left);
-      }
-      if (str === 'd' || str === 'D') {
-        pressKey(keys.right);
       }
 
-      // Arrow keys (escape sequences) - only for look when mouse not captured
-      if (str === '\x1b[A' || str === 'k') pressKey(keys.lookUp);    // Up arrow
-      if (str === '\x1b[B' || str === 'j') pressKey(keys.lookDown);  // Down arrow
-      if (str === '\x1b[C' || str === 'l') pressKey(keys.turnRight); // Right arrow
-      if (str === '\x1b[D' || str === 'h') pressKey(keys.turnLeft);  // Left arrow
-
-      // Jump
-      if (str === ' ' && physics.onGround) {
-        physics.velocityY = JUMP_VELOCITY;
-        physics.onGround = false;
-        playSound('jump');
+      // Tab for scoreboard
+      if (str === '\t') {
+        showScoreboardRef.current = !showScoreboardRef.current;
       }
 
-      // C key to toggle mouse capture (close to WASD)
-      if (str === 'c' || str === 'C') {
+      // B for buy menu (freeze phase only)
+      if (key === 'b' && gameModeRef.current.canBuy()) {
+        buyMenu.toggle(playerRef.current);
+      }
+
+      // C to toggle mouse capture
+      if (key === 'c') {
         if (mouseHandler.isCaptured()) {
           mouseHandler.release();
         } else {
@@ -598,41 +689,15 @@ function Game() {
         }
       }
 
-      // V key to toggle collision (debug)
-      if (str === 'v' || str === 'V') {
-        const newState = !collisionEnabledRef.current;
-        collisionEnabledRef.current = newState;
-        setCollisionEnabled(newState);
-      }
-
-      // Reload
-      if (str === 'r' || str === 'R') {
-        if (playerRef.current.reload(now)) {
-          playSound('reload');
-        }
-      }
-
-      // Weapon slots (1-5)
-      if (str >= '1' && str <= '5') {
-        playerRef.current.selectWeapon(parseInt(str) as WeaponSlot);
-      }
-
-      // Tab key for scoreboard toggle
-      if (str === '\t') {
-        showScoreboardRef.current = !showScoreboardRef.current;
-      }
-
-      // E key for weapon pickup
-      if (str === 'e' || str === 'E') {
+      // E for weapon pickup
+      if (key === 'e') {
         const player = playerRef.current;
         const droppedWeaponManager = getDroppedWeaponManager();
         const nearby = droppedWeaponManager.getWeaponsNear(player.position, 2.5);
         if (nearby.length > 0) {
           const weaponState = droppedWeaponManager.toWeaponState(nearby[0]);
           if (weaponState) {
-            // Drop current weapon in the same slot if any
             player.dropWeaponInSlot(weaponState.def.slot, now);
-            // Pick up the new weapon
             player.pickupWeapon(weaponState);
             droppedWeaponManager.removeWeapon(nearby[0].id);
             consoleLog(`Picked up ${weaponState.def.name}`);
@@ -640,188 +705,21 @@ function Game() {
         }
       }
 
-      // N key for restart when game is over
-      if ((str === 'n' || str === 'N') && gameModeRef.current.phase === 'match_end') {
-        // Restart the game
-        const spawn = loadedMap.spawns[Math.floor(Math.random() * loadedMap.spawns.length)];
-        const player = playerRef.current;
-
-        // Respawn player
-        player.respawn(
-          new Vector3(spawn.position[0], spawn.position[1], spawn.position[2]),
-          degToRad(spawn.angle)
-        );
-
-        // Update camera
-        const camera = renderer.getCamera();
-        camera.setPosition(spawn.position[0], spawn.position[1] + PLAYER_HEIGHT, spawn.position[2]);
-        camera.setYaw(degToRad(spawn.angle));
-        camera.setPitch(0);
-
-        // Clear and respawn bots
-        botManager.clear();
-        botManager.spawnBots(6, 'medium');
-
-        // Restart game mode
-        gameModeRef.current.restart(player, botManager.getBots(), performance.now());
-      }
-
-      // Fire (left click handled in mouse handler, but also allow F key)
-      // Block shooting during freeze phase
-      if ((str === 'f' || str === 'F') && !gameModeRef.current.isPlayerFrozen()) {
-        const player = playerRef.current;
-        const weapon = player.getCurrentWeapon();
-
-        if (player.fire(now) && weapon) {
-          const isKnife = weapon.def.type === 'knife';
-          const eyePos = player.getEyePosition();
-          const yaw = player.yaw;
-          const pitch = player.pitch;
-
-          // Play weapon sound
-          const weaponType = weapon.def.type;
-          if (weaponType === 'pistol') playSound('shoot_pistol');
-          else if (weaponType === 'rifle') playSound('shoot_rifle');
-          else if (weaponType === 'shotgun') playSound('shoot_shotgun');
-          else if (weaponType === 'sniper') playSound('shoot_sniper');
-
-          if (isKnife) {
-            // MELEE ATTACK - knife has limited range, no tracer, no decal
-            const meleeRange = weapon.def.range; // Usually ~2 units
-            const spreadDir = player.getAimDirection();
-
-            // Check for bot hits within melee range
-            const botHit = botManager.checkPlayerHit(eyePos, spreadDir, weapon.def.damage, meleeRange);
-
-            // Check for wall hits (to see if wall is closer than bot)
-            let wallHitDist = meleeRange + 1;
-            for (const collider of collidersRef.current) {
-              const result = rayAABBIntersection(eyePos, spreadDir, collider);
-              if (result.hit && result.distance < wallHitDist) {
-                wallHitDist = result.distance;
-              }
-            }
-
-            // If we hit a bot and it's closer than any wall
-            if (botHit && botHit.distance <= meleeRange && botHit.distance < wallHitDist) {
-              const damage = weapon.def.damage * (botHit.headshot ? weapon.def.headshotMultiplier : 1);
-              const wasAlive = botHit.bot.isAlive;
-              botHit.bot.takeDamage(damage, botHit.headshot);
-
-              // Trigger hit marker and sound
-              renderer.triggerHitMarker();
-              playSound(botHit.headshot ? 'hit_headshot' : 'hit_enemy');
-
-              // Award kill if bot died
-              if (wasAlive && !botHit.bot.isAlive) {
-                player.kills++;
-                player.awardKill(weapon.def.type);
-                playSound('bot_death');
-                gameModeRef.current.registerKill(
-                  player.name,
-                  botHit.bot.name,
-                  weapon.def.name,
-                  botHit.headshot,
-                  now
-                );
-                consoleLog(`You killed ${botHit.bot.name} with ${weapon.def.name}${botHit.headshot ? ' (headshot)' : ''}`);
-              }
-            }
-
-            // Swing animation
-            renderer.triggerMuzzleFlash(100);
-
-          } else {
-            // RANGED ATTACK - guns have tracer and decal
-            renderer.triggerMuzzleFlash(80);
-
-            // For hit detection, use aim with weapon spread
-            const spreadDir = player.getAimDirection();
-            const maxRange = weapon.def.range;
-
-            // Check hit against bots first
-            const botHit = botManager.checkPlayerHit(eyePos, spreadDir, weapon.def.damage, maxRange);
-
-            // Check hit against map colliders
-            let wallHit: { distance: number; point: Vector3; normal: Vector3 } | null = null;
-            for (const collider of collidersRef.current) {
-              const result = rayAABBIntersection(eyePos, spreadDir, collider);
-              if (result.hit && (!wallHit || result.distance < wallHit.distance)) {
-                wallHit = {
-                  distance: result.distance,
-                  point: result.point,
-                  normal: result.normal,
-                };
-              }
-            }
-
-            // Determine what we hit (bot or wall, whichever is closer)
-            let hitPoint: Vector3;
-            let hitWall = false;
-
-            if (botHit && (!wallHit || botHit.distance < wallHit.distance)) {
-              // Hit a bot!
-              const damage = weapon.def.damage * (botHit.headshot ? weapon.def.headshotMultiplier : 1);
-              const wasAlive = botHit.bot.isAlive;
-              botHit.bot.takeDamage(damage, botHit.headshot);
-              hitPoint = Vector3.add(eyePos, Vector3.scale(spreadDir, botHit.distance));
-
-              // Trigger hit marker feedback
-              renderer.triggerHitMarker();
-
-              // Play hit sound
-              playSound(botHit.headshot ? 'hit_headshot' : 'hit_enemy');
-
-              // Award kill if bot died
-              if (wasAlive && !botHit.bot.isAlive) {
-                player.kills++;
-                player.awardKill(weapon.def.type);
-                playSound('bot_death');
-                // Register kill in game mode for kill feed
-                gameModeRef.current.registerKill(
-                  player.name,
-                  botHit.bot.name,
-                  weapon.def.name,
-                  botHit.headshot,
-                  now
-                );
-                consoleLog(`You killed ${botHit.bot.name} with ${weapon.def.name}${botHit.headshot ? ' (headshot)' : ''}`);
-              }
-            } else if (wallHit) {
-              hitPoint = wallHit.point;
-              hitWall = true;
-            } else {
-              hitPoint = Vector3.add(eyePos, Vector3.scale(spreadDir, maxRange));
-            }
-
-            // Calculate muzzle position in world space
-            const cosYaw = Math.cos(yaw);
-            const sinYaw = Math.sin(yaw);
-
-            const muzzleForward = 0.8;
-            const muzzleRight = 0.5;
-            const muzzleDown = 0.5;
-
-            const muzzlePos = new Vector3(
-              eyePos.x + (-sinYaw * muzzleForward) + (cosYaw * muzzleRight),
-              eyePos.y - muzzleDown,
-              eyePos.z + (-cosYaw * muzzleForward) + (-sinYaw * muzzleRight)
-            );
-
-            // Spawn tracer from muzzle to hit point
-            renderer.spawnTracer(muzzlePos, hitPoint, 150);
-
-            // Spawn bullet hole decal only if we hit a wall
-            if (hitWall && wallHit) {
-              renderer.spawnBulletDecal(wallHit.point, wallHit.normal);
-            }
-          }
-        }
+      // Weapon slots (1-5)
+      if (str >= '1' && str <= '5') {
+        playerRef.current.selectWeapon(parseInt(str) as WeaponSlot);
       }
     };
 
-    // Enable mouse tracking
+    // Enable mouse tracking (user must click to capture)
     mouseHandler.enable();
+
+    // Try to initialize native keyboard (falls back to stdin if unavailable)
+    useNativeKeyboardRef.current = initNativeKeyboard();
+
+    // Log input mode to game console
+    const inputMode = getInputMode();
+    consoleLog(`Input: ${inputMode === 'native' ? 'Native (CGEventTap)' : 'Stdin (fallback)'}`);
 
     process.stdin.setRawMode(true);
     process.stdin.resume();
@@ -829,6 +727,7 @@ function Game() {
 
     return () => {
       mouseHandler.disable();
+      stopNativeKeyboard();
       process.stdin.setRawMode(false);
       process.stdin.pause();
       process.stdin.off('data', handleData);
@@ -839,21 +738,12 @@ function Game() {
   useEffect(() => {
     let running = true;
     let lastTime = performance.now();
+    let lastJumpTime = 0; // Prevent jump spam
 
-    // Helper to check if a key is "held" (pressed within KEY_HOLD_TIME ms)
-    const isKeyHeld = (key: KeyState, now: number) => {
-      return key.lastPress > 0 && (now - key.lastPress) < KEY_HOLD_TIME;
-    };
-
-    // Get movement multiplier based on hold duration (tap = small, hold = full)
-    // Ramps from KEY_TAP_MULTIPLIER to 1.0 over KEY_RAMP_TIME
-    const getKeyMultiplier = (key: KeyState, now: number): number => {
-      if (!isKeyHeld(key, now)) return 0;
-      const holdDuration = now - key.firstPress;
-      if (holdDuration >= KEY_RAMP_TIME) return 1.0;
-      // Linear ramp from TAP_MULTIPLIER to 1.0
-      const t = holdDuration / KEY_RAMP_TIME;
-      return KEY_TAP_MULTIPLIER + t * (1.0 - KEY_TAP_MULTIPLIER);
+    // Helper: check if key is currently "held" via stdin (fallback)
+    const isKeyHeld = (key: string, now: number): boolean => {
+      const lastPress = keyTimesRef.current.get(key);
+      return lastPress !== undefined && (now - lastPress) < KEY_HOLD_MS;
     };
 
     const gameLoop = () => {
@@ -864,8 +754,91 @@ function Game() {
       lastTime = now;
 
       const camera = renderer.getCamera();
-      const keys = keysRef.current;
       const physics = physicsRef.current;
+      const useNative = useNativeKeyboardRef.current && isNativeKeyboardAvailable();
+
+      // Process keyboard input - native or stdin fallback
+      let forward = 0;
+      let strafe = 0;
+      let lookYaw = 0;
+      let lookPitch = 0;
+      let jumpPressed = false;
+      let firePressed = false;
+
+      if (useNative) {
+        // Native keyboard input (true key state)
+        const movement = getNativeMovement();
+        forward = movement.forward;
+        strafe = movement.strafe;
+        jumpPressed = movement.jump;
+
+        const look = getNativeLook();
+        lookYaw = look.yaw;
+        lookPitch = look.pitch;
+
+        firePressed = isGameKeyDown('F');
+
+        // Handle weapon slots via native
+        const slot = getNativeWeaponSlot();
+        if (slot !== null) {
+          playerRef.current.selectWeapon(slot as WeaponSlot);
+        }
+
+        // Handle other action keys via native
+        if (wasGameKeyJustPressed('R')) {
+          if (playerRef.current.reload(now)) {
+            playSound('reload');
+          }
+        }
+
+        if (wasGameKeyJustPressed('Tab')) {
+          showScoreboardRef.current = !showScoreboardRef.current;
+        }
+
+        if (wasGameKeyJustPressed('B') && gameModeRef.current.canBuy()) {
+          buyMenu.toggle(playerRef.current);
+        }
+
+        if (wasGameKeyJustPressed('C')) {
+          if (mouseHandler.isCaptured()) {
+            mouseHandler.release();
+          } else {
+            mouseHandler.capture();
+          }
+        }
+
+        if (wasGameKeyJustPressed('E')) {
+          const player = playerRef.current;
+          const droppedWeaponManager = getDroppedWeaponManager();
+          const nearby = droppedWeaponManager.getWeaponsNear(player.position, 2.5);
+          if (nearby.length > 0) {
+            const weaponState = droppedWeaponManager.toWeaponState(nearby[0]);
+            if (weaponState) {
+              player.dropWeaponInSlot(weaponState.def.slot, now);
+              player.pickupWeapon(weaponState);
+              droppedWeaponManager.removeWeapon(nearby[0].id);
+              consoleLog(`Picked up ${weaponState.def.name}`);
+            }
+          }
+        }
+
+        // Clear just pressed/released flags for next frame
+        updateNativeKeyboard();
+      } else {
+        // Stdin fallback
+        if (isKeyHeld('w', now)) forward += 1;
+        if (isKeyHeld('s', now)) forward -= 1;
+        if (isKeyHeld('a', now)) strafe -= 1;
+        if (isKeyHeld('d', now)) strafe += 1;
+
+        if (isKeyHeld('left', now)) lookYaw -= 1;
+        if (isKeyHeld('right', now)) lookYaw += 1;
+        if (isKeyHeld('up', now)) lookPitch += 1;
+        if (isKeyHeld('down', now)) lookPitch -= 1;
+
+        jumpPressed = isKeyHeld(' ', now);
+        firePressed = isKeyHeld('f', now);
+      }
 
       // Apply rotation from mouse (if captured)
       if (mouseHandler.isCaptured()) {
@@ -876,31 +849,39 @@ function Game() {
         mouseHandler.resetDelta();
       }
 
-      // Apply rotation from keyboard with tap/hold multiplier
-      const turnLeftMult = getKeyMultiplier(keys.turnLeft, now);
-      const turnRightMult = getKeyMultiplier(keys.turnRight, now);
-      const lookUpMult = getKeyMultiplier(keys.lookUp, now);
-      const lookDownMult = getKeyMultiplier(keys.lookDown, now);
-      if (turnLeftMult > 0) camera.rotate(0, TURN_SPEED * deltaTime * turnLeftMult);
-      if (turnRightMult > 0) camera.rotate(0, -TURN_SPEED * deltaTime * turnRightMult);
-      if (lookUpMult > 0) camera.rotate(TURN_SPEED * deltaTime * lookUpMult, 0);
-      if (lookDownMult > 0) camera.rotate(-TURN_SPEED * deltaTime * lookDownMult, 0);
+      // Apply rotation from keyboard (arrow keys)
+      if (lookYaw !== 0) camera.rotate(0, -TURN_SPEED * deltaTime * lookYaw);
+      if (lookPitch !== 0) camera.rotate(TURN_SPEED * deltaTime * lookPitch, 0);
 
       // Check if player is frozen (freeze phase in competitive mode)
       const playerFrozen = gameModeRef.current.isPlayerFrozen();
 
-      // Calculate movement direction with tap/hold multiplier (blocked during freeze phase)
+      // Calculate movement direction (blocked during freeze phase)
       let moveForward = 0;
       let moveRight = 0;
       if (!playerFrozen) {
-        const fwdMult = getKeyMultiplier(keys.forward, now);
-        const backMult = getKeyMultiplier(keys.backward, now);
-        const leftMult = getKeyMultiplier(keys.left, now);
-        const rightMult = getKeyMultiplier(keys.right, now);
-        if (fwdMult > 0) moveForward += MOVE_SPEED * deltaTime * fwdMult;
-        if (backMult > 0) moveForward -= MOVE_SPEED * deltaTime * backMult;
-        if (leftMult > 0) moveRight -= MOVE_SPEED * deltaTime * leftMult;
-        if (rightMult > 0) moveRight += MOVE_SPEED * deltaTime * rightMult;
+        moveForward = forward * MOVE_SPEED * deltaTime;
+        moveRight = strafe * MOVE_SPEED * deltaTime;
+      }
+
+      // Handle jump (with cooldown to prevent spam from key repeat)
+      if (jumpPressed && physics.onGround && (now - lastJumpTime) > 300) {
+        physics.velocityY = JUMP_VELOCITY;
+        physics.onGround = false;
+        lastJumpTime = now;
+        playSound('jump');
+      }
+
+      // Handle fire key (F) - continuous fire while held
+      const gameConsole = getGameConsole();
+      if (!gameConsole.getIsOpen() && appModeRef.current === 'playing') {
+        if (firePressed && !gameModeRef.current.isPlayerFrozen()) {
+          const player = playerRef.current;
+          const weapon = player.getCurrentWeapon();
+          if (player.fire(now) && weapon) {
+            handlePlayerFire(player, weapon, now);
+          }
+        }
       }
 
       // Get movement vector in world space

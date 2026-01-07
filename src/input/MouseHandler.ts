@@ -116,6 +116,9 @@ export class MouseHandler {
     this.lastX = this.centerX;
     this.lastY = this.centerY;
 
+    // Reset any accumulated movement to prevent drift
+    this.resetSmoothing();
+
     // Get current mouse position as lock point using robotjs
     if (this.useRobotCapture) {
       try {
@@ -136,6 +139,7 @@ export class MouseHandler {
   release(): void {
     this.state.captured = false;
     this.recenterPending = false;
+    this.resetSmoothing();  // Clear any accumulated movement
     this.onCapture?.(false);
   }
 

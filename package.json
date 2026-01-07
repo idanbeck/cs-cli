@@ -1,18 +1,44 @@
 {
-  "name": "cs-cli",
-  "version": "0.1.0",
-  "description": "Terminal-based Counter-Strike clone with true 3D rendering",
+  "name": "csterm",
+  "version": "1.0.1",
+  "description": "Counter-Strike in your terminal - true 3D FPS with software rendering",
   "type": "module",
   "main": "dist/index.js",
+  "bin": {
+    "csterm": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "native"
+  ],
   "scripts": {
     "play": "npx tsx src/index.tsx 2>/dev/null",
     "dev": "bun run src/index.tsx 2>/dev/null",
     "dev:tsx": "tsx src/index.tsx 2>/dev/null",
     "build": "tsc",
-    "start": "bun dist/index.js 2>/dev/null"
+    "build:native": "cd native && node-gyp rebuild",
+    "postinstall": "node-gyp rebuild --directory=native || echo 'Native keyboard module build failed (optional)'",
+    "start": "node dist/index.js 2>/dev/null"
+  },
+  "keywords": [
+    "cli",
+    "terminal",
+    "game",
+    "fps",
+    "counter-strike",
+    "3d",
+    "ascii",
+    "tui"
+  ],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": ""
   },
   "dependencies": {
     "ink": "^5.0.1",
+    "node-addon-api": "^8.5.0",
     "react": "^18.3.1",
     "robotjs": "^0.6.0",
     "speaker": "^0.5.5"
@@ -21,6 +47,7 @@
     "@types/bun": "latest",
     "@types/node": "^22.10.2",
     "@types/react": "^18.3.12",
+    "node-gyp": "^10.3.1",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   }
