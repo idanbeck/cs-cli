@@ -44,18 +44,25 @@ interface GameState {
   team: TeamId;
 }
 
+interface KeyState {
+  lastPress: number;   // Last time key was pressed (for hold detection)
+  firstPress: number;  // When the key was first pressed (for ramp-up)
+}
+
 interface KeyTiming {
-  forward: number;
-  backward: number;
-  left: number;
-  right: number;
-  turnLeft: number;
-  turnRight: number;
-  lookUp: number;
-  lookDown: number;
+  forward: KeyState;
+  backward: KeyState;
+  left: KeyState;
+  right: KeyState;
+  turnLeft: KeyState;
+  turnRight: KeyState;
+  lookUp: KeyState;
+  lookDown: KeyState;
 }
 
 const KEY_HOLD_TIME = 300; // ms to keep key "held" after press (needs to be longer than terminal key repeat)
+const KEY_RAMP_TIME = 150; // ms before full speed kicks in
+const KEY_TAP_MULTIPLIER = 0.25; // Movement multiplier for initial tap (fine control)
 
 interface PlayerPhysics {
   velocityY: number;
@@ -119,16 +126,17 @@ function Game() {
     return new MouseHandler(width, height);
   });
 
-  // Key timing ref - stores timestamp of last press for each key
+  // Key timing ref - stores timestamp of last press and first press for each key
+  const defaultKeyState = (): KeyState => ({ lastPress: 0, firstPress: 0 });
   const keysRef = useRef<KeyTiming>({
-    forward: 0,
-    backward: 0,
-    left: 0,
-    right: 0,
-    turnLeft: 0,
-    turnRight: 0,
-    lookUp: 0,
-    lookDown: 0,
+    forward: defaultKeyState(),
+    backward: defaultKeyState(),
+    left: defaultKeyState(),
+    right: defaultKeyState(),
+    turnLeft: defaultKeyState(),
+    turnRight: defaultKeyState(),
+    lookUp: defaultKeyState(),
+    lookDown: defaultKeyState(),
   });
 
   // Physics state ref
@@ -228,8 +236,7 @@ function Game() {
       playSoundAt(soundType as SoundType, position);
     });
 
-    // Spawn more bots for larger map
-    botManager.spawnBots(6, 'medium'); // Spawn 6 medium difficulty bots
+    // Don't spawn bots yet - wait until player starts game from menu
 
     // Set up main menu display (don't start game yet)
     renderer.setMainMenu(mainMenu, true);
@@ -428,13 +435,17 @@ function Game() {
 
           // Configure game mode based on selection
           const config = result.mode === 'competitive'
-            ? { ...DEFAULT_COMPETITIVE_CONFIG }
-            : { ...DEFAULT_DEATHMATCH_CONFIG, killLimit: 15, timeLimit: 300, warmupTime: 3 };
+            ? { ...DEFAULT_COMPETITIVE_CONFIG, warmupTime: 5 }
+            : { ...DEFAULT_DEATHMATCH_CONFIG, warmupTime: 3, freezeTime: 5 };  // Shorter times for DM
           gameModeRef.current = new GameMode(config);
 
           // Reset team manager
           resetTeamManager();
           resetDroppedWeaponManager();
+
+          // Spawn bots for the game
+          botManager.clear();  // Clear any existing bots first
+          botManager.spawnBots(6, 'medium');
 
           // Set up teams if competitive mode
           const isTeamMode = result.mode === 'competitive';
@@ -542,25 +553,34 @@ function Game() {
         return;
       }
 
+      // Helper to update key state - tracks first press for ramp-up
+      const pressKey = (key: KeyState) => {
+        // If key wasn't held recently, this is a new press
+        if (now - key.lastPress > KEY_HOLD_TIME) {
+          key.firstPress = now;
+        }
+        key.lastPress = now;
+      };
+
       // Movement keys - store timestamp
       if (str === 'w' || str === 'W') {
-        keys.forward = now;
+        pressKey(keys.forward);
       }
       if (str === 's' || str === 'S') {
-        keys.backward = now;
+        pressKey(keys.backward);
       }
       if (str === 'a' || str === 'A') {
-        keys.left = now;
+        pressKey(keys.left);
       }
       if (str === 'd' || str === 'D') {
-        keys.right = now;
+        pressKey(keys.right);
       }
 
       // Arrow keys (escape sequences) - only for look when mouse not captured
-      if (str === '\x1b[A' || str === 'k') keys.lookUp = now;    // Up arrow
-      if (str === '\x1b[B' || str === 'j') keys.lookDown = now;  // Down arrow
-      if (str === '\x1b[C' || str === 'l') keys.turnRight = now; // Right arrow
-      if (str === '\x1b[D' || str === 'h') keys.turnLeft = now;  // Left arrow
+      if (str === '\x1b[A' || str === 'k') pressKey(keys.lookUp);    // Up arrow
+      if (str === '\x1b[B' || str === 'j') pressKey(keys.lookDown);  // Down arrow
+      if (str === '\x1b[C' || str === 'l') pressKey(keys.turnRight); // Right arrow
+      if (str === '\x1b[D' || str === 'h') pressKey(keys.turnLeft);  // Left arrow
 
       // Jump
       if (str === ' ' && physics.onGround) {
@@ -821,8 +841,19 @@ function Game() {
     let lastTime = performance.now();
 
     // Helper to check if a key is "held" (pressed within KEY_HOLD_TIME ms)
-    const isKeyHeld = (keyTime: number, now: number) => {
-      return keyTime > 0 && (now - keyTime) < KEY_HOLD_TIME;
+    const isKeyHeld = (key: KeyState, now: number) => {
+      return key.lastPress > 0 && (now - key.lastPress) < KEY_HOLD_TIME;
+    };
+
+    // Get movement multiplier based on hold duration (tap = small, hold = full)
+    // Ramps from KEY_TAP_MULTIPLIER to 1.0 over KEY_RAMP_TIME
+    const getKeyMultiplier = (key: KeyState, now: number): number => {
+      if (!isKeyHeld(key, now)) return 0;
+      const holdDuration = now - key.firstPress;
+      if (holdDuration >= KEY_RAMP_TIME) return 1.0;
+      // Linear ramp from TAP_MULTIPLIER to 1.0
+      const t = holdDuration / KEY_RAMP_TIME;
+      return KEY_TAP_MULTIPLIER + t * (1.0 - KEY_TAP_MULTIPLIER);
     };
 
     const gameLoop = () => {
@@ -845,23 +876,31 @@ function Game() {
         mouseHandler.resetDelta();
       }
 
-      // Apply rotation from keyboard (always available as fallback)
-      if (isKeyHeld(keys.turnLeft, now)) camera.rotate(0, TURN_SPEED * deltaTime);
-      if (isKeyHeld(keys.turnRight, now)) camera.rotate(0, -TURN_SPEED * deltaTime);
-      if (isKeyHeld(keys.lookUp, now)) camera.rotate(TURN_SPEED * deltaTime, 0);
-      if (isKeyHeld(keys.lookDown, now)) camera.rotate(-TURN_SPEED * deltaTime, 0);
+      // Apply rotation from keyboard with tap/hold multiplier
+      const turnLeftMult = getKeyMultiplier(keys.turnLeft, now);
+      const turnRightMult = getKeyMultiplier(keys.turnRight, now);
+      const lookUpMult = getKeyMultiplier(keys.lookUp, now);
+      const lookDownMult = getKeyMultiplier(keys.lookDown, now);
+      if (turnLeftMult > 0) camera.rotate(0, TURN_SPEED * deltaTime * turnLeftMult);
+      if (turnRightMult > 0) camera.rotate(0, -TURN_SPEED * deltaTime * turnRightMult);
+      if (lookUpMult > 0) camera.rotate(TURN_SPEED * deltaTime * lookUpMult, 0);
+      if (lookDownMult > 0) camera.rotate(-TURN_SPEED * deltaTime * lookDownMult, 0);
 
       // Check if player is frozen (freeze phase in competitive mode)
       const playerFrozen = gameModeRef.current.isPlayerFrozen();
 
-      // Calculate movement direction (blocked during freeze phase)
+      // Calculate movement direction with tap/hold multiplier (blocked during freeze phase)
       let moveForward = 0;
       let moveRight = 0;
       if (!playerFrozen) {
-        if (isKeyHeld(keys.forward, now)) moveForward += MOVE_SPEED * deltaTime;
-        if (isKeyHeld(keys.backward, now)) moveForward -= MOVE_SPEED * deltaTime;
-        if (isKeyHeld(keys.left, now)) moveRight -= MOVE_SPEED * deltaTime;
-        if (isKeyHeld(keys.right, now)) moveRight += MOVE_SPEED * deltaTime;
+        const fwdMult = getKeyMultiplier(keys.forward, now);
+        const backMult = getKeyMultiplier(keys.backward, now);
+        const leftMult = getKeyMultiplier(keys.left, now);
+        const rightMult = getKeyMultiplier(keys.right, now);
+        if (fwdMult > 0) moveForward += MOVE_SPEED * deltaTime * fwdMult;
+        if (backMult > 0) moveForward -= MOVE_SPEED * deltaTime * backMult;
+        if (leftMult > 0) moveRight -= MOVE_SPEED * deltaTime * leftMult;
+        if (rightMult > 0) moveRight += MOVE_SPEED * deltaTime * rightMult;
       }
 
       // Get movement vector in world space
@@ -940,18 +979,23 @@ function Game() {
         renderer.setWeaponSprite(sprite);
       }
 
+      // Only run game logic when actually playing (not in menu)
+      const isPlaying = appModeRef.current === 'playing';
+
       // Check if player is frozen (freeze phase)
       const gameMode = gameModeRef.current;
       const isTeamMode = gameModeTypeRef.current === 'competitive';
       const isFrozen = gameMode.isPlayerFrozen();
 
-      // Update bots (pass freeze and team mode info)
-      botManager.update(player, collidersRef.current, now, deltaTime, isFrozen, isTeamMode);
+      // Update bots only when playing (pass freeze and team mode info)
+      if (isPlaying) {
+        botManager.update(player, collidersRef.current, now, deltaTime, isFrozen, isTeamMode);
 
-      // Bot combat is now handled by BotManager.update() via callbacks
+        // Bot combat is now handled by BotManager.update() via callbacks
 
-      // Update game mode
-      gameMode.update(player, botManager.getBots(), now);
+        // Update game mode
+        gameMode.update(player, botManager.getBots(), now);
+      }
 
       // Handle death camera effect
       renderer.setPlayerDead(!player.isAlive, deltaTime);
@@ -1026,15 +1070,14 @@ function Game() {
         Math.ceil(gameMode.getWarmupRemaining(now))
       );
 
-      // Set competitive mode UI data
+      // Set freeze time for ALL modes (not just competitive)
+      renderer.setFreezeTime(gameMode.getFreezeTimeRemaining(now));
+
+      // Set team-specific UI data for competitive mode
       if (isTeamMode) {
         renderer.setTeamScores(gameMode.round.tScore, gameMode.round.ctScore, gameMode.round.roundNumber);
         renderer.setPlayerTeam(player.team);
         renderer.setPlayerMoney(player.economy.getMoney());
-        renderer.setFreezeTime(gameMode.getFreezeTimeRemaining(now));
-      } else {
-        // Reset competitive UI for deathmatch
-        renderer.setFreezeTime(0);
       }
 
       // Update dropped weapons in renderer
@@ -1087,43 +1130,9 @@ function Game() {
 
 // Main entry point
 async function main() {
-  console.log('Starting CS-CLI...');
-  console.log('');
-  console.log('Controls:');
-  console.log('  WASD        - Move');
-  console.log('  Arrow keys  - Look around (keyboard)');
-  console.log('  Mouse       - Look around (when captured)');
-  console.log('  Click / C   - Capture/release mouse');
-  console.log('  Space       - Jump');
-  console.log('  F           - Fire weapon');
-  console.log('  R           - Reload');
-  console.log('  E           - Pick up weapon');
-  console.log('  B           - Open buy menu (freeze phase)');
-  console.log('  1-5         - Select weapon');
-  console.log('  Tab         - Show scoreboard');
-  console.log('  ~           - Open debug console');
-  console.log('  N           - New game (when game over)');
-  console.log('  Esc         - Release mouse / Quit');
-  console.log('  Q           - Quit');
-  console.log('');
-  console.log('Press any key to start...');
-
-  // Wait for a keypress
-  await new Promise<void>((resolve) => {
-    process.stdin.setRawMode(true);
-    process.stdin.resume();
-    process.stdin.once('data', () => {
-      process.stdin.setRawMode(false);
-      resolve();
-    });
-  });
-
-  // Render the game
+  // Go straight to GUI - press H in main menu for help
   const { waitUntilExit } = render(<Game />);
-
   await waitUntilExit();
-
-  console.log('Thanks for playing CS-CLI!');
 }
 
 main().catch(console.error);

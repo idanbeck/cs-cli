@@ -3,7 +3,7 @@
 
 import { GameModeType } from '../game/GameMode.js';
 
-export type MenuScreen = 'main' | 'mode_select' | 'map_select' | 'settings';
+export type MenuScreen = 'main' | 'mode_select' | 'map_select' | 'settings' | 'help';
 
 export interface MapInfo {
   id: string;
@@ -33,7 +33,33 @@ export class MainMenu {
   private state: MainMenuState;
 
   // Menu items for each screen
-  private mainMenuItems = ['Play', 'Settings', 'Quit'];
+  private mainMenuItems = ['Play', 'Help', 'Settings', 'Quit'];
+
+  // Help content
+  private helpLines = [
+    '=== CONTROLS ===',
+    '',
+    'WASD / Arrows  - Move / Look',
+    'Mouse          - Look (click to capture)',
+    'C              - Toggle mouse capture',
+    'Space          - Jump',
+    'F / Click      - Fire weapon',
+    'R              - Reload',
+    'E              - Pick up weapon',
+    'B              - Buy menu (freeze phase)',
+    '1-5            - Select weapon',
+    'Tab            - Scoreboard',
+    '~              - Debug console',
+    'Esc            - Release mouse / Quit',
+    'Q              - Quit',
+    '',
+    '=== TIPS ===',
+    '',
+    'Tap keys for fine movement',
+    'Hold keys for full speed',
+    '',
+    'Press any key to go back...',
+  ];
   private modeMenuItems: { label: string; mode: GameModeType }[] = [
     { label: 'Deathmatch (FFA)', mode: 'deathmatch' },
     { label: 'Competitive (Team)', mode: 'competitive' },
@@ -79,9 +105,21 @@ export class MainMenu {
         return this.getAvailableMaps().map(m => m.name);
       case 'settings':
         return ['Back'];
+      case 'help':
+        return []; // Help screen has no selectable items
       default:
         return [];
     }
+  }
+
+  // Get help text lines
+  getHelpLines(): string[] {
+    return this.helpLines;
+  }
+
+  // Check if we're on the help screen
+  isHelpScreen(): boolean {
+    return this.state.screen === 'help';
   }
 
   // Get maps available for current mode
@@ -125,6 +163,10 @@ export class MainMenu {
     switch (item) {
       case 'Play':
         this.state.screen = 'mode_select';
+        this.state.selectedIndex = 0;
+        return { action: 'navigate' };
+      case 'Help':
+        this.state.screen = 'help';
         this.state.selectedIndex = 0;
         return { action: 'navigate' };
       case 'Settings':
@@ -180,9 +222,13 @@ export class MainMenu {
         this.state.screen = 'mode_select';
         this.state.selectedIndex = 0;
         break;
+      case 'help':
+        this.state.screen = 'main';
+        this.state.selectedIndex = 1; // Help item
+        break;
       case 'settings':
         this.state.screen = 'main';
-        this.state.selectedIndex = 1; // Settings item
+        this.state.selectedIndex = 2; // Settings item
         break;
     }
   }
@@ -202,6 +248,8 @@ export class MainMenu {
         return 'Select Game Mode';
       case 'map_select':
         return 'Select Map';
+      case 'help':
+        return 'Help';
       case 'settings':
         return 'Settings';
       default:
@@ -235,6 +283,12 @@ export class MainMenu {
 
   // Handle key input - returns result of selection if any
   handleKey(key: string): { action: 'start_game' | 'quit' | 'navigate' | 'back' | 'none'; mode?: GameModeType; map?: string } {
+    // Help screen - any key goes back
+    if (this.state.screen === 'help') {
+      this.back();
+      return { action: 'back' };
+    }
+
     switch (key) {
       case 'up':
       case 'w':
@@ -252,6 +306,14 @@ export class MainMenu {
         if (this.state.screen !== 'main') {
           this.back();
           return { action: 'back' };
+        }
+        return { action: 'none' };
+      // H key as shortcut to help from main menu
+      case 'h':
+      case 'H':
+        if (this.state.screen === 'main') {
+          this.state.screen = 'help';
+          return { action: 'navigate' };
         }
         return { action: 'none' };
       default:

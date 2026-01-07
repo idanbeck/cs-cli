@@ -1,5 +1,8 @@
 // Mouse handling for terminal using SGR 1006 extended mode
 // Works in modern terminals: iTerm2, Ghostty, Kitty, etc.
+// Uses robotjs to recenter mouse for true FPS-style capture
+
+import robot from 'robotjs';
 
 export interface MouseState {
   x: number;
@@ -32,7 +35,7 @@ export class MouseHandler {
   };
 
   private config: MouseConfig = {
-    sensitivity: 1.0,  // Base sensitivity (lower for smoother control)
+    sensitivity: 2.0,  // Sensitivity for robotjs-based capture
     invertY: false
   };
 
@@ -43,12 +46,18 @@ export class MouseHandler {
   private screenWidth: number = 80;
   private screenHeight: number = 24;
   private enabled: boolean = false;
-  private releaseOnEdge: boolean = true; // Release capture when mouse hits edge
+  private releaseOnEdge: boolean = false; // Don't release capture at edges (use Esc instead)
+
+  // robotjs-based capture
+  private lockX: number = 0;  // Screen pixel position to lock mouse to
+  private lockY: number = 0;
+  private useRobotCapture: boolean = true;  // Use robotjs for true capture
+  private recenterPending: boolean = false;  // Flag to skip movement caused by recentering
 
   // Smoothing for continuous mouse movement
   private smoothedDeltaX: number = 0;
   private smoothedDeltaY: number = 0;
-  private smoothingFactor: number = 0.3; // How much of target to apply per frame (0-1)
+  private smoothingFactor: number = 0.7; // How much of target to apply per frame (higher = more responsive)
 
   private onMove?: (deltaX: number, deltaY: number) => void;
   private onClick?: (button: number, x: number, y: number) => void;
@@ -106,12 +115,27 @@ export class MouseHandler {
     this.state.captured = true;
     this.lastX = this.centerX;
     this.lastY = this.centerY;
+
+    // Get current mouse position as lock point using robotjs
+    if (this.useRobotCapture) {
+      try {
+        const pos = robot.getMousePos();
+        this.lockX = pos.x;
+        this.lockY = pos.y;
+        this.recenterPending = false;
+      } catch (e) {
+        // robotjs not available, fall back to terminal-only mode
+        this.useRobotCapture = false;
+      }
+    }
+
     this.onCapture?.(true);
   }
 
   // Release mouse capture
   release(): void {
     this.state.captured = false;
+    this.recenterPending = false;
     this.onCapture?.(false);
   }
 
@@ -180,30 +204,69 @@ export class MouseHandler {
     this.state.x = x;
     this.state.y = y;
 
-    // Check if mouse has left the terminal area (release capture)
-    if (this.state.captured && this.releaseOnEdge && this.isAtEdge(x, y)) {
+    // Check if mouse has left the terminal area (release capture) - only for non-robot mode
+    if (this.state.captured && !this.useRobotCapture && this.releaseOnEdge && this.isAtEdge(x, y)) {
       this.release();
-      // Reset last position to center so next capture doesn't jump
       this.lastX = this.centerX;
       this.lastY = this.centerY;
       return;
     }
 
     if (this.state.captured) {
-      // In captured mode, calculate delta from last position
-      const rawDeltaX = x - this.lastX;
-      const rawDeltaY = y - this.lastY;
+      if (this.useRobotCapture) {
+        // robotjs-based capture: get actual pixel position and recenter
+        try {
+          const pos = robot.getMousePos();
 
-      // Apply sensitivity
-      this.state.deltaX += rawDeltaX * this.config.sensitivity;
-      this.state.deltaY += rawDeltaY * this.config.sensitivity * (this.config.invertY ? -1 : 1);
+          // Skip if this is the movement we caused by recentering
+          if (this.recenterPending) {
+            this.recenterPending = false;
+            return;
+          }
 
-      // Notify callback
-      if ((rawDeltaX !== 0 || rawDeltaY !== 0) && this.onMove) {
-        this.onMove(
-          rawDeltaX * this.config.sensitivity,
-          rawDeltaY * this.config.sensitivity * (this.config.invertY ? -1 : 1)
-        );
+          // Calculate pixel delta from lock position
+          const pixelDeltaX = pos.x - this.lockX;
+          const pixelDeltaY = pos.y - this.lockY;
+
+          // Only process if there's actual movement
+          if (pixelDeltaX !== 0 || pixelDeltaY !== 0) {
+            // Apply sensitivity (pixels are much finer than terminal cells)
+            const scaledSensitivity = this.config.sensitivity * 0.15;
+            this.state.deltaX += pixelDeltaX * scaledSensitivity;
+            this.state.deltaY += pixelDeltaY * scaledSensitivity * (this.config.invertY ? -1 : 1);
+
+            // Notify callback
+            if (this.onMove) {
+              this.onMove(
+                pixelDeltaX * scaledSensitivity,
+                pixelDeltaY * scaledSensitivity * (this.config.invertY ? -1 : 1)
+              );
+            }
+
+            // Recenter mouse to lock position
+            this.recenterPending = true;
+            robot.moveMouse(this.lockX, this.lockY);
+          }
+        } catch (e) {
+          // robotjs failed, fall back to terminal mode
+          this.useRobotCapture = false;
+        }
+      } else {
+        // Terminal-based capture: use cell coordinates
+        const rawDeltaX = x - this.lastX;
+        const rawDeltaY = y - this.lastY;
+
+        // Apply sensitivity
+        this.state.deltaX += rawDeltaX * this.config.sensitivity;
+        this.state.deltaY += rawDeltaY * this.config.sensitivity * (this.config.invertY ? -1 : 1);
+
+        // Notify callback
+        if ((rawDeltaX !== 0 || rawDeltaY !== 0) && this.onMove) {
+          this.onMove(
+            rawDeltaX * this.config.sensitivity,
+            rawDeltaY * this.config.sensitivity * (this.config.invertY ? -1 : 1)
+          );
+        }
       }
     }
 
@@ -281,8 +344,8 @@ export class MouseHandler {
     this.smoothedDeltaY += (targetDeltaY - this.smoothedDeltaY) * this.smoothingFactor;
 
     // Convert to radians with sensitivity
-    // Use smaller base value for finer control
-    const radiansPerUnit = 0.015 * this.config.sensitivity;
+    // Higher base value for more responsive camera control
+    const radiansPerUnit = 0.025 * this.config.sensitivity;
 
     const result = {
       pitch: -this.smoothedDeltaY * radiansPerUnit, // Negative because screen Y is inverted

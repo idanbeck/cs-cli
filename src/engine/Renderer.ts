@@ -1153,16 +1153,30 @@ export class Renderer {
   // Draw warmup countdown
   private drawWarmupOverlay(): void {
     if (this.gamePhase !== 'warmup' || this.warmupCountdown <= 0) return;
+    if (this.showMainMenu) return;
 
     const centerX = Math.floor(this.width / 2);
     const centerY = Math.floor(this.height / 2);
-    const bgDark = new Color(0, 0, 0, 0.8);
+    const bgDark = new Color(0, 0, 0, 0.9);
 
-    const title = 'WARMUP';
-    const countdown = `Game starts in ${this.warmupCountdown}...`;
+    // Draw a box for better visibility
+    const boxWidth = 30;
+    const boxHeight = 5;
+    const startX = centerX - Math.floor(boxWidth / 2);
+    const startY = centerY - Math.floor(boxHeight / 2);
+    for (let y = startY; y < startY + boxHeight; y++) {
+      for (let x = startX; x < startX + boxWidth; x++) {
+        this.framebuffer.setPixel(x, y, ' ', Color.white(), bgDark);
+      }
+    }
 
-    this.framebuffer.drawText(centerX - Math.floor(title.length / 2), centerY - 1, title, new Color(255, 255, 100), bgDark);
-    this.framebuffer.drawText(centerX - Math.floor(countdown.length / 2), centerY + 1, countdown, Color.white(), bgDark);
+    const title = '★ WARMUP ★';
+    const countdown = `Starting in ${this.warmupCountdown}...`;
+    const hint = 'Get ready!';
+
+    this.framebuffer.drawText(centerX - Math.floor(title.length / 2), centerY - 1, title, new Color(255, 215, 0), bgDark);
+    this.framebuffer.drawText(centerX - Math.floor(countdown.length / 2), centerY, countdown, Color.white(), bgDark);
+    this.framebuffer.drawText(centerX - Math.floor(hint.length / 2), centerY + 1, hint, new Color(150, 150, 150), bgDark);
   }
 
   // Draw respawn countdown
@@ -1300,15 +1314,30 @@ export class Renderer {
     if (this.freezeTimeRemaining <= 0) return;
     if (this.showMainMenu) return; // Don't show when main menu is open
 
-    const bgDark = new Color(0, 0, 0, 0.8);
+    const bgDark = new Color(0, 0, 0, 0.9);
     const centerX = Math.floor(this.width / 2);
+    const centerY = Math.floor(this.height / 2);
+
+    // Draw a prominent box
+    const boxWidth = 35;
+    const boxHeight = 5;
+    const startX = centerX - Math.floor(boxWidth / 2);
+    const startY = centerY - Math.floor(boxHeight / 2);
+    for (let y = startY; y < startY + boxHeight; y++) {
+      for (let x = startX; x < startX + boxWidth; x++) {
+        this.framebuffer.setPixel(x, y, ' ', Color.white(), bgDark);
+      }
+    }
 
     // Draw freeze time countdown
-    const timeText = `FREEZE TIME: ${this.freezeTimeRemaining}s`;
+    const freezeSeconds = Math.ceil(this.freezeTimeRemaining);
+    const timeText = `❄ FREEZE TIME: ${freezeSeconds}s ❄`;
     const buyHint = 'Press B to open Buy Menu';
+    const moveHint = 'You cannot move yet';
 
-    this.framebuffer.drawText(centerX - Math.floor(timeText.length / 2), 3, timeText, new Color(100, 200, 255), bgDark);
-    this.framebuffer.drawText(centerX - Math.floor(buyHint.length / 2), 4, buyHint, new Color(200, 200, 200), bgDark);
+    this.framebuffer.drawText(centerX - Math.floor(timeText.length / 2), centerY - 1, timeText, new Color(100, 200, 255), bgDark);
+    this.framebuffer.drawText(centerX - Math.floor(buyHint.length / 2), centerY, buyHint, new Color(255, 215, 0), bgDark);
+    this.framebuffer.drawText(centerX - Math.floor(moveHint.length / 2), centerY + 1, moveHint, new Color(150, 150, 150), bgDark);
   }
 
   // Draw buy menu overlay
@@ -1455,6 +1484,24 @@ export class Renderer {
       bgDark
     );
 
+    // Check if we're on help screen
+    if (this.mainMenu.isHelpScreen()) {
+      // Draw help content
+      const helpLines = this.mainMenu.getHelpLines();
+      const helpStartY = titleY + 2;
+      const helpColor = new Color(180, 220, 255);  // Light blue
+      const headerColor = new Color(255, 215, 0);  // Gold for headers
+
+      for (let i = 0; i < helpLines.length && helpStartY + i < this.height - 2; i++) {
+        const line = helpLines[i];
+        const isHeader = line.startsWith('===');
+        const color = isHeader ? headerColor : helpColor;
+        const x = Math.floor((this.width - line.length) / 2);
+        this.framebuffer.drawText(x, helpStartY + i, line, color, bgDark);
+      }
+      return;
+    }
+
     // Menu items
     const items = this.mainMenu.getCurrentItems();
     const selectedIndex = this.mainMenu.getSelectedIndex();
@@ -1484,7 +1531,7 @@ export class Renderer {
     }
 
     // Controls hint
-    const hint = 'W/S or Arrow keys: navigate | Enter: select | Esc: back';
+    const hint = 'W/S or Arrow keys: navigate | Enter: select | H: help | Esc: back';
     const hintY = this.height - 3;
     this.framebuffer.drawText(
       Math.floor((this.width - hint.length) / 2),
