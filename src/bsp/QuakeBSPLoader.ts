@@ -31,6 +31,7 @@ export interface QuakeBSPLoadResult {
   name: string;
   renderObjects: RenderObject[];
   colliders: AABB[];
+  collisionMesh: CollisionMesh;  // Triangle-based collision
   spawns: SpawnPoint[];
   bounds: AABB;
   skyColor: Color;
@@ -79,6 +80,9 @@ export class QuakeBSPLoader {
     // Build colliders from models
     const colliders = this.buildColliders();
 
+    // Build collision mesh from all solid faces
+    const collisionMesh = this.buildCollisionMesh();
+
     // Compute bounds
     const bounds = this.computeBounds();
 
@@ -89,6 +93,7 @@ export class QuakeBSPLoader {
       name,
       renderObjects,
       colliders,
+      collisionMesh,
       spawns,
       bounds,
       skyColor: new Color(80, 80, 120), // Blue-gray for Quake
@@ -412,5 +417,68 @@ export class QuakeBSPLoader {
         Math.max(min.z, max.z)
       ),
     };
+  }
+
+  // Build collision mesh from BSP faces (for triangle-based collision)
+  private buildCollisionMesh(): CollisionMesh {
+    const mesh = new CollisionMesh();
+    if (!this.bsp) return mesh;
+
+    // Iterate through all faces and add collision triangles
+    for (let faceIdx = 0; faceIdx < this.bsp.faces.length; faceIdx++) {
+      const face = this.bsp.faces[faceIdx];
+      const texInfo = this.bsp.texInfo[face.texInfo];
+      const texIndex = texInfo.mipTexIndex;
+
+      // Get texture name to filter non-solid surfaces
+      const mipTex = this.bsp.mipTextures[texIndex];
+      const texName = mipTex?.name?.toLowerCase() || '';
+
+      // Skip non-solid textures
+      if (texName.startsWith('sky')) continue;
+      if (texName.includes('trigger')) continue;
+      if (texName === 'clip') continue;
+      if (texName === 'origin') continue;
+      if (texName === 'null') continue;
+      if (texName.startsWith('skip')) continue;
+      if (texName.startsWith('hint')) continue;
+      // Water, lava, slime - skip for collision
+      if (texName.startsWith('*')) continue;
+      if (texName.includes('water')) continue;
+      if (texName.includes('lava')) continue;
+      if (texName.includes('slime')) continue;
+
+      // Get face vertices using edges
+      const vertices: Vector3[] = [];
+
+      for (let i = 0; i < face.numEdges; i++) {
+        const surfEdgeIdx = face.firstEdge + i;
+        const edgeIdx = this.bsp.surfEdges[surfEdgeIdx];
+
+        let vertIdx: number;
+        if (edgeIdx >= 0) {
+          vertIdx = this.bsp.edges[edgeIdx].v[0];
+        } else {
+          vertIdx = this.bsp.edges[-edgeIdx].v[1];
+        }
+
+        const quakeVert = this.bsp.vertices[vertIdx];
+
+        // Convert to engine coordinates and scale
+        const engineVert = quakeToEngine(quakeVert.x, quakeVert.y, quakeVert.z).scale(QUAKE_SCALE);
+        vertices.push(engineVert);
+      }
+
+      if (vertices.length < 3) continue;
+
+      // Triangulate using fan method (BSP faces are convex)
+      // Use same winding as render mesh
+      for (let i = 1; i < vertices.length - 1; i++) {
+        mesh.addTriangle(vertices[0], vertices[i + 1], vertices[i]);
+      }
+    }
+
+    console.log(`Built collision mesh with ${mesh.triangles.length} triangles`);
+    return mesh;
   }
 }

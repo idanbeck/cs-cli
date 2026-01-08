@@ -118,9 +118,16 @@ export class Renderer {
   private damageIndicators: { angle: number; until: number }[] = [];
   private damageIndicatorDuration: number = 500;
 
-  // Death camera effect
+  // Death camera effect - deliberate fall to ground
   private deathCameraRoll: number = 0;
+  private deathCameraPitch: number = 0;
   private deathCameraY: number = 0;
+  private deathVelocityY: number = 0;
+  private deathPhase: 'falling' | 'impact' | 'settling' | 'resting' = 'falling';
+  private deathTime: number = 0;
+  private deathImpactTime: number = 0;
+  private deathRollDirection: number = 1; // 1 or -1
+  private deathFadeToRed: number = 0; // 0-1 fade amount
   private isPlayerDead: boolean = false;
 
   // Team-based display data
@@ -771,35 +778,126 @@ export class Renderer {
   // Set player death state for camera effect
   setPlayerDead(isDead: boolean, deltaTime: number = 0): void {
     if (isDead && !this.isPlayerDead) {
-      // Just died - start the topple
+      // Just died - initialize deliberate fall
       this.deathCameraRoll = 0;
+      this.deathCameraPitch = 0;
       this.deathCameraY = 0;
+      this.deathVelocityY = 0;
+      this.deathTime = 0;
+      this.deathImpactTime = 0;
+      this.deathPhase = 'falling';
+      this.deathFadeToRed = 0;
+
+      // Random direction to fall (left or right)
+      this.deathRollDirection = Math.random() > 0.5 ? 1 : -1;
     }
 
     this.isPlayerDead = isDead;
 
     if (isDead) {
-      // Animate the death camera roll (topple to the side)
-      const targetRoll = Math.PI / 2; // 90 degrees
-      const rollSpeed = 3; // radians per second
-      this.deathCameraRoll = Math.min(targetRoll, this.deathCameraRoll + rollSpeed * deltaTime);
+      this.deathTime += deltaTime;
+      const groundLevel = 1.4;
 
-      // Drop camera Y
-      const dropSpeed = 2; // units per second
-      this.deathCameraY = Math.min(1.5, this.deathCameraY + dropSpeed * deltaTime);
+      switch (this.deathPhase) {
+        case 'falling':
+          // Accelerate downward with gravity
+          const gravity = 12;
+          this.deathVelocityY += gravity * deltaTime;
+          this.deathCameraY += this.deathVelocityY * deltaTime;
+
+          // Slight forward pitch as we fall (head going down)
+          const fallProgress = Math.min(1, this.deathCameraY / groundLevel);
+          this.deathCameraPitch = fallProgress * 0.3; // Slight look down
+
+          // Start rolling to the side as we fall
+          this.deathCameraRoll = this.deathRollDirection * fallProgress * 0.5;
+
+          // Hit the ground
+          if (this.deathCameraY >= groundLevel) {
+            this.deathCameraY = groundLevel;
+            this.deathPhase = 'impact';
+            this.deathImpactTime = this.deathTime;
+          }
+          break;
+
+        case 'impact':
+          // Brutal impact - quick snap to side, looking at ground
+          const impactDuration = 0.15;
+          const impactProgress = Math.min(1, (this.deathTime - this.deathImpactTime) / impactDuration);
+
+          // Ease out for impact (fast then slow)
+          const impactEase = 1 - Math.pow(1 - impactProgress, 3);
+
+          // Roll hard to the side (90 degrees)
+          const targetRoll = this.deathRollDirection * (Math.PI / 2);
+          this.deathCameraRoll = this.deathRollDirection * 0.5 + (targetRoll - this.deathRollDirection * 0.5) * impactEase;
+
+          // Pitch down to look at ground
+          const targetPitch = 0.6; // Looking down at pavement
+          this.deathCameraPitch = 0.3 + (targetPitch - 0.3) * impactEase;
+
+          // Small bounce on impact
+          const bounceAmount = Math.sin(impactProgress * Math.PI) * 0.1;
+          this.deathCameraY = groundLevel - bounceAmount;
+
+          if (impactProgress >= 1) {
+            this.deathPhase = 'settling';
+            this.deathCameraY = groundLevel;
+          }
+          break;
+
+        case 'settling':
+          // Small settle/wobble then rest
+          const settleStart = this.deathImpactTime + 0.15;
+          const settleDuration = 0.3;
+          const settleProgress = Math.min(1, (this.deathTime - settleStart) / settleDuration);
+
+          // Damped oscillation for subtle settle
+          const wobble = Math.sin(settleProgress * Math.PI * 2) * (1 - settleProgress) * 0.05;
+          this.deathCameraRoll = this.deathRollDirection * (Math.PI / 2) + wobble;
+
+          if (settleProgress >= 1) {
+            this.deathPhase = 'resting';
+          }
+          break;
+
+        case 'resting':
+          // Lock in final position, fade to red
+          this.deathCameraRoll = this.deathRollDirection * (Math.PI / 2);
+          this.deathCameraPitch = 0.6;
+          this.deathCameraY = groundLevel;
+
+          // Fade to red after head is on ground
+          const fadeSpeed = 0.5; // Takes 2 seconds to fully fade
+          this.deathFadeToRed = Math.min(1, this.deathFadeToRed + fadeSpeed * deltaTime);
+          break;
+      }
     } else {
+      // Reset everything
       this.deathCameraRoll = 0;
+      this.deathCameraPitch = 0;
       this.deathCameraY = 0;
+      this.deathVelocityY = 0;
+      this.deathPhase = 'falling';
+      this.deathFadeToRed = 0;
     }
   }
 
-  // Get death camera roll for external use
+  // Get death camera rotations for external use
   getDeathCameraRoll(): number {
     return this.deathCameraRoll;
   }
 
+  getDeathCameraPitch(): number {
+    return this.deathCameraPitch;
+  }
+
   getDeathCameraYDrop(): number {
     return this.deathCameraY;
+  }
+
+  getDeathFadeToRed(): number {
+    return this.deathFadeToRed;
   }
 
   // Set weapon sprite to display
@@ -1402,23 +1500,47 @@ export class Renderer {
   private drawDeathEffect(): void {
     if (!this.isPlayerDead) return;
 
-    // Add red vignette effect around edges
-    const vignetteColor = new Color(100, 0, 0);
-    const edgeWidth = 3;
+    // Fade to red overlay - only fades in AFTER head hits ground (resting phase)
+    if (this.deathFadeToRed > 0) {
+      // Create a red overlay that increases with fade amount
+      const redIntensity = Math.floor(80 * this.deathFadeToRed);
+      const overlayColor = new Color(redIntensity, 0, 0, this.deathFadeToRed * 0.6);
+
+      // Apply red tint to entire screen
+      for (let y = 0; y < this.height; y++) {
+        for (let x = 0; x < this.width; x++) {
+          const existingPixel = this.framebuffer.getPixel(x, y);
+          if (existingPixel) {
+            // Blend existing color with red overlay
+            const blendedFg = Color.lerp(existingPixel.fg, new Color(180, 20, 20), this.deathFadeToRed * 0.5);
+            this.framebuffer.setPixel(x, y, existingPixel.char, blendedFg, existingPixel.bg);
+          }
+        }
+      }
+    }
+
+    // Add red vignette effect around edges (always visible when dead)
+    const vignetteIntensity = Math.min(100, 60 + 40 * this.deathFadeToRed);
+    const vignetteColor = new Color(vignetteIntensity, 0, 0);
+    const edgeWidth = 3 + Math.floor(this.deathFadeToRed * 2);
 
     // Top and bottom edges
     for (let x = 0; x < this.width; x++) {
       for (let y = 0; y < edgeWidth; y++) {
-        this.framebuffer.setPixel(x, y, '░', vignetteColor, new Color(0, 0, 0, 0));
-        this.framebuffer.setPixel(x, this.height - 1 - y, '░', vignetteColor, new Color(0, 0, 0, 0));
+        const fade = 1 - (y / edgeWidth);
+        const edgeColor = new Color(Math.floor(vignetteIntensity * fade), 0, 0);
+        this.framebuffer.setPixel(x, y, '░', edgeColor, new Color(0, 0, 0, 0));
+        this.framebuffer.setPixel(x, this.height - 1 - y, '░', edgeColor, new Color(0, 0, 0, 0));
       }
     }
 
     // Left and right edges
     for (let y = 0; y < this.height; y++) {
       for (let x = 0; x < edgeWidth; x++) {
-        this.framebuffer.setPixel(x, y, '░', vignetteColor, new Color(0, 0, 0, 0));
-        this.framebuffer.setPixel(this.width - 1 - x, y, '░', vignetteColor, new Color(0, 0, 0, 0));
+        const fade = 1 - (x / edgeWidth);
+        const edgeColor = new Color(Math.floor(vignetteIntensity * fade), 0, 0);
+        this.framebuffer.setPixel(x, y, '░', edgeColor, new Color(0, 0, 0, 0));
+        this.framebuffer.setPixel(this.width - 1 - x, y, '░', edgeColor, new Color(0, 0, 0, 0));
       }
     }
   }

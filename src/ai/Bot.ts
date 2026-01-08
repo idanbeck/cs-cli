@@ -60,13 +60,15 @@ export class Bot extends Player {
   // Timing
   public stateStartTime: number = 0;
   public lastThinkTime: number = 0;
-  public thinkInterval: number = 100; // ms between AI updates
+  public thinkInterval: number = 150; // ms between AI updates (higher = better perf)
   public lastFireTime: number = 0;
+  public lastLOSCheckTime: number = 0; // Throttle expensive LOS checks
 
   // Movement
   public moveTarget: Vector3 | null = null;
   public stuckTime: number = 0;
   public lastPosition: Vector3;
+  public verticalVelocity: number = 0;  // For gravity tracking
 
   constructor(
     difficulty: BotDifficulty = 'medium',

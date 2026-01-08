@@ -16,6 +16,7 @@ import { Color } from '../utils/Colors.js';
 import { Texture } from '../engine/Texture.js';
 import { TextureManager, getTextureManager } from '../engine/TextureManager.js';
 import { AABB, SpawnPoint } from '../maps/MapFormat.js';
+import { CollisionMesh } from '../physics/MeshCollision.js';
 import { existsSync, readFileSync } from 'fs';
 import { join, dirname } from 'path';
 
@@ -33,6 +34,7 @@ export interface Q3BSPLoadResult {
   name: string;
   renderObjects: RenderObject[];
   colliders: AABB[];
+  collisionMesh: CollisionMesh;  // Triangle-based collision
   spawns: SpawnPoint[];
   bounds: AABB;
   skyColor: Color;
@@ -71,6 +73,9 @@ export class Q3BSPLoader {
     // Extract spawn points from entities
     const spawns = this.parseSpawns();
 
+    // Build collision mesh from all solid faces
+    const collisionMesh = this.buildCollisionMesh();
+
     // Compute bounds from model 0
     const bounds = this.computeBounds();
 
@@ -81,6 +86,7 @@ export class Q3BSPLoader {
       name,
       renderObjects,
       colliders: [], // Q3 collision would need brush parsing
+      collisionMesh,
       spawns,
       bounds,
       skyColor: new Color(20, 20, 40), // Dark space for Facing Worlds
@@ -514,5 +520,68 @@ export class Q3BSPLoader {
         Math.max(min.z, max.z)
       ),
     };
+  }
+
+  // Build collision mesh from Q3 BSP faces (for triangle-based collision)
+  private buildCollisionMesh(): CollisionMesh {
+    const mesh = new CollisionMesh();
+    if (!this.bsp) return mesh;
+
+    // Iterate through all faces and add collision triangles
+    for (let faceIdx = 0; faceIdx < this.bsp.faces.length; faceIdx++) {
+      const face = this.bsp.faces[faceIdx];
+      const texIndex = face.textureIndex;
+
+      // Skip invalid textures
+      if (texIndex < 0 || texIndex >= this.bsp.textures.length) continue;
+
+      const texName = this.bsp.textures[texIndex]?.name?.toLowerCase() || '';
+
+      // Skip non-solid textures
+      if (texName.includes('sky')) continue;
+      if (texName.includes('clip')) continue;
+      if (texName.includes('trigger')) continue;
+      if (texName.includes('hint')) continue;
+      if (texName.includes('nodraw')) continue;
+      if (texName.includes('caulk')) continue;
+      if (texName.includes('water')) continue;
+      if (texName.includes('lava')) continue;
+      if (texName.includes('slime')) continue;
+
+      // Only handle polygon and mesh faces (skip patches for collision)
+      if (face.type !== Q3FaceType.POLYGON && face.type !== Q3FaceType.MESH) {
+        continue;
+      }
+
+      // Get face vertices
+      const vertices: Vector3[] = [];
+      for (let i = 0; i < face.numVertices; i++) {
+        const vertIdx = face.firstVertex + i;
+        const q3Vert = this.bsp.vertices[vertIdx];
+
+        const pos = q3ToEngine(
+          q3Vert.position.x,
+          q3Vert.position.y,
+          q3Vert.position.z
+        ).scale(Q3_SCALE);
+
+        vertices.push(pos);
+      }
+
+      // Add triangles using meshverts (same winding as render mesh)
+      for (let i = 0; i < face.numMeshVerts; i += 3) {
+        const mv0 = this.bsp.meshVerts[face.firstMeshVert + i];
+        const mv1 = this.bsp.meshVerts[face.firstMeshVert + i + 1];
+        const mv2 = this.bsp.meshVerts[face.firstMeshVert + i + 2];
+
+        // Reverse winding for coordinate system change (same as render)
+        if (mv0 < vertices.length && mv1 < vertices.length && mv2 < vertices.length) {
+          mesh.addTriangle(vertices[mv0], vertices[mv2], vertices[mv1]);
+        }
+      }
+    }
+
+    console.log(`Built collision mesh with ${mesh.triangles.length} triangles`);
+    return mesh;
   }
 }

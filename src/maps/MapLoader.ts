@@ -11,6 +11,7 @@ import { QuakeBSPLoader, QuakeBSPLoadResult } from '../bsp/QuakeBSPLoader.js';
 import { Q3BSPLoader, Q3BSPLoadResult } from '../bsp/Q3BSPLoader.js';
 import { TextureManager } from '../engine/TextureManager.js';
 import { readFileSync } from 'fs';
+import { CollisionMesh } from '../physics/MeshCollision.js';
 
 // Q3 BSP magic number "IBSP" in little-endian
 const Q3BSP_MAGIC = 0x50534249;
@@ -19,6 +20,7 @@ export interface LoadedMap {
   name: string;
   renderObjects: RenderObject[];
   colliders: AABB[];
+  collisionMesh?: CollisionMesh;  // Triangle-based collision for BSP maps
   spawns: SpawnPoint[];
   bounds: AABB;
   skyColor: Color;
@@ -156,6 +158,7 @@ export class MapLoader {
       name: result.name,
       renderObjects: result.renderObjects,
       colliders: result.colliders,
+      collisionMesh: result.collisionMesh,
       spawns: result.spawns,
       bounds: result.bounds,
       skyColor: result.skyColor,

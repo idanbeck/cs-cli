@@ -57,7 +57,7 @@ export const DEFAULT_COMPETITIVE_CONFIG: GameModeConfig = {
   freezeTime: 15,
   roundTime: 115,
   roundEndDelay: 5,
-  warmupTime: 10,
+  warmupTime: 0,
   halftimeRound: 7,           // Swap after 7 rounds
   friendlyFire: true,
   economy: DEFAULT_ECONOMY_CONFIG,
@@ -71,7 +71,7 @@ export const DEFAULT_DEATHMATCH_CONFIG: GameModeConfig = {
   freezeTime: 10,             // Shorter freeze for DM
   roundTime: 120,
   roundEndDelay: 3,
-  warmupTime: 5,
+  warmupTime: 0,
   halftimeRound: 0,           // No halftime in DM
   friendlyFire: true,
   economy: DEFAULT_ECONOMY_CONFIG,

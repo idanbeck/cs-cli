@@ -38,6 +38,7 @@ import { MapRegistry } from './maps/MapRegistry.js';
 import { dm_arena } from './maps/maps/dm_arena.js';
 import { AABB } from './maps/MapFormat.js';
 import { moveAndSlide, checkOnGround, setCollisionEnabled, rayAABBIntersection } from './physics/Collision.js';
+import { CollisionMesh, moveWithMeshCollision, checkGroundMesh, setGlobalCollisionMesh, getGlobalCollisionMesh, adjustSpawnPosition } from './physics/MeshCollision.js';
 import { Player } from './game/Player.js';
 import { WeaponSlot } from './game/Weapon.js';
 import { getWeaponSprite } from './game/WeaponSprites.js';
@@ -1105,6 +1106,14 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
   // Colliders ref for physics
   const collidersRef = useRef<AABB[]>(loadedMapRef.current.colliders);
 
+  // Collision mesh ref for triangle-based BSP collision
+  const collisionMeshRef = useRef<CollisionMesh | null>(loadedMapRef.current.collisionMesh || null);
+
+  // Set global collision mesh (for bot AI to use)
+  if (collisionMeshRef.current) {
+    setGlobalCollisionMesh(collisionMeshRef.current);
+  }
+
   // Function to load a new map
   const loadMapAsync = async (mapId: string): Promise<boolean> => {
     try {
@@ -1112,6 +1121,12 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
       loadedMapRef.current = newMap;
       currentMapIdRef.current = mapId;
       collidersRef.current = newMap.colliders;
+
+      // Update collision mesh for BSP maps
+      collisionMeshRef.current = newMap.collisionMesh || null;
+      if (collisionMeshRef.current) {
+        setGlobalCollisionMesh(collisionMeshRef.current);
+      }
 
       // Update renderer with new map
       renderer.clearObjects();
@@ -1192,9 +1207,13 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
     // Pick a random spawn point
     const spawn = loadedMapRef.current.spawns[Math.floor(Math.random() * loadedMapRef.current.spawns.length)];
 
-    // Position camera at spawn
+    // Position camera at spawn, adjusted to valid ground
     const camera = renderer.getCamera();
-    camera.setPosition(spawn.position[0], spawn.position[1] + PLAYER_HEIGHT, spawn.position[2]);
+    const rawSpawnPos = new Vector3(spawn.position[0], spawn.position[1], spawn.position[2]);
+    const adjustedSpawn = collisionMeshRef.current
+      ? adjustSpawnPosition(rawSpawnPos, collisionMeshRef.current)
+      : rawSpawnPos;
+    camera.setPosition(adjustedSpawn.x, adjustedSpawn.y + PLAYER_HEIGHT, adjustedSpawn.z);
     camera.setYaw(degToRad(spawn.angle));
     camera.setPitch(0);
 
@@ -2290,15 +2309,15 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
       const forwardDir = new Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
       const rightDir = new Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
 
-      let movement = Vector3.zero();
-      movement = Vector3.add(movement, Vector3.scale(forwardDir, moveForward));
-      movement = Vector3.add(movement, Vector3.scale(rightDir, moveRight));
+      // Build horizontal velocity (units per second)
+      const horizontalSpeed = MOVE_SPEED;
+      let velocityX = forwardDir.x * forward * horizontalSpeed + rightDir.x * strafe * horizontalSpeed;
+      let velocityZ = forwardDir.z * forward * horizontalSpeed + rightDir.z * strafe * horizontalSpeed;
 
       // Apply gravity
       if (!physics.onGround) {
         physics.velocityY -= GRAVITY * deltaTime;
       }
-      movement.y = physics.velocityY * deltaTime;
 
       // Get feet position (camera is at eye level)
       const feetPos = new Vector3(
@@ -2307,36 +2326,60 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
         camera.position.z
       );
 
-      // Apply collision detection
-      const newFeetPos = moveAndSlide(
-        feetPos,
-        movement,
-        PLAYER_RADIUS,
-        PLAYER_HEIGHT,
-        collidersRef.current
-      );
+      // Use mesh collision if available (BSP maps), otherwise use AABB collision
+      const collisionMesh = collisionMeshRef.current;
+      let newFeetPos: Vector3;
+      let newOnGround: boolean;
+
+      if (collisionMesh && collisionMesh.triangles.length > 0 && collisionEnabledRef.current) {
+        // Use triangle-based collision for BSP maps
+        const velocity = new Vector3(velocityX, physics.velocityY, velocityZ);
+        const result = moveWithMeshCollision(feetPos, velocity, collisionMesh, deltaTime);
+        newFeetPos = result.newPosition;
+        physics.velocityY = result.newVelocity.y;
+        newOnGround = result.onGround;
+      } else {
+        // Fall back to AABB collision
+        let movement = Vector3.zero();
+        movement = Vector3.add(movement, Vector3.scale(forwardDir, moveForward));
+        movement = Vector3.add(movement, Vector3.scale(rightDir, moveRight));
+        movement.y = physics.velocityY * deltaTime;
+
+        newFeetPos = moveAndSlide(
+          feetPos,
+          movement,
+          PLAYER_RADIUS,
+          PLAYER_HEIGHT,
+          collidersRef.current
+        );
+
+        newOnGround = checkOnGround(
+          newFeetPos,
+          PLAYER_RADIUS,
+          collidersRef.current
+        );
+      }
 
       // Update camera position (convert feet to eye level)
       // Must use setPosition or translate to mark camera as dirty for matrix recalculation
-      const newCameraY = camera.position.y + (newFeetPos.y - feetPos.y);
+      const newCameraY = newFeetPos.y + PLAYER_HEIGHT;
       camera.setPosition(newFeetPos.x, newCameraY, newFeetPos.z);
 
-      // Check if on ground
+      // Update ground state
       const wasOnGround = physics.onGround;
-      physics.onGround = checkOnGround(
-        new Vector3(camera.position.x, camera.position.y - PLAYER_HEIGHT, camera.position.z),
-        PLAYER_RADIUS,
-        collidersRef.current
-      );
+      physics.onGround = newOnGround;
 
       // Reset vertical velocity when landing
       if (physics.onGround && !wasOnGround) {
         physics.velocityY = 0;
       }
 
-      // Clamp to ground level
-      if (camera.position.y < PLAYER_HEIGHT) {
-        camera.setPosition(camera.position.x, PLAYER_HEIGHT, camera.position.z);
+      // Safety fallback - respawn if fell out of world
+      // BSP maps can have floors at negative Y coordinates, but -50 is definitely out of bounds
+      if (camera.position.y < -50) {
+        // Player fell out of the world - reset to spawn
+        const spawn = loadedMapRef.current.spawns[0] || { position: [0, 2, 0], angle: 0 };
+        camera.setPosition(spawn.position[0], spawn.position[1] + PLAYER_HEIGHT, spawn.position[2]);
         physics.velocityY = 0;
         physics.onGround = true;
       }
@@ -2398,7 +2441,9 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
       const isSoloMode = gameModeTypeRef.current === 'solo';
 
       // Check if player is frozen (freeze phase) - never frozen in solo mode
-      const isFrozen = isSoloMode ? false : gameMode.isPlayerFrozen();
+      const isPlayerFrozen = isSoloMode ? false : gameMode.isPlayerFrozen();
+      // Bots are frozen in more phases than player (includes warmup)
+      const areBotsFrozen = isSoloMode ? false : gameMode.areBotsFrozen();
 
       // Update bots only when playing (pass freeze and team mode info)
       // Skip all bot/game logic in solo mode - just free exploration
@@ -2408,7 +2453,7 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
           // Game mode is handled by server, we just render what server tells us
         } else {
           // Single player mode: run local bot simulation
-          botManager.update(player, collidersRef.current, now, deltaTime, isFrozen, isTeamMode);
+          botManager.update(player, collidersRef.current, now, deltaTime, areBotsFrozen, isTeamMode);
 
           // Bot combat is now handled by BotManager.update() via callbacks
 
@@ -2430,14 +2475,22 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
             player.dropAllWeapons(now);
           }
         }
-        // Apply death camera roll
+        // Apply death camera rotations - deliberate fall to side
         camera.setRoll(renderer.getDeathCameraRoll());
 
-        // Lower camera toward ground
+        // Apply death pitch - looking down at ground when head hits
+        const deathPitch = renderer.getDeathCameraPitch();
+        if (deathPitch > 0) {
+          // Override pitch to look at ground (positive = looking down)
+          camera.setPitch(-deathPitch);
+        }
+
+        // Lower camera toward ground with physics
         const dropAmount = renderer.getDeathCameraYDrop();
         if (dropAmount > 0) {
           const minY = 0.3; // Ground level for head
-          const newY = Math.max(minY, camera.position.y - dropAmount * deltaTime * 2);
+          const targetY = camera.position.y - dropAmount;
+          const newY = Math.max(minY, targetY);
           camera.setPosition(camera.position.x, newY, camera.position.z);
         }
       } else {
@@ -2451,11 +2504,16 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
         const mapSpawns = loadedMapRef.current.spawns;
         const spawnPoints = mapSpawns.map(s => new Vector3(s.position[0], s.position[1], s.position[2]));
         const botPositions = botManager.getAllEntityPositions();
-        const spawnPos = botManager.getSpreadSpawnPoint(spawnPoints, botPositions);
+        const rawSpawnPos = botManager.getSpreadSpawnPoint(spawnPoints, botPositions);
+
+        // Adjust spawn position to valid ground
+        const spawnPos = collisionMeshRef.current
+          ? adjustSpawnPosition(rawSpawnPos, collisionMeshRef.current)
+          : rawSpawnPos;
 
         // Find the matching spawn point for angle
         const spawnIndex = spawnPoints.findIndex(s =>
-          Math.abs(s.x - spawnPos.x) < 0.1 && Math.abs(s.z - spawnPos.z) < 0.1
+          Math.abs(s.x - rawSpawnPos.x) < 0.1 && Math.abs(s.z - rawSpawnPos.z) < 0.1
         );
         const spawnAngle = spawnIndex >= 0 ? mapSpawns[spawnIndex].angle : 0;
 

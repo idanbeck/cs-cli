@@ -8,6 +8,7 @@ import { SpawnPoint } from '../maps/MapFormat.js';
 import { rayAABBIntersection } from '../physics/Collision.js';
 import { TeamId, getTeamManager } from '../game/Team.js';
 import { getDroppedWeaponManager } from '../game/DroppedWeapon.js';
+import { adjustSpawnPosition, getGlobalCollisionMesh } from '../physics/MeshCollision.js';
 
 // Callback for tracer spawning
 export type TracerCallback = (origin: Vector3, endpoint: Vector3) => void;
@@ -172,6 +173,7 @@ export class BotManager {
   respawnAllBots(now: number, player?: Player): void {
     // Track positions as we spawn to spread bots out
     const spawnedPositions: Vector3[] = [];
+    const collisionMesh = getGlobalCollisionMesh();
 
     // Include player position if provided
     if (player && player.isAlive) {
@@ -182,7 +184,13 @@ export class BotManager {
       const spawnPoints = this.getSpawnPointsForTeam(bot.team);
       if (spawnPoints.length > 0) {
         // Use spread spawning to place bots far from each other
-        const spawn = this.getSpreadSpawnPoint(spawnPoints, spawnedPositions);
+        const rawSpawn = this.getSpreadSpawnPoint(spawnPoints, spawnedPositions);
+
+        // Adjust spawn position for BSP collision mesh
+        const spawn = (collisionMesh && collisionMesh.triangles.length > 0)
+          ? adjustSpawnPosition(rawSpawn, collisionMesh)
+          : rawSpawn;
+
         spawnedPositions.push(spawn.clone());
 
         // keepInventory = true if bot was alive, false if dead
@@ -249,7 +257,14 @@ export class BotManager {
     // Pick a random spawn point
     if (this.spawnPoints.length > 0) {
       const spawnIndex = Math.floor(Math.random() * this.spawnPoints.length);
-      const spawn = this.spawnPoints[spawnIndex];
+      const rawSpawn = this.spawnPoints[spawnIndex];
+
+      // Adjust spawn position for BSP collision mesh
+      const collisionMesh = getGlobalCollisionMesh();
+      const spawn = (collisionMesh && collisionMesh.triangles.length > 0)
+        ? adjustSpawnPosition(rawSpawn, collisionMesh)
+        : rawSpawn;
+
       bot.position = new Vector3(spawn.x, spawn.y + bot.config.eyeHeight, spawn.z);
       bot.yaw = Math.random() * Math.PI * 2;
     }
@@ -327,6 +342,20 @@ export class BotManager {
       // Snap bot to ground using raycast (prevent clipping)
       this.snapToGround(bot, colliders);
 
+      // Safety check - respawn bot if they fell out of the world
+      if (bot.position.y < -50) {
+        const spawnPoints = this.getSpawnPointsForTeam(bot.team);
+        if (spawnPoints.length > 0) {
+          const rawSpawn = spawnPoints[Math.floor(Math.random() * spawnPoints.length)];
+          const collisionMesh = getGlobalCollisionMesh();
+          const spawn = (collisionMesh && collisionMesh.triangles.length > 0)
+            ? adjustSpawnPosition(rawSpawn, collisionMesh)
+            : rawSpawn;
+          bot.position = new Vector3(spawn.x, spawn.y + bot.config.eyeHeight, spawn.z);
+          bot.verticalVelocity = 0;
+        }
+      }
+
       // Update weapon state
       bot.updateWeapon(now);
 
@@ -337,8 +366,16 @@ export class BotManager {
     }
   }
 
-  // Snap bot to ground to prevent clipping
+  // Snap bot to ground to prevent clipping (AABB collision only)
+  // When mesh collision is active, BotBrain handles ground detection
   private snapToGround(bot: Bot, colliders: AABB[]): void {
+    // Skip AABB-based snap when using mesh collision (BSP maps)
+    // BotBrain.applyMovement already handles ground detection for mesh collision
+    const collisionMesh = getGlobalCollisionMesh();
+    if (collisionMesh && collisionMesh.triangles.length > 0) {
+      return; // Mesh collision handles ground snapping
+    }
+
     const eyePos = bot.position;
     const feetY = eyePos.y - bot.config.eyeHeight;
 
@@ -346,7 +383,7 @@ export class BotManager {
     const rayOrigin = new Vector3(eyePos.x, eyePos.y + 2.0, eyePos.z);
     const rayDir = new Vector3(0, -1, 0);
 
-    let groundY = 0; // Default to world floor at y=0
+    let groundY = -Infinity; // No default floor - find actual ground
 
     // Check for any platform/collider below the bot
     for (const collider of colliders) {
@@ -360,19 +397,13 @@ export class BotManager {
       }
     }
 
-    // Calculate where bot's eyes should be based on ground
-    const targetEyeY = groundY + bot.config.eyeHeight;
-
-    // Always enforce minimum height (can't be below world floor)
-    const minEyeY = bot.config.eyeHeight; // Eyes at eyeHeight when feet at y=0
-
-    // If bot is below where it should be, snap up
-    if (eyePos.y < minEyeY) {
-      bot.position.y = minEyeY;
-    }
-    // If close to a valid ground surface, snap to it
-    else if (Math.abs(feetY - groundY) < 0.5) {
-      bot.position.y = targetEyeY;
+    // Only snap if we found actual ground
+    if (groundY > -Infinity) {
+      const targetEyeY = groundY + bot.config.eyeHeight;
+      // If close to a valid ground surface, snap to it
+      if (Math.abs(feetY - groundY) < 0.5) {
+        bot.position.y = targetEyeY;
+      }
     }
   }
 
@@ -492,7 +523,14 @@ export class BotManager {
       // Respawn at spawn point far from other entities
       if (this.spawnPoints.length > 0) {
         const avoidPositions = this.getAllEntityPositions(player);
-        const spawn = this.getSpreadSpawnPoint(this.spawnPoints, avoidPositions);
+        const rawSpawn = this.getSpreadSpawnPoint(this.spawnPoints, avoidPositions);
+
+        // Adjust spawn position for BSP collision mesh
+        const collisionMesh = getGlobalCollisionMesh();
+        const spawn = (collisionMesh && collisionMesh.triangles.length > 0)
+          ? adjustSpawnPosition(rawSpawn, collisionMesh)
+          : rawSpawn;
+
         bot.respawn(spawn, Math.random() * Math.PI * 2);
         bot.setState('idle', now);
       }
