@@ -20,6 +20,14 @@ import {
   isGameKeyDown,
   wasGameKeyJustPressed,
   updateNativeKeyboard,
+  // Native mouse
+  isNativeMouseAvailable,
+  getNativeMouseDelta,
+  wasMouseButtonJustPressed,
+  isNativeMouseButtonDown,
+  MouseButton,
+  // Cursor capture
+  setNativeCursorCaptured,
 } from './input/NativeKeyboard.js';
 
 // Stdin-based key state tracking with timing (fallback)
@@ -36,12 +44,486 @@ import { BotManager } from './ai/BotManager.js';
 import { GameMode, DEFAULT_DEATHMATCH_CONFIG, DEFAULT_COMPETITIVE_CONFIG, GameModeType } from './game/GameMode.js';
 import { getSoundEngine, playSound, playSoundAt, SoundType } from './audio/SoundEngine.js';
 import { getGameConsole, consoleLog, consoleWarn, consoleError, consoleDebug } from './ui/Console.js';
-import { getMainMenu, MainMenu } from './ui/MainMenu.js';
+import { getMainMenu, MainMenu, RenderMode, MSAAMode } from './ui/MainMenu.js';
 import { getBuyMenu, BuyMenu } from './ui/BuyMenu.js';
+
+// CLI options interface
+interface CLIOptions {
+  renderMode: RenderMode;
+  msaaMode: MSAAMode;
+  help: boolean;
+  debug: boolean;
+}
+
+// Graphics quality presets
+type QualityPreset = 'low' | 'medium' | 'high' | 'ultra';
+
+const QUALITY_PRESETS: Record<QualityPreset, { render: RenderMode; msaa: MSAAMode }> = {
+  low:    { render: 'basic',     msaa: 'none' },
+  medium: { render: 'basic',     msaa: '4x'   },
+  high:   { render: 'halfblock', msaa: '4x'   },
+  ultra:  { render: 'sixel',     msaa: '16x'  },
+};
+
+// Parse command line arguments
+function parseArgs(): CLIOptions {
+  const args = process.argv.slice(2);
+  const options: CLIOptions = {
+    renderMode: 'basic',
+    msaaMode: 'none',
+    help: false,
+    debug: false,
+  };
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+
+    if (arg === '--help' || arg === '-h') {
+      options.help = true;
+    } else if (arg === '--debug' || arg === '-d') {
+      options.debug = true;
+    } else if (arg === '--quality' || arg === '-q') {
+      const value = args[++i]?.toLowerCase() as QualityPreset;
+      if (value in QUALITY_PRESETS) {
+        options.renderMode = QUALITY_PRESETS[value].render;
+        options.msaaMode = QUALITY_PRESETS[value].msaa;
+      }
+    } else if (arg.startsWith('--quality=')) {
+      const value = arg.split('=')[1]?.toLowerCase() as QualityPreset;
+      if (value in QUALITY_PRESETS) {
+        options.renderMode = QUALITY_PRESETS[value].render;
+        options.msaaMode = QUALITY_PRESETS[value].msaa;
+      }
+    } else if (arg === '--low') {
+      options.renderMode = QUALITY_PRESETS.low.render;
+      options.msaaMode = QUALITY_PRESETS.low.msaa;
+    } else if (arg === '--medium' || arg === '--med') {
+      options.renderMode = QUALITY_PRESETS.medium.render;
+      options.msaaMode = QUALITY_PRESETS.medium.msaa;
+    } else if (arg === '--high') {
+      options.renderMode = QUALITY_PRESETS.high.render;
+      options.msaaMode = QUALITY_PRESETS.high.msaa;
+    } else if (arg === '--ultra' || arg === '--max') {
+      options.renderMode = QUALITY_PRESETS.ultra.render;
+      options.msaaMode = QUALITY_PRESETS.ultra.msaa;
+    } else if (arg === '--render' || arg === '-r') {
+      const value = args[++i]?.toLowerCase();
+      if (value === 'basic' || value === 'halfblock' || value === 'half-block' || value === 'sixel') {
+        options.renderMode = value === 'half-block' ? 'halfblock' : value as RenderMode;
+      }
+    } else if (arg.startsWith('--render=')) {
+      const value = arg.split('=')[1]?.toLowerCase();
+      if (value === 'basic' || value === 'halfblock' || value === 'half-block' || value === 'sixel') {
+        options.renderMode = value === 'half-block' ? 'halfblock' : value as RenderMode;
+      }
+    } else if (arg === '--msaa' || arg === '-m') {
+      const value = args[++i]?.toLowerCase();
+      if (value === 'none' || value === 'off' || value === '0') {
+        options.msaaMode = 'none';
+      } else if (value === '4x' || value === '4') {
+        options.msaaMode = '4x';
+      } else if (value === '16x' || value === '16') {
+        options.msaaMode = '16x';
+      }
+    } else if (arg.startsWith('--msaa=')) {
+      const value = arg.split('=')[1]?.toLowerCase();
+      if (value === 'none' || value === 'off' || value === '0') {
+        options.msaaMode = 'none';
+      } else if (value === '4x' || value === '4') {
+        options.msaaMode = '4x';
+      } else if (value === '16x' || value === '16') {
+        options.msaaMode = '16x';
+      }
+    }
+  }
+
+  return options;
+}
+
+function printHelp(): void {
+  console.log(`
+CS-CLI - Terminal-based Counter-Strike
+
+Usage: cs-cli [options]
+
+Quality Presets:
+  --low                   Basic rendering, no AA (fastest)
+  --medium, --med         Basic rendering + 4x MSAA
+  --high                  Half-block (2x res) + 4x MSAA
+  --ultra, --max          Sixel (pixel) + 16x MSAA (best quality)
+  -q, --quality <preset>  Set quality: low, medium, high, ultra
+
+Advanced Options:
+  -r, --render <mode>     Set render mode:
+                            basic      - Standard character rendering (default)
+                            halfblock  - 2x vertical resolution using half-blocks
+                            sixel      - Pixel-level rendering (requires sixel support)
+  -m, --msaa <level>      Set anti-aliasing:
+                            none|off|0 - No anti-aliasing (default)
+                            4x|4       - 4x MSAA
+                            16x|16     - 16x MSAA
+
+Other:
+  -h, --help              Show this help message
+  -d, --debug             Run debug mode (rotating cube test scene)
+
+Examples:
+  cs-cli                           # Start with defaults (low)
+  cs-cli --high                    # High quality preset
+  cs-cli --ultra                   # Ultra quality (sixel + 16x MSAA)
+  cs-cli -q medium                 # Medium quality preset
+  cs-cli --render=halfblock        # Half-block rendering only
+  cs-cli -r sixel -m 4x            # Custom: sixel + 4x MSAA
+
+In-Game Controls:
+  WASD/Arrows  - Move/Look
+  Mouse        - Look (click to capture)
+  Space        - Jump
+  F/Click      - Fire
+  R            - Reload
+  B            - Buy menu
+  Tab          - Scoreboard
+  ~            - Console
+  Esc/Q        - Quit
+`);
+}
+
+// Debug mode: rotating colored cube test scene
+async function runDebugMode(initialRenderMode: RenderMode, initialMsaaMode: MSAAMode): Promise<void> {
+  const { Renderer } = await import('./engine/Renderer.js');
+  const { Mesh } = await import('./engine/Mesh.js');
+  const { Transform } = await import('./engine/Transform.js');
+  const { Vector3 } = await import('./engine/math/Vector3.js');
+  const { Quaternion } = await import('./engine/math/Quaternion.js');
+  const { Color, CURSOR_HIDE, ALT_SCREEN_ON, ALT_SCREEN_OFF, RESET } = await import('./utils/Colors.js');
+  const fs = await import('fs');
+
+  // Debug log file
+  const debugLog = (msg: string) => {
+    fs.appendFileSync('/tmp/cs_debug.log', `${new Date().toISOString()} ${msg}\n`);
+  };
+  fs.writeFileSync('/tmp/cs_debug.log', `=== Debug session started ===\n`);
+
+  // Graphics modes (mutable for runtime switching)
+  const renderModes: RenderMode[] = ['basic', 'halfblock', 'sixel'];
+  const msaaModes: MSAAMode[] = ['none', '4x', '16x'];
+  let renderModeIndex = renderModes.indexOf(initialRenderMode);
+  let msaaModeIndex = msaaModes.indexOf(initialMsaaMode);
+
+  // Create renderer
+  const width = process.stdout.columns || 80;
+  const height = process.stdout.rows ? process.stdout.rows - 2 : 22;
+  const renderer = new Renderer(width, height);
+
+  // Disable game UI features for clean debug rendering
+  renderer.showCrosshair = false;
+  renderer.showHUD = false;
+  renderer.showStats = false;
+  renderer.enableDifferentialRendering = false;
+
+  renderer.setRenderMode(renderModes[renderModeIndex]);
+  renderer.setMSAAMode(msaaModes[msaaModeIndex]);
+  renderer.setClearColor(new Color(240, 240, 240)); // Light gray background
+
+  // Update camera FOV for better cube visibility
+  const camera = renderer.getCamera();
+  camera.setFov(60); // 60 degrees - narrower FOV for less distortion
+
+  // Create colored faces as separate meshes
+  const faceColors = [
+    new Color(255, 50, 50),    // Red
+    new Color(50, 255, 50),    // Green
+    new Color(50, 50, 255),    // Blue
+    new Color(255, 255, 50),   // Yellow
+    new Color(255, 50, 255),   // Magenta
+    new Color(50, 255, 255),   // Cyan
+  ];
+
+  const meshes: { mesh: Mesh; transform: Transform }[] = [];
+
+  // Create a simple cube with 6 colored faces
+  for (let i = 0; i < 6; i++) {
+    const mesh = new Mesh({ name: `face${i}`, color: faceColors[i] });
+
+    // Create a quad for each face
+    const s = 1; // half-size
+    let verts: Vector3[];
+    let normal: Vector3;
+
+    switch (i) {
+      case 0: // Front (+Z)
+        verts = [new Vector3(-s, -s, s), new Vector3(s, -s, s), new Vector3(s, s, s), new Vector3(-s, s, s)];
+        normal = new Vector3(0, 0, 1);
+        break;
+      case 1: // Back (-Z)
+        verts = [new Vector3(s, -s, -s), new Vector3(-s, -s, -s), new Vector3(-s, s, -s), new Vector3(s, s, -s)];
+        normal = new Vector3(0, 0, -1);
+        break;
+      case 2: // Left (-X)
+        verts = [new Vector3(-s, -s, -s), new Vector3(-s, -s, s), new Vector3(-s, s, s), new Vector3(-s, s, -s)];
+        normal = new Vector3(-1, 0, 0);
+        break;
+      case 3: // Right (+X)
+        verts = [new Vector3(s, -s, s), new Vector3(s, -s, -s), new Vector3(s, s, -s), new Vector3(s, s, s)];
+        normal = new Vector3(1, 0, 0);
+        break;
+      case 4: // Top (+Y)
+        verts = [new Vector3(-s, s, s), new Vector3(s, s, s), new Vector3(s, s, -s), new Vector3(-s, s, -s)];
+        normal = new Vector3(0, 1, 0);
+        break;
+      case 5: // Bottom (-Y)
+      default:
+        verts = [new Vector3(-s, -s, -s), new Vector3(s, -s, -s), new Vector3(s, -s, s), new Vector3(-s, -s, s)];
+        normal = new Vector3(0, -1, 0);
+        break;
+    }
+
+    for (const v of verts) {
+      mesh.addVertex(v, normal);
+    }
+    // Counter-clockwise winding for front-facing triangles
+    mesh.addTriangle(0, 2, 1);
+    mesh.addTriangle(0, 3, 2);
+
+    const transform = new Transform();
+    meshes.push({ mesh, transform });
+    renderer.addObject({ mesh, transform });
+  }
+
+  // Set up camera position (will be updated in loop based on cameraDistance)
+  camera.lookAt(new Vector3(0, 0, 0));
+
+  // Enter fullscreen
+  process.stdout.write(ALT_SCREEN_ON + CURSOR_HIDE);
+
+  let running = true;
+  let lastTime = Date.now();
+
+  // Current rotation as quaternion
+  let currentRotation = new Quaternion();
+
+  // Rotation velocities (radians per second) around each axis
+  let velX = 0.5;
+  let velY = 0.8;
+  let velZ = 0.3;
+
+  // Camera zoom (distance from cube)
+  let cameraDistance = 3.0;
+  const ZOOM_STEP = 0.5;
+  const MIN_ZOOM = 1.5;
+  const MAX_ZOOM = 10.0;
+
+  const VELOCITY_STEP = 0.3; // How much to change velocity per keypress
+
+  // FPS tracking
+  let frameCount = 0;
+  let lastFpsUpdate = Date.now();
+  let currentFps = 0;
+
+  // Sixel resolution options (1=full, 2=half, 4=quarter, 8=eighth, 16=sixteenth)
+  const sixelResolutions = [1, 2, 4, 8, 16];
+  let sixelResIndex = 3; // Start at 8 (eighth res)
+
+  // Handle keyboard input
+  process.stdin.setRawMode(true);
+  process.stdin.resume();
+  process.stdin.on('data', (data) => {
+    const key = data.toString();
+
+    // Exit keys
+    if (key === 'q' || key === '\x03') { // q, Ctrl+C
+      running = false;
+      return;
+    }
+
+    // Arrow keys (escape sequences)
+    if (key === '\x1b[A') { // Up arrow - increase X rotation (pitch)
+      velX += VELOCITY_STEP;
+    } else if (key === '\x1b[B') { // Down arrow - decrease X rotation
+      velX -= VELOCITY_STEP;
+    } else if (key === '\x1b[C') { // Right arrow - increase Y rotation (yaw)
+      velY += VELOCITY_STEP;
+    } else if (key === '\x1b[D') { // Left arrow - decrease Y rotation
+      velY -= VELOCITY_STEP;
+    } else if (key === '[' || key === ']') { // [ ] for Z rotation (roll)
+      velZ += key === ']' ? VELOCITY_STEP : -VELOCITY_STEP;
+    } else if (key === ' ') { // Space to reset
+      velX = 0.5;
+      velY = 0.8;
+      velZ = 0.3;
+      currentRotation = new Quaternion();
+    } else if (key === '0') { // 0 to stop all rotation
+      velX = velY = velZ = 0;
+    } else if (key === 'r' || key === 'R') { // R to cycle render mode
+      const oldMode = renderModes[renderModeIndex];
+      renderModeIndex = (renderModeIndex + 1) % renderModes.length;
+      const newMode = renderModes[renderModeIndex];
+
+      debugLog(`MODE SWITCH: ${oldMode} -> ${newMode}`);
+      debugLog(`  BEFORE: fb=${renderer.getWidth()}x${renderer.getHeight()} cam.aspect=${camera.aspect}`);
+      debugLog(`  BEFORE: cam.pos=${JSON.stringify(camera.position)} cam.fov=${camera.fov}`);
+      debugLog(`  Terminal: ${process.stdout.columns}x${process.stdout.rows}`);
+
+      // Full terminal reset: clear screen, reset sixel, home cursor
+      process.stdout.write('\x1b\\\x1b[2J\x1b[H\x1b[0m');
+      renderer.setRenderMode(newMode);
+
+      debugLog(`  AFTER: fb=${renderer.getWidth()}x${renderer.getHeight()} cam.aspect=${camera.aspect}`);
+      debugLog(`  AFTER: cam.pos=${JSON.stringify(camera.position)} cam.fov=${camera.fov}`);
+
+      if (newMode === 'sixel') {
+        const si = renderer.getSixelInfo();
+        debugLog(`  SIXEL: resolution=1/${si.resolution} cellSize=${si.cellSize} targetPixels=${si.targetPixels}`);
+        debugLog(`  SIXEL: outputScale=${renderer.getSixelOutputScale()}`);
+      }
+
+      // Log transform state
+      for (let i = 0; i < meshes.length; i++) {
+        const t = meshes[i].transform;
+        debugLog(`  mesh[${i}] pos=${JSON.stringify(t.position)} scale=${JSON.stringify(t.scale)}`);
+      }
+    } else if (key === 'm' || key === 'M') { // M to cycle MSAA mode
+      msaaModeIndex = (msaaModeIndex + 1) % msaaModes.length;
+      debugLog(`MSAA SWITCH: -> ${msaaModes[msaaModeIndex]}`);
+      // Clear when changing MSAA to reset sample buffers visually
+      process.stdout.write('\x1b[2J\x1b[H');
+      renderer.setMSAAMode(msaaModes[msaaModeIndex]);
+    } else if (key === '=' || key === '+') { // Zoom in (closer)
+      cameraDistance = Math.max(MIN_ZOOM, cameraDistance - ZOOM_STEP);
+    } else if (key === '-' || key === '_') { // Zoom out (farther)
+      cameraDistance = Math.min(MAX_ZOOM, cameraDistance + ZOOM_STEP);
+    } else if (key === '<' || key === ',') { // Decrease sixel resolution (faster)
+      sixelResIndex = Math.min(sixelResIndex + 1, sixelResolutions.length - 1);
+      renderer.setSixelResolution(sixelResolutions[sixelResIndex]);
+      debugLog(`SIXEL RES: ${sixelResolutions[sixelResIndex]} (fb=${renderer.getWidth()}x${renderer.getHeight()})`);
+    } else if (key === '>' || key === '.') { // Increase sixel resolution (better quality)
+      sixelResIndex = Math.max(sixelResIndex - 1, 0);
+      renderer.setSixelResolution(sixelResolutions[sixelResIndex]);
+      debugLog(`SIXEL RES: ${sixelResolutions[sixelResIndex]} (fb=${renderer.getWidth()}x${renderer.getHeight()})`);
+    } else if (key === 'd' || key === 'D') { // Detect terminal pixel size
+      debugLog(`DETECTING terminal pixel size...`);
+      renderer.detectTerminalPixelSize().then((result) => {
+        if (result) {
+          debugLog(`DETECTED: ${result.width}x${result.height} pixels`);
+          const cellW = Math.round(result.width / (process.stdout.columns || 80));
+          const cellH = Math.round(result.height / (process.stdout.rows || 24));
+          debugLog(`CELL SIZE: ${cellW}x${cellH} pixels`);
+          renderer.setCellPixelSize(cellW, cellH);
+        } else {
+          debugLog(`DETECTION FAILED (terminal may not support CSI 14 t)`);
+        }
+      });
+    } else if (key === 'c' || key === 'C') { // Cycle cell size presets
+      const presets = [
+        { w: 8, h: 16, name: '8x16 (standard)' },
+        { w: 10, h: 20, name: '10x20 (medium)' },
+        { w: 14, h: 28, name: '14x28 (large)' },
+        { w: 16, h: 32, name: '16x32 (Retina)' },
+        { w: 20, h: 40, name: '20x40 (HiDPI)' },
+      ];
+      const si = renderer.getSixelInfo();
+      const currentCell = si.cellSize;
+      let currentIdx = presets.findIndex(p => `${p.w}x${p.h}` === currentCell);
+      currentIdx = (currentIdx + 1) % presets.length;
+      const preset = presets[currentIdx];
+      renderer.setCellPixelSize(preset.w, preset.h);
+      debugLog(`CELL SIZE: ${preset.name} -> target ${renderer.getSixelInfo().targetPixels}`);
+    }
+  });
+
+  // Main loop
+  const loop = () => {
+    if (!running) {
+      // Cleanup
+      process.stdout.write(ALT_SCREEN_OFF + RESET);
+      process.stdin.setRawMode(false);
+      process.exit(0);
+      return;
+    }
+
+    // Calculate delta time
+    const now = Date.now();
+    const dt = (now - lastTime) / 1000;
+    lastTime = now;
+
+    // Apply incremental rotations using quaternion multiplication
+    // This avoids gimbal lock issues with Euler angles
+    if (velX !== 0) {
+      const deltaRotX = Quaternion.fromAxisAngle(new Vector3(1, 0, 0), velX * dt);
+      currentRotation = Quaternion.multiply(deltaRotX, currentRotation);
+    }
+    if (velY !== 0) {
+      const deltaRotY = Quaternion.fromAxisAngle(new Vector3(0, 1, 0), velY * dt);
+      currentRotation = Quaternion.multiply(deltaRotY, currentRotation);
+    }
+    if (velZ !== 0) {
+      const deltaRotZ = Quaternion.fromAxisAngle(new Vector3(0, 0, 1), velZ * dt);
+      currentRotation = Quaternion.multiply(deltaRotZ, currentRotation);
+    }
+
+    // Normalize to prevent drift
+    currentRotation.normalize();
+
+    // Apply rotation to all faces (use setRotation to mark matrix dirty)
+    for (const { transform } of meshes) {
+      transform.setRotation(currentRotation);
+    }
+
+    // Keep camera at fixed position looking at cube (zoom adjustable)
+    camera.position = new Vector3(0, cameraDistance * 0.5, cameraDistance);
+    camera.lookAt(new Vector3(0, 0, 0));
+
+    // Render
+    renderer.render();
+
+    // Update FPS counter
+    frameCount++;
+    const fpsNow = Date.now();
+    if (fpsNow - lastFpsUpdate >= 500) {
+      currentFps = frameCount / ((fpsNow - lastFpsUpdate) / 1000);
+      frameCount = 0;
+      lastFpsUpdate = fpsNow;
+    }
+
+    // Draw controls overlay (after render, directly to stdout)
+    const currentRenderMode = renderModes[renderModeIndex];
+    const currentMsaaMode = msaaModes[msaaModeIndex];
+    const fbW = renderer.getWidth();
+    const fbH = renderer.getHeight();
+    const camAspect = camera.aspect.toFixed(2);
+
+    // Sixel-specific info
+    let sixelInfo = '';
+    if (currentRenderMode === 'sixel') {
+      const si = renderer.getSixelInfo();
+      sixelInfo = ` | Res:1/${si.resolution} Cell:${si.cellSize} Target:${si.targetPixels}`;
+    }
+
+    const info = [
+      `\x1b[1;1H\x1b[97m\x1b[40m ${currentRenderMode} ${currentMsaaMode} | FB:${fbW}×${fbH} | A:${camAspect} | Z:${cameraDistance.toFixed(1)} | ${currentFps.toFixed(0)} FPS${sixelInfo} \x1b[K`,
+      `\x1b[2;1H ↑↓←→:Rot  []:Roll  +/-:Zoom  0:Stop  Space:Reset  R:Render  M:MSAA \x1b[K`,
+      `\x1b[3;1H </>:SixelRes  C:CellSize  D:DetectSize  Q:Quit \x1b[0m\x1b[K`,
+    ];
+    process.stdout.write(info.join(''));
+
+    // Schedule next frame
+    setTimeout(loop, 16); // ~60 FPS
+  };
+
+  loop();
+
+  // Keep process alive
+  await new Promise(() => {});
+}
+
 import { getTeamManager, resetTeamManager, TeamId } from './game/Team.js';
 import { getDroppedWeaponManager, resetDroppedWeaponManager } from './game/DroppedWeapon.js';
+import { getServerBrowser, ServerBrowser } from './ui/ServerBrowser.js';
+import { getLobbyScreen, LobbyScreen } from './ui/LobbyScreen.js';
+import { getGameClient, GameClient } from './network/GameClient.js';
+import { getMultiplayerState, resetMultiplayerState } from './network/MultiplayerState.js';
 
-type AppMode = 'menu' | 'playing';
+type AppMode = 'menu' | 'playing' | 'server_browser' | 'lobby';
 
 interface GameState {
   appMode: AppMode;
@@ -75,14 +557,23 @@ const GROUND_Y = 1.7; // eye height
 const PLAYER_RADIUS = 0.4;
 const PLAYER_HEIGHT = 1.7;
 
-function Game() {
+interface GameProps {
+  initialRenderMode?: RenderMode;
+  initialMSAAMode?: MSAAMode;
+}
+
+function Game({ initialRenderMode = 'basic', initialMSAAMode = 'none' }: GameProps) {
   const { exit } = useApp();
   const { stdout } = useStdout();
 
   const [renderer] = useState(() => {
     const width = stdout?.columns || 80;
     const height = stdout?.rows ? stdout.rows - 2 : 22;
-    return new Renderer(width, height);
+    const r = new Renderer(width, height);
+    // Apply initial settings from CLI
+    r.setRenderMode(initialRenderMode);
+    r.setMSAAMode(initialMSAAMode);
+    return r;
   });
 
   const [gameState, setGameState] = useState<GameState>({
@@ -109,11 +600,24 @@ function Game() {
   // Selected game mode type
   const gameModeTypeRef = useRef<GameModeType>('deathmatch');
 
-  // Main menu
-  const [mainMenu] = useState(() => getMainMenu());
+  // Main menu - initialize with CLI settings
+  const [mainMenu] = useState(() => {
+    const menu = getMainMenu();
+    menu.setInitialSettings(initialRenderMode, initialMSAAMode);
+    return menu;
+  });
 
   // Buy menu
   const [buyMenu] = useState(() => getBuyMenu());
+
+  // Server browser
+  const [serverBrowser] = useState(() => getServerBrowser());
+
+  // Lobby screen
+  const [lobbyScreen] = useState(() => getLobbyScreen());
+
+  // Game client (network)
+  const [gameClient] = useState(() => getGameClient());
 
   // Player ref
   const playerRef = useRef<Player>(new Player());
@@ -124,6 +628,10 @@ function Game() {
     const height = stdout?.rows ? stdout.rows - 2 : 22;
     return new MouseHandler(width, height);
   });
+
+  // Mouse sensitivity for native mouse input (radians per pixel)
+  // Higher = faster camera movement. Default 0.004 is good for most users.
+  const mouseSensitivityRef = useRef(0.004);
 
   // Physics state ref
   const physicsRef = useRef<PlayerPhysics>({
@@ -168,6 +676,12 @@ function Game() {
 
   // Track if native keyboard is active
   const useNativeKeyboardRef = useRef(false);
+
+  // Track mouse click fire request
+  const mouseFireRef = useRef(false);
+
+  // Track if we're in multiplayer mode
+  const isMultiplayerRef = useRef(false);
 
   const [scene] = useState(() => {
     const objects: RenderObject[] = [];
@@ -229,6 +743,8 @@ function Game() {
     // Set up main menu display (don't start game yet)
     renderer.setMainMenu(mainMenu, true);
     renderer.setBuyMenu(buyMenu);
+    renderer.setServerBrowser(serverBrowser, false);
+    renderer.setLobbyScreen(lobbyScreen, false);
 
     // Register console commands
     const gameConsole = getGameConsole();
@@ -408,6 +924,8 @@ function Game() {
         playSound(botHit.headshot ? 'hit_headshot' : 'hit_enemy');
 
         if (wasAlive && !botHit.bot.isAlive) {
+          // Drop bot's weapons on death
+          botHit.bot.dropAllWeapons(now);
           player.kills++;
           player.awardKill(weapon.def.type);
           playSound('bot_death');
@@ -447,6 +965,8 @@ function Game() {
         playSound(botHit.headshot ? 'hit_headshot' : 'hit_enemy');
 
         if (wasAlive && !botHit.bot.isAlive) {
+          // Drop bot's weapons on death
+          botHit.bot.dropAllWeapons(now);
           player.kills++;
           player.awardKill(weapon.def.type);
           playSound('bot_death');
@@ -582,7 +1102,161 @@ function Game() {
           // Hide main menu
           renderer.setMainMenu(mainMenu, false);
 
+          // Enable mouse capture for gameplay
+          mouseHandler.setAllowClickCapture(true);
+
           consoleLog(`Starting ${result.mode} game on ${result.map}`);
+        } else if (result.action === 'multiplayer') {
+          // Switch to server browser
+          appModeRef.current = 'server_browser';
+          renderer.setMainMenu(mainMenu, false);
+          renderer.setServerBrowser(serverBrowser, true);
+          serverBrowser.setConnecting();
+          mouseHandler.setAllowClickCapture(false); // Disable click-to-capture in menus
+          consoleLog('Opening server browser...');
+
+          // Connect to game server
+          const gameClient = getGameClient();
+          const mpState = getMultiplayerState();
+
+          gameClient.setCallbacks({
+            onConnect: () => {
+              serverBrowser.setConnected();
+              consoleLog('Connected to server');
+              gameClient.listRooms();
+            },
+            onDisconnect: (reason) => {
+              serverBrowser.setError(`Disconnected: ${reason}`);
+              consoleLog(`Disconnected: ${reason}`);
+              // Deactivate multiplayer state on disconnect
+              mpState.deactivate();
+              isMultiplayerRef.current = false;
+            },
+            onError: (error) => {
+              serverBrowser.setError(error);
+              consoleError(error);
+            },
+            onRoomList: (rooms) => {
+              serverBrowser.updateRooms(rooms);
+              consoleLog(`Found ${rooms.length} rooms`);
+            },
+            onRoomJoined: (roomId, playerId, room) => {
+              consoleLog(`Joined room: ${room.name} as ${playerId}`);
+              // Transition to lobby screen
+              appModeRef.current = 'lobby';
+              renderer.setServerBrowser(serverBrowser, false);
+              renderer.setLobbyScreen(lobbyScreen, true);
+              lobbyScreen.reset(); // Clear any previous state
+              lobbyScreen.setRoomInfo(room);
+              lobbyScreen.setLocalPlayerId(playerId);
+              // Add ourselves to the player list
+              const isHost = room.playerCount === 1; // First player is host
+              lobbyScreen.addPlayer(playerId, serverBrowser.getPlayerName(), isHost);
+            },
+            onRoomError: (error) => {
+              serverBrowser.setError(error);
+              consoleError(error);
+            },
+            onPlayerJoined: (playerId, playerName) => {
+              consoleLog(`${playerName} joined`);
+              lobbyScreen.addPlayer(playerId, playerName);
+            },
+            onPlayerLeft: (playerId, playerName) => {
+              consoleLog(`${playerName} left`);
+              lobbyScreen.removePlayer(playerId);
+            },
+            onPlayerReady: (playerId, ready) => {
+              lobbyScreen.setPlayerReady(playerId, ready);
+              const player = lobbyScreen.getState().players.find(p => p.id === playerId);
+              consoleLog(`${player?.name || playerId} is ${ready ? 'ready' : 'not ready'}`);
+            },
+            onAssignedTeam: (team) => {
+              lobbyScreen.setLocalTeam(team);
+              playerRef.current.team = team;
+              consoleLog(`Assigned to team: ${team}`);
+            },
+            // Game state from server (multiplayer)
+            onGameState: (state) => {
+              mpState.applyServerState(state);
+            },
+            // Input acknowledgement for client-side prediction
+            onInputAck: (sequence, position) => {
+              const correctedPos = mpState.acknowledgeInput(sequence, position);
+              if (correctedPos) {
+                // Significant drift detected - snap to server position
+                const camera = renderer.getCamera();
+                camera.setPosition(correctedPos.x, correctedPos.y, correctedPos.z);
+                playerRef.current.position = correctedPos.clone();
+              }
+            },
+            // Combat events for visual/audio effects
+            onFireEvent: (event) => {
+              mpState.queueFireEvent(event);
+              // Play fire sound at position
+              const pos = new Vector3(event.origin.x, event.origin.y, event.origin.z);
+              const isLocal = event.playerId === mpState.getLocalPlayerId();
+              if (!isLocal) {
+                // Remote player fire - play sound at their position
+                playSoundAt('shoot_rifle', pos);
+              }
+            },
+            onHitEvent: (event) => {
+              mpState.queueHitEvent(event);
+              // If we hit someone, show hit marker
+              const localId = mpState.getLocalPlayerId();
+              if (event.attackerId === localId) {
+                renderer.triggerHitMarker();
+                playSound(event.headshot ? 'hit_headshot' : 'hit_enemy');
+              } else if (event.victimId === localId) {
+                // We got hit - play hurt sound
+                playSound('player_hurt');
+              }
+            },
+            onKillEvent: (event) => {
+              mpState.queueKillEvent(event);
+              consoleLog(`${event.killerName} killed ${event.victimName} with ${event.weapon}${event.headshot ? ' (headshot)' : ''}`);
+              // Update local player stats if they got the kill
+              const localId = mpState.getLocalPlayerId();
+              if (event.killerId === localId) {
+                playerRef.current.kills++;
+                playSound('bot_death');
+              } else if (event.victimId === localId) {
+                playerRef.current.deaths++;
+                playSound('player_death');
+              }
+            },
+            // Phase changes
+            onPhaseChange: (phase, roundNumber, tScore, ctScore) => {
+              consoleLog(`Phase: ${phase}, Round ${roundNumber} (T: ${tScore}, CT: ${ctScore})`);
+            },
+            // Game starting from lobby
+            onGameStarting: (countdown) => {
+              consoleLog(`Game starting in ${countdown}...`);
+              if (countdown <= 0) {
+                // Transition to gameplay
+                appModeRef.current = 'playing';
+                isMultiplayerRef.current = true;
+                renderer.setLobbyScreen(lobbyScreen, false);
+                mouseHandler.setAllowClickCapture(true);
+
+                // Activate multiplayer state
+                const playerId = gameClient.getPlayerId();
+                if (playerId) {
+                  mpState.activate(playerId);
+                }
+
+                // Clear local bots - we'll use server entities
+                botManager.clear();
+
+                consoleLog('Game started! You are now in multiplayer mode.');
+              }
+            },
+          });
+
+          gameClient.connect('ws://localhost:8080').catch((err) => {
+            serverBrowser.setError(`Failed to connect: ${err.message}`);
+            consoleError(`Connection failed: ${err.message}`);
+          });
         } else if (result.action === 'quit') {
           exitingRef.current = true;
           mouseHandler.disable();
@@ -591,6 +1265,90 @@ function Game() {
           process.stdin.pause();
           process.stdout.write(CURSOR_SHOW + ALT_SCREEN_OFF + RESET);
           process.exit(0);
+        }
+        return;
+      }
+
+      // Server browser handling
+      if (appModeRef.current === 'server_browser') {
+        let key = str;
+        if (str === '\x1b[A') key = 'up';
+        else if (str === '\x1b[B') key = 'down';
+        else if (str === '\x1b[C') key = 'right';
+        else if (str === '\x1b[D') key = 'left';
+        else if (str === '\r') key = 'enter';
+        else if (str === ' ') key = 'space';
+        else if (str === '\x1b' && !str.startsWith('\x1b[')) key = 'escape';
+        else if (str === '\x7f') key = 'backspace';
+
+        const result = serverBrowser.handleKey(key);
+        if (result.action === 'back') {
+          // Go back to main menu
+          appModeRef.current = 'menu';
+          renderer.setServerBrowser(serverBrowser, false);
+          renderer.setMainMenu(mainMenu, true);
+          mainMenu.reset();
+          mouseHandler.setAllowClickCapture(false); // Disable click capture in menu
+          mouseHandler.release(); // Release mouse if captured
+          // Disconnect from server
+          const gameClient = getGameClient();
+          gameClient.disconnect();
+        } else if (result.action === 'create' && result.config) {
+          // Create a room
+          consoleLog(`Creating room: ${result.config.name}`);
+          const gameClient = getGameClient();
+          gameClient.createRoom(result.config);
+        } else if (result.action === 'join' && result.roomId) {
+          // Join a room
+          consoleLog(`Joining room: ${result.roomId}`);
+          const gameClient = getGameClient();
+          gameClient.joinRoom(result.roomId);
+        } else if (result.action === 'refresh') {
+          // Refresh room list
+          const gameClient = getGameClient();
+          gameClient.listRooms();
+        }
+        return;
+      }
+
+      // Lobby handling
+      if (appModeRef.current === 'lobby') {
+        let key = str;
+        if (str === '\r') key = 'enter';
+        else if (str === '\x1b' && !str.startsWith('\x1b[')) key = 'escape';
+
+        const result = lobbyScreen.handleKey(key);
+        if (result.action === 'leave') {
+          // Leave room and go back to server browser
+          const gameClient = getGameClient();
+          gameClient.leaveRoom();
+          appModeRef.current = 'server_browser';
+          renderer.setLobbyScreen(lobbyScreen, false);
+          renderer.setServerBrowser(serverBrowser, true);
+          lobbyScreen.reset();
+          // Refresh room list
+          gameClient.listRooms();
+        } else if (result.action === 'ready') {
+          // Toggle ready state and notify server
+          const isReady = lobbyScreen.toggleReady();
+          const gameClient = getGameClient();
+          gameClient.setReady();
+          consoleLog(isReady ? 'Ready!' : 'Unready');
+        } else if (result.action === 'start') {
+          // Host starts the game
+          const gameClient = getGameClient();
+          gameClient.startGame();
+          consoleLog('Starting game...');
+        } else if (result.action === 'team_t') {
+          // Request team T
+          const gameClient = getGameClient();
+          gameClient.changeTeam('T');
+          consoleLog('Requesting team T...');
+        } else if (result.action === 'team_ct') {
+          // Request team CT
+          const gameClient = getGameClient();
+          gameClient.changeTeam('CT');
+          consoleLog('Requesting team CT...');
         }
         return;
       }
@@ -680,12 +1438,17 @@ function Game() {
         buyMenu.toggle(playerRef.current);
       }
 
-      // C to toggle mouse capture
+      // C to toggle mouse capture (in game) or release (in menu)
       if (key === 'c') {
-        if (mouseHandler.isCaptured()) {
+        if (appModeRef.current === 'playing') {
+          if (mouseHandler.isCaptured()) {
+            mouseHandler.release();
+          } else {
+            mouseHandler.capture();
+          }
+        } else if (mouseHandler.isCaptured()) {
+          // In menu mode, only allow releasing, not capturing
           mouseHandler.release();
-        } else {
-          mouseHandler.capture();
         }
       }
 
@@ -721,6 +1484,25 @@ function Game() {
     // Enable mouse tracking (user must click to capture)
     mouseHandler.enable();
 
+    // Disable click-to-capture initially since we start in menu
+    mouseHandler.setAllowClickCapture(false);
+
+    // Set up mouse click handler for firing when captured
+    mouseHandler.setOnClick((button, _x, _y) => {
+      // Left click (button 0) fires when captured and in game
+      if (button === 0 && mouseHandler.isCaptured() && appModeRef.current === 'playing') {
+        mouseFireRef.current = true;
+      }
+    });
+
+    // Set up capture state change handler for native cursor capture
+    mouseHandler.setOnCapture((captured) => {
+      // When native mouse is available, capture/release the system cursor
+      if (isNativeMouseAvailable()) {
+        setNativeCursorCaptured(captured);
+      }
+    });
+
     // Try to initialize native keyboard (falls back to stdin if unavailable)
     useNativeKeyboardRef.current = initNativeKeyboard();
 
@@ -728,7 +1510,21 @@ function Game() {
     const inputMode = getInputMode();
     const mainMenu = getMainMenu();
 
+    // Set up settings change callback to update mouse sensitivity and render modes
+    mainMenu.setOnSettingsChange((settings) => {
+      mouseSensitivityRef.current = settings.mouseSensitivity;
+      renderer.setRenderMode(settings.renderMode);
+      renderer.setMSAAMode(settings.msaaMode);
+      renderer.setSixelResolution(settings.sixelResolution);
+      renderer.setTargetFps(settings.targetFps);
+    });
+
     if (inputMode === 'native') {
+      // Enable native mouse mode - skip robotjs recentering, use CGEventTap delta
+      if (isNativeMouseAvailable()) {
+        mouseHandler.setNativeMouseMode(true);
+      }
+
       mainMenu.setInputStatus({
         mode: 'native',
         working: true,
@@ -750,6 +1546,7 @@ function Game() {
 
     return () => {
       mouseHandler.disable();
+      setNativeCursorCaptured(false);  // Ensure cursor is released
       stopNativeKeyboard();
       process.stdin.setRawMode(false);
       process.stdin.pause();
@@ -799,7 +1596,20 @@ function Game() {
         lookYaw = look.yaw;
         lookPitch = look.pitch;
 
-        firePressed = isGameKeyDown('F');
+        // Native mouse button (left click = button 0) for firing when captured
+        const nativeMouseFire = isNativeMouseAvailable() && mouseHandler.isCaptured() &&
+          isNativeMouseButtonDown(MouseButton.Left);
+        firePressed = isGameKeyDown('F') || mouseFireRef.current || nativeMouseFire;
+
+        // Read native mouse delta NOW before updateNativeKeyboard() clears it
+        if (isNativeMouseAvailable() && mouseHandler.isCaptured()) {
+          const nativeDelta = getNativeMouseDelta();
+          if (nativeDelta.x !== 0 || nativeDelta.y !== 0) {
+            const yawDelta = -nativeDelta.x * mouseSensitivityRef.current;
+            const pitchDelta = -nativeDelta.y * mouseSensitivityRef.current;
+            camera.rotate(pitchDelta, yawDelta);
+          }
+        }
 
         // Handle weapon slots via native
         const slot = getNativeWeaponSlot();
@@ -822,7 +1632,7 @@ function Game() {
           buyMenu.toggle(playerRef.current);
         }
 
-        if (wasGameKeyJustPressed('C')) {
+        if (wasGameKeyJustPressed('C') && appModeRef.current === 'playing') {
           if (mouseHandler.isCaptured()) {
             mouseHandler.release();
           } else {
@@ -867,11 +1677,15 @@ function Game() {
         if (isKeyHeld('down', now)) lookPitch -= 1;
 
         jumpPressed = isKeyHeld(' ', now);
-        firePressed = isKeyHeld('f', now);
+        firePressed = isKeyHeld('f', now) || mouseFireRef.current;
       }
 
-      // Apply rotation from mouse (if captured)
-      if (mouseHandler.isCaptured()) {
+      // Clear mouse fire request after checking
+      mouseFireRef.current = false;
+
+      // Apply rotation from stdin mouse (fallback when native not available)
+      // Native mouse is handled earlier in the native input block
+      if (!isNativeMouseAvailable() && mouseHandler.isCaptured()) {
         const { pitch, yaw } = mouseHandler.getPitchYawDelta();
         if (pitch !== 0 || yaw !== 0) {
           camera.rotate(pitch, yaw);
@@ -905,11 +1719,32 @@ function Game() {
       // Handle fire key (F) - continuous fire while held
       const gameConsole = getGameConsole();
       if (!gameConsole.getIsOpen() && appModeRef.current === 'playing') {
-        if (firePressed && !gameModeRef.current.isPlayerFrozen()) {
+        const isFrozenMP = isMultiplayerRef.current && getMultiplayerState().isPlayerFrozen();
+        const isFrozenSP = !isMultiplayerRef.current && gameModeRef.current.isPlayerFrozen();
+        const isFrozen = isFrozenMP || isFrozenSP;
+
+        if (firePressed && !isFrozen) {
           const player = playerRef.current;
           const weapon = player.getCurrentWeapon();
-          if (player.fire(now) && weapon) {
-            handlePlayerFire(player, weapon, now);
+
+          if (isMultiplayerRef.current) {
+            // Multiplayer: send fire event to server
+            // Still check fire timing locally for responsive feel
+            if (player.fire(now) && weapon) {
+              getGameClient().sendFire();
+              // Play local fire sound immediately for responsiveness
+              const weaponType = weapon.def.type;
+              if (weaponType === 'pistol') playSound('shoot_pistol');
+              else if (weaponType === 'rifle') playSound('shoot_rifle');
+              else if (weaponType === 'shotgun') playSound('shoot_shotgun');
+              else if (weaponType === 'sniper') playSound('shoot_sniper');
+              renderer.triggerMuzzleFlash(80);
+            }
+          } else {
+            // Single player: handle fire locally
+            if (player.fire(now) && weapon) {
+              handlePlayerFire(player, weapon, now);
+            }
           }
         }
       }
@@ -980,6 +1815,34 @@ function Game() {
       // Update sound engine listener position for spatial audio
       getSoundEngine().setListenerPosition(player.position, player.yaw);
 
+      // Multiplayer: send input to server and record for prediction
+      const isMultiplayer = isMultiplayerRef.current;
+      const mpState = getMultiplayerState();
+
+      if (isMultiplayer && mpState.isActive()) {
+        const gameClient = getGameClient();
+
+        // Build input state
+        const inputState = {
+          forward: forward,
+          strafe: strafe,
+          yaw: camera.yaw,
+          pitch: camera.pitch,
+          jump: jumpPressed,
+          crouch: false, // TODO: implement crouch
+        };
+
+        // Get sequence and send to server
+        const sequence = mpState.getNextInputSequence();
+        gameClient.sendInput(inputState);
+
+        // Record for client-side prediction reconciliation
+        mpState.recordPendingInput(sequence, inputState, player.position);
+
+        // Update interpolation for remote entities
+        mpState.updateInterpolation(now);
+      }
+
       // Get weapon state for HUD
       const weapon = player.getCurrentWeapon();
 
@@ -1000,12 +1863,18 @@ function Game() {
 
       // Update bots only when playing (pass freeze and team mode info)
       if (isPlaying) {
-        botManager.update(player, collidersRef.current, now, deltaTime, isFrozen, isTeamMode);
+        if (isMultiplayer && mpState.isActive()) {
+          // Multiplayer mode: use server entities, skip local bot simulation
+          // Game mode is handled by server, we just render what server tells us
+        } else {
+          // Single player mode: run local bot simulation
+          botManager.update(player, collidersRef.current, now, deltaTime, isFrozen, isTeamMode);
 
-        // Bot combat is now handled by BotManager.update() via callbacks
+          // Bot combat is now handled by BotManager.update() via callbacks
 
-        // Update game mode
-        gameMode.update(player, botManager.getBots(), now);
+          // Update game mode
+          gameMode.update(player, botManager.getBots(), now);
+        }
       }
 
       // Handle death camera effect
@@ -1055,8 +1924,14 @@ function Game() {
         gameMode.onPlayerRespawn();
       }
 
-      // Pass bots to renderer
-      renderer.setBots(botManager.getBots());
+      // Pass bots to renderer (use multiplayer entities or local bots)
+      if (isMultiplayer && mpState.isActive()) {
+        // Multiplayer: use remote entities from server
+        renderer.setBots(mpState.getBotCompatibleEntities() as any);
+      } else {
+        // Single player: use local bots
+        renderer.setBots(botManager.getBots());
+      }
 
       // Set HUD data before rendering
       renderer.setHUD(
@@ -1068,27 +1943,54 @@ function Game() {
         weapon?.isReloading ?? false
       );
 
-      // Set game mode UI data
-      renderer.setKillFeed(gameMode.getKillFeed(now));
-      renderer.setScoreboard(gameMode.getScoreboard(player, botManager.getBots()));
-      renderer.setShowScoreboard(showScoreboardRef.current || gameMode.phase === 'match_end');
-      renderer.setGameState(
-        gameMode.phase,
-        gameMode.formatTime(gameMode.getRoundTimeRemaining(now)),
-        gameMode.config.roundsToWin,
-        gameMode.matchWinner,
-        gameMode.getRespawnCountdown(now),
-        Math.ceil(gameMode.getWarmupRemaining(now))
-      );
+      // Set game mode UI data (use multiplayer state when in multiplayer)
+      if (isMultiplayer && mpState.isActive()) {
+        // Multiplayer: use server-provided game state
+        const scores = mpState.getScores();
+        const phase = mpState.getPhase();
 
-      // Set freeze time for ALL modes (not just competitive)
-      renderer.setFreezeTime(gameMode.getFreezeTimeRemaining(now));
+        // For now, skip local scoreboard in multiplayer - use server kill events
+        renderer.setKillFeed([]);  // TODO: build kill feed from mpState events
+        renderer.setShowScoreboard(showScoreboardRef.current);
+        renderer.setGameState(
+          phase,
+          gameMode.formatTime(mpState.getRoundTime()),
+          7,  // roundsToWin - server controlled
+          null,  // matchWinner
+          0,  // respawn countdown
+          0   // warmup remaining
+        );
 
-      // Set team-specific UI data for competitive mode
-      if (isTeamMode) {
-        renderer.setTeamScores(gameMode.round.tScore, gameMode.round.ctScore, gameMode.round.roundNumber);
+        // Set freeze time from multiplayer state
+        renderer.setFreezeTime(mpState.getFreezeTime());
+
+        // Set team scores from server
+        renderer.setTeamScores(scores.t, scores.ct, scores.round);
         renderer.setPlayerTeam(player.team);
         renderer.setPlayerMoney(player.economy.getMoney());
+      } else {
+        // Single player: use local game mode
+        renderer.setKillFeed(gameMode.getKillFeed(now));
+        renderer.setScoreboard(gameMode.getScoreboard(player, botManager.getBots()));
+        renderer.setShowScoreboard(showScoreboardRef.current || gameMode.phase === 'match_end');
+        renderer.setGameState(
+          gameMode.phase,
+          gameMode.formatTime(gameMode.getRoundTimeRemaining(now)),
+          gameMode.config.roundsToWin,
+          gameMode.matchWinner,
+          gameMode.getRespawnCountdown(now),
+          Math.ceil(gameMode.getWarmupRemaining(now))
+        );
+
+        // Set freeze time for ALL modes (not just competitive)
+        renderer.setFreezeTime(gameMode.getFreezeTimeRemaining(now));
+
+        // Set team-specific UI data for competitive mode
+        if (isTeamMode) {
+          renderer.setTeamScores(gameMode.round.tScore, gameMode.round.ctScore, gameMode.round.roundNumber);
+          renderer.setPlayerTeam(player.team);
+          renderer.setPlayerMoney(player.economy.getMoney());
+        }
       }
 
       // Update dropped weapons in renderer
@@ -1118,10 +2020,9 @@ function Game() {
         team: player.team,
       });
 
-      // Target ~60 FPS for smoother input
-      const targetFrameTime = 1000 / 60;
-      const sleepTime = Math.max(0, targetFrameTime - (performance.now() - now));
-      setTimeout(gameLoop, sleepTime);
+      // Use configurable frame rate cap from renderer
+      const frameDelay = renderer.getFrameDelay();
+      setTimeout(gameLoop, frameDelay || 1);
     };
 
     // Enter fullscreen mode
@@ -1141,8 +2042,34 @@ function Game() {
 
 // Main entry point
 async function main() {
-  // Go straight to GUI - press H in main menu for help
-  const { waitUntilExit } = render(<Game />);
+  // Parse command line arguments
+  const options = parseArgs();
+
+  // Handle --help
+  if (options.help) {
+    printHelp();
+    process.exit(0);
+  }
+
+  // Handle --debug
+  if (options.debug) {
+    console.log(`Debug mode: render=${options.renderMode}, msaa=${options.msaaMode}`);
+    await runDebugMode(options.renderMode, options.msaaMode);
+    return;
+  }
+
+  // Log startup settings if non-default
+  if (options.renderMode !== 'basic' || options.msaaMode !== 'none') {
+    console.log(`Starting with: render=${options.renderMode}, msaa=${options.msaaMode}`);
+  }
+
+  // Start the game with CLI options
+  const { waitUntilExit } = render(
+    <Game
+      initialRenderMode={options.renderMode}
+      initialMSAAMode={options.msaaMode}
+    />
+  );
   await waitUntilExit();
 }
 

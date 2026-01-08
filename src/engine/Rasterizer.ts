@@ -20,11 +20,40 @@ export interface RasterTriangle {
   material: { color: Color };
 }
 
+// MSAA sample patterns (offsets within pixel, in range [-0.5, 0.5])
+const MSAA_PATTERNS = {
+  'none': [[0, 0]],
+  '4x': [
+    [-0.25, -0.25], [0.25, -0.25],
+    [-0.25, 0.25], [0.25, 0.25]
+  ],
+  '16x': [
+    [-0.375, -0.375], [-0.125, -0.375], [0.125, -0.375], [0.375, -0.375],
+    [-0.375, -0.125], [-0.125, -0.125], [0.125, -0.125], [0.375, -0.125],
+    [-0.375, 0.125], [-0.125, 0.125], [0.125, 0.125], [0.375, 0.125],
+    [-0.375, 0.375], [-0.125, 0.375], [0.125, 0.375], [0.375, 0.375]
+  ]
+};
+
+export type MSAAMode = 'none' | '4x' | '16x';
+
+// Sample buffer for MSAA - stores multiple color samples per pixel
+interface MSAASample {
+  color: Color;
+  depth: number;
+  covered: boolean;
+}
+
 export class Rasterizer {
   private framebuffer: Framebuffer;
   private depthBuffer: DepthBuffer;
   private width: number;
   private height: number;
+
+  // MSAA settings
+  private msaaMode: MSAAMode = 'none';
+  private sampleBuffer: MSAASample[][] | null = null;
+  private sampleCount: number = 1;
 
   // Lighting settings
   public ambientLight: number = 0.3;
@@ -50,11 +79,104 @@ export class Rasterizer {
     this.depthBuffer = depthBuffer;
     this.width = framebuffer.width;
     this.height = framebuffer.height;
+    // Rebuild sample buffer if MSAA is enabled
+    if (this.msaaMode !== 'none') {
+      this.initSampleBuffer();
+    }
+  }
+
+  // Set MSAA mode
+  setMSAAMode(mode: MSAAMode): void {
+    this.msaaMode = mode;
+    this.sampleCount = MSAA_PATTERNS[mode].length;
+    if (mode !== 'none') {
+      this.initSampleBuffer();
+    } else {
+      this.sampleBuffer = null;
+    }
+  }
+
+  getMSAAMode(): MSAAMode {
+    return this.msaaMode;
+  }
+
+  // Initialize sample buffer for MSAA
+  private initSampleBuffer(): void {
+    this.sampleBuffer = new Array(this.width * this.height);
+    for (let i = 0; i < this.sampleBuffer.length; i++) {
+      this.sampleBuffer[i] = new Array(this.sampleCount);
+      for (let s = 0; s < this.sampleCount; s++) {
+        this.sampleBuffer[i][s] = {
+          color: Color.black(),
+          depth: 1.0,
+          covered: false
+        };
+      }
+    }
+  }
+
+  // Clear sample buffer
+  private clearSampleBuffer(clearColor: Color): void {
+    if (!this.sampleBuffer) return;
+    for (let i = 0; i < this.sampleBuffer.length; i++) {
+      for (let s = 0; s < this.sampleCount; s++) {
+        this.sampleBuffer[i][s].color.copy(clearColor);
+        this.sampleBuffer[i][s].depth = 1.0;
+        this.sampleBuffer[i][s].covered = false;
+      }
+    }
+  }
+
+  // Resolve MSAA samples to framebuffer (average colors)
+  resolveMSAA(): void {
+    if (!this.sampleBuffer || this.msaaMode === 'none') return;
+
+    for (let y = 0; y < this.height; y++) {
+      for (let x = 0; x < this.width; x++) {
+        const index = y * this.width + x;
+        const samples = this.sampleBuffer[index];
+
+        // Average all sample colors
+        let r = 0, g = 0, b = 0;
+        for (const sample of samples) {
+          r += sample.color.r;
+          g += sample.color.g;
+          b += sample.color.b;
+        }
+
+        r = Math.round(r / this.sampleCount);
+        g = Math.round(g / this.sampleCount);
+        b = Math.round(b / this.sampleCount);
+
+        // Write to both fg and bg (fg for basic mode, bg for halfblock/sixel)
+        const resolvedColor = new Color(r, g, b);
+        this.framebuffer.setPixel(x, y, '█', resolvedColor, resolvedColor);
+      }
+    }
   }
 
   clear(): void {
     this.framebuffer.clear(' ', Color.white(), Color.black());
     this.depthBuffer.clear();
+    // Clear MSAA sample buffer if enabled
+    if (this.sampleBuffer) {
+      this.clearSampleBuffer(Color.black());
+    }
+  }
+
+  clearWithColor(clearColor: Color): void {
+    this.framebuffer.clear(' ', Color.white(), clearColor);
+    this.depthBuffer.clear();
+    if (this.sampleBuffer) {
+      this.clearSampleBuffer(clearColor);
+    }
+  }
+
+  // Clear only the MSAA sample buffer (used when framebuffer is cleared separately)
+  clearMSAASamples(clearColor: Color): void {
+    if (this.sampleBuffer) {
+      this.clearSampleBuffer(clearColor);
+    }
   }
 
   // Interpolate between two clip vertices at parameter t
@@ -259,6 +381,10 @@ export class Rasterizer {
     // Base color with lighting
     const baseColor = tri.material.color.clone().multiply(lightFactor);
 
+    // Get MSAA sample pattern
+    const samplePattern = MSAA_PATTERNS[this.msaaMode];
+    const useMSAA = this.msaaMode !== 'none' && this.sampleBuffer;
+
     // Rasterize
     for (let y = minY; y <= maxY; y++) {
       let w0 = w0_row;
@@ -266,38 +392,102 @@ export class Rasterizer {
       let w2 = w2_row;
 
       for (let x = minX; x <= maxX; x++) {
-        // Check if inside triangle
-        if (w0 >= 0 && w1 >= 0 && w2 >= 0) {
-          // Compute barycentric coordinates
-          const b0 = w0 * invArea;
-          const b1 = w1 * invArea;
-          const b2 = w2 * invArea;
+        const pixelIndex = y * this.width + x;
 
-          // Linear interpolation of NDC z for depth buffer
-          // NDC z is already in screen space after perspective divide, so linear interp is correct
-          const depth = b0 * v0.z + b1 * v1.z + b2 * v2.z;
+        if (useMSAA && this.sampleBuffer) {
+          // MSAA mode: test each sample point
+          let minSampleDepth = 1.0;  // Track minimum depth for main depth buffer
+          let anySampleCovered = false;
 
-          // Depth test
-          if (this.depthBuffer.testAndSet(x, y, depth)) {
-            // Compute linear depth for shading
-            // Interpolate world Z for distance-based effects
-            const worldZ = b0 * tv0.worldPosition.z + b1 * tv1.worldPosition.z + b2 * tv2.worldPosition.z;
-            const distance = Math.sqrt(
-              tv0.worldPosition.x * tv0.worldPosition.x +
-              tv0.worldPosition.y * tv0.worldPosition.y +
-              worldZ * worldZ
-            );
+          for (let s = 0; s < this.sampleCount; s++) {
+            const [sx, sy] = samplePattern[s];
 
-            let finalColor = baseColor;
-            let char = '█';
+            // Compute edge functions at sample point
+            const sampleX = x + 0.5 + sx;
+            const sampleY = y + 0.5 + sy;
 
-            if (this.enableDepthShading) {
-              const shading = getDepthShading(baseColor, distance, this.maxDepth);
-              finalColor = shading.color;
-              char = shading.char;
+            const sw0 = edgeFunction(v1.x, v1.y, v2.x, v2.y, sampleX, sampleY);
+            const sw1 = edgeFunction(v2.x, v2.y, v0.x, v0.y, sampleX, sampleY);
+            const sw2 = edgeFunction(v0.x, v0.y, v1.x, v1.y, sampleX, sampleY);
+
+            // Check if sample is inside triangle
+            if (sw0 >= 0 && sw1 >= 0 && sw2 >= 0) {
+              // Compute barycentric coordinates for this sample
+              const sb0 = sw0 * invArea;
+              const sb1 = sw1 * invArea;
+              const sb2 = sw2 * invArea;
+
+              // Interpolate depth at sample
+              const sampleDepth = sb0 * v0.z + sb1 * v1.z + sb2 * v2.z;
+
+              // Depth test for this sample
+              const sample = this.sampleBuffer[pixelIndex][s];
+              if (sampleDepth < sample.depth) {
+                sample.depth = sampleDepth;
+                sample.covered = true;
+                anySampleCovered = true;
+
+                // Track minimum depth across all samples for main depth buffer
+                if (sampleDepth < minSampleDepth) {
+                  minSampleDepth = sampleDepth;
+                }
+
+                // Compute shaded color
+                const worldZ = sb0 * tv0.worldPosition.z + sb1 * tv1.worldPosition.z + sb2 * tv2.worldPosition.z;
+                const distance = Math.sqrt(
+                  tv0.worldPosition.x * tv0.worldPosition.x +
+                  tv0.worldPosition.y * tv0.worldPosition.y +
+                  worldZ * worldZ
+                );
+
+                if (this.enableDepthShading) {
+                  const shading = getDepthShading(baseColor, distance, this.maxDepth);
+                  sample.color.copy(shading.color);
+                } else {
+                  sample.color.copy(baseColor);
+                }
+              }
             }
+          }
 
-            this.framebuffer.setPixel(x, y, char, finalColor);
+          // Also update main depth buffer with minimum sample depth
+          // This allows bots/tracers/decals to properly depth-test against geometry
+          if (anySampleCovered) {
+            this.depthBuffer.testAndSet(x, y, minSampleDepth);
+          }
+        } else {
+          // Standard mode: test center point only
+          if (w0 >= 0 && w1 >= 0 && w2 >= 0) {
+            // Compute barycentric coordinates
+            const b0 = w0 * invArea;
+            const b1 = w1 * invArea;
+            const b2 = w2 * invArea;
+
+            // Linear interpolation of NDC z for depth buffer
+            const depth = b0 * v0.z + b1 * v1.z + b2 * v2.z;
+
+            // Depth test
+            if (this.depthBuffer.testAndSet(x, y, depth)) {
+              // Compute linear depth for shading
+              const worldZ = b0 * tv0.worldPosition.z + b1 * tv1.worldPosition.z + b2 * tv2.worldPosition.z;
+              const distance = Math.sqrt(
+                tv0.worldPosition.x * tv0.worldPosition.x +
+                tv0.worldPosition.y * tv0.worldPosition.y +
+                worldZ * worldZ
+              );
+
+              let finalColor = baseColor;
+              let char = '█';
+
+              if (this.enableDepthShading) {
+                const shading = getDepthShading(baseColor, distance, this.maxDepth);
+                finalColor = shading.color;
+                char = shading.char;
+              }
+
+              // Set both fg (for basic mode) and bg (for half-block/sixel modes)
+              this.framebuffer.setPixel(x, y, char, finalColor, finalColor);
+            }
           }
         }
 

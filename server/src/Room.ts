@@ -112,8 +112,32 @@ export class Room {
   // ============ Player Management ============
 
   addPlayer(clientId: string, client: ConnectedClient): void {
+    // Send existing players to new joiner BEFORE adding them
+    for (const [existingId, existingClient] of this.clients) {
+      this.sendToClient(clientId, {
+        type: 'player_joined',
+        playerId: existingId,
+        playerName: existingClient.name || 'Player',
+      });
+      // Also send their ready state
+      if (existingClient.isReady) {
+        this.sendToClient(clientId, {
+          type: 'player_ready',
+          playerId: existingId,
+          ready: true,
+        });
+      }
+    }
+
     this.clients.set(clientId, client);
     this.lastActivity = Date.now();
+
+    // Broadcast new player to all OTHER clients
+    this.broadcastExcept(clientId, {
+      type: 'player_joined',
+      playerId: clientId,
+      playerName: client.name || 'Player',
+    });
 
     // Assign team
     const team = this.assignTeam(clientId);
@@ -254,6 +278,12 @@ export class Room {
         this.handleStartGame(clientId);
         break;
 
+      case 'change_team':
+        if ('team' in message) {
+          this.handleChangeTeam(clientId, message.team);
+        }
+        break;
+
       case 'input':
       case 'fire':
       case 'reload':
@@ -295,6 +325,27 @@ export class Room {
 
     // Check if all players are ready (or just the host for now)
     this.startGame();
+  }
+
+  private handleChangeTeam(clientId: string, team: TeamId): void {
+    if (team !== 'T' && team !== 'CT') return;
+
+    this.teamAssignments.set(clientId, team);
+
+    // Send team assignment back to player
+    this.sendToClient(clientId, {
+      type: 'assigned_team',
+      team,
+    });
+
+    // Broadcast team change to all players
+    this.broadcast({
+      type: 'player_team_changed' as any,
+      playerId: clientId,
+      team,
+    });
+
+    console.log(`Player ${clientId} changed to team ${team}`);
   }
 
   private handleChat(

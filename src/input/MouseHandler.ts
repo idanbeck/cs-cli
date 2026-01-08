@@ -47,12 +47,17 @@ export class MouseHandler {
   private screenHeight: number = 24;
   private enabled: boolean = false;
   private releaseOnEdge: boolean = false; // Don't release capture at edges (use Esc instead)
+  private allowClickCapture: boolean = true; // Allow click to capture mouse
 
   // robotjs-based capture
   private lockX: number = 0;  // Screen pixel position to lock mouse to
   private lockY: number = 0;
   private useRobotCapture: boolean = true;  // Use robotjs for true capture
   private recenterPending: boolean = false;  // Flag to skip movement caused by recentering
+
+  // Native mouse mode - when true, skip all mouse position manipulation
+  // and just track capture state (native input handles actual movement)
+  private nativeMouseMode: boolean = false;
 
   // Smoothing for continuous mouse movement
   private smoothedDeltaX: number = 0;
@@ -107,6 +112,11 @@ export class MouseHandler {
     this.state.captured = false;
   }
 
+  // Set whether clicking should capture the mouse
+  setAllowClickCapture(allow: boolean): void {
+    this.allowClickCapture = allow;
+  }
+
   // Capture mouse (lock to window for FPS-style control)
   capture(): void {
     if (!this.enabled) {
@@ -120,7 +130,8 @@ export class MouseHandler {
     this.resetSmoothing();
 
     // Get current mouse position as lock point using robotjs
-    if (this.useRobotCapture) {
+    // Skip this entirely in native mouse mode - native input handles movement
+    if (this.useRobotCapture && !this.nativeMouseMode) {
       try {
         const pos = robot.getMousePos();
         this.lockX = pos.x;
@@ -216,7 +227,9 @@ export class MouseHandler {
       return;
     }
 
-    if (this.state.captured) {
+    if (this.state.captured && !this.nativeMouseMode) {
+      // Only process terminal mouse movement when NOT in native mode
+      // Native mode gets movement directly from CGEventTap
       if (this.useRobotCapture) {
         // robotjs-based capture: get actual pixel position and recenter
         try {
@@ -282,8 +295,8 @@ export class MouseHandler {
       // Button press
       if (actualButton === 0) {
         this.state.buttons |= 1; // Left
-        if (!this.state.captured) {
-          // Click to capture
+        if (!this.state.captured && this.allowClickCapture) {
+          // Click to capture (only if allowed)
           this.capture();
         }
         this.onClick?.(0, x, y);
@@ -378,6 +391,16 @@ export class MouseHandler {
     this.smoothedDeltaY = 0;
     this.state.deltaX = 0;
     this.state.deltaY = 0;
+  }
+
+  // Enable/disable native mouse mode
+  // When enabled, skip all robotjs mouse manipulation (native input handles movement)
+  setNativeMouseMode(enabled: boolean): void {
+    this.nativeMouseMode = enabled;
+  }
+
+  isNativeMouseMode(): boolean {
+    return this.nativeMouseMode;
   }
 }
 

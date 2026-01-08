@@ -92,11 +92,20 @@ export type GameKeyName = keyof typeof GameKeyMap;
 interface NativeKeyboardModule {
   start(): boolean;
   stop(): boolean;
+  // Keyboard
   isKeyDown(keycode: number): boolean;
   wasKeyJustPressed(keycode: number): boolean;
   wasKeyJustReleased(keycode: number): boolean;
   update(): void;
   isRunning(): boolean;
+  // Mouse
+  getMouseDelta(): { x: number; y: number };
+  isMouseButtonDown(button: number): boolean;
+  wasMouseButtonJustPressed(button: number): boolean;
+  wasMouseButtonJustReleased(button: number): boolean;
+  // Cursor capture
+  setCursorCaptured(captured: boolean): boolean;
+  isCursorCaptured(): boolean;
 }
 
 let nativeModule: NativeKeyboardModule | null = null;
@@ -233,4 +242,74 @@ export function getWeaponSlotPressed(): number | null {
   if (nativeModule.wasKeyJustPressed(MacKeyCode.Num5)) return 5;
 
   return null;
+}
+
+// ============ Native Mouse Input ============
+
+// Mouse button constants
+export const MouseButton = {
+  Left: 0,
+  Right: 1,
+  Middle: 2,
+} as const;
+
+export type MouseButtonName = keyof typeof MouseButton;
+
+// Check if native mouse is available (same as keyboard - they share the module)
+export function isNativeMouseAvailable(): boolean {
+  return useNative && nativeModule !== null;
+}
+
+// Get mouse delta (accumulated since last update())
+export function getNativeMouseDelta(): { x: number; y: number } {
+  if (!useNative || !nativeModule) {
+    return { x: 0, y: 0 };
+  }
+  return nativeModule.getMouseDelta();
+}
+
+// Check if mouse button is held
+export function isNativeMouseButtonDown(button: number): boolean {
+  if (!useNative || !nativeModule) return false;
+  return nativeModule.isMouseButtonDown(button);
+}
+
+// Check if mouse button was just pressed
+export function wasNativeMouseButtonJustPressed(button: number): boolean {
+  if (!useNative || !nativeModule) return false;
+  return nativeModule.wasMouseButtonJustPressed(button);
+}
+
+// Check if mouse button was just released
+export function wasNativeMouseButtonJustReleased(button: number): boolean {
+  if (!useNative || !nativeModule) return false;
+  return nativeModule.wasMouseButtonJustReleased(button);
+}
+
+// Convenience: check mouse button by name
+export function isMouseButtonDown(button: MouseButtonName): boolean {
+  return isNativeMouseButtonDown(MouseButton[button]);
+}
+
+export function wasMouseButtonJustPressed(button: MouseButtonName): boolean {
+  return wasNativeMouseButtonJustPressed(MouseButton[button]);
+}
+
+export function wasMouseButtonJustReleased(button: MouseButtonName): boolean {
+  return wasNativeMouseButtonJustReleased(MouseButton[button]);
+}
+
+// ============ Cursor Capture ============
+
+// Capture cursor - disassociates mouse movement from cursor position
+// Cursor stays in place, but we still get delta events (standard FPS behavior)
+export function setNativeCursorCaptured(captured: boolean): boolean {
+  if (!useNative || !nativeModule) return false;
+  return nativeModule.setCursorCaptured(captured);
+}
+
+// Check if cursor is currently captured
+export function isNativeCursorCaptured(): boolean {
+  if (!useNative || !nativeModule) return false;
+  return nativeModule.isCursorCaptured();
 }

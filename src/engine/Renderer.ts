@@ -7,6 +7,7 @@ import { Framebuffer } from './Framebuffer.js';
 import { DepthBuffer } from './DepthBuffer.js';
 import { Rasterizer } from './Rasterizer.js';
 import { Color, CURSOR_HIDE, CURSOR_SHOW, ALT_SCREEN_ON, ALT_SCREEN_OFF, RESET } from '../utils/Colors.js';
+import { RenderMode, MSAAMode } from '../ui/MainMenu.js';
 import { DecalPool, Decal } from '../game/Decal.js';
 import { TracerPool, getTracerChar } from '../game/Tracer.js';
 import { Bot } from '../ai/Bot.js';
@@ -14,6 +15,8 @@ import { KillEvent, ScoreEntry, GamePhase } from '../game/GameMode.js';
 import { getGameConsole, ConsoleMessage } from '../ui/Console.js';
 import { MainMenu, MainMenuState, InputStatus } from '../ui/MainMenu.js';
 import { BuyMenu, BuyMenuItem } from '../ui/BuyMenu.js';
+import { ServerBrowser, ServerBrowserState } from '../ui/ServerBrowser.js';
+import { LobbyScreen, LobbyState } from '../ui/LobbyScreen.js';
 import { TeamId, TEAMS } from '../game/Team.js';
 import { DroppedWeapon } from '../game/DroppedWeapon.js';
 
@@ -54,6 +57,24 @@ export class Renderer {
   public showStats: boolean = false;
   public showCrosshair: boolean = true;
   public showHUD: boolean = true;
+
+  // Rendering mode settings
+  private renderMode: RenderMode = 'basic';
+  private msaaMode: MSAAMode = 'none';
+
+  // Frame rate cap (0 = uncapped)
+  private targetFps: number = 0;
+  private lastFrameTimestamp: number = 0;
+  private minFrameTime: number = 0;
+
+  // Async sixel output
+  private asyncSixelOutput: boolean = true;
+  private pendingSixelChunks: string[] = [];
+  private isWritingSixel: boolean = false;
+
+  // Terminal dimensions (actual terminal size, for calculating framebuffer size)
+  private terminalWidth: number = 80;
+  private terminalHeight: number = 24;
 
   // HUD state
   private hudData: {
@@ -117,14 +138,25 @@ export class Renderer {
   // Buy menu state
   private buyMenu: BuyMenu | null = null;
 
+  // Server browser state
+  private serverBrowser: ServerBrowser | null = null;
+  private showServerBrowser: boolean = false;
+
+  // Lobby screen state
+  private lobbyScreen: LobbyScreen | null = null;
+  private showLobbyScreen: boolean = false;
+
   // Dropped weapons to render
   private droppedWeapons: DroppedWeapon[] = [];
 
   constructor(width?: number, height?: number) {
     // Get terminal size if not specified
-    this.width = width || process.stdout.columns || 80;
-    // Terminal characters are roughly 2:1 aspect ratio, so halve the rows
-    this.height = height || Math.floor((process.stdout.rows || 24));
+    this.terminalWidth = width || process.stdout.columns || 80;
+    this.terminalHeight = height || Math.floor((process.stdout.rows || 24));
+
+    // Initial framebuffer size (will be adjusted when render mode changes)
+    this.width = this.terminalWidth;
+    this.height = this.terminalHeight;
 
     this.framebuffer = new Framebuffer(this.width, this.height);
     this.prevFramebuffer = new Framebuffer(this.width, this.height);
@@ -144,6 +176,254 @@ export class Renderer {
 
   getHeight(): number {
     return this.height;
+  }
+
+  // Get expected framebuffer dimensions for current render mode
+  private getExpectedWidth(): number {
+    if (this.renderMode === 'sixel') {
+      return Math.floor((this.terminalWidth * this.cellPixelWidth) / this.sixelResolutionDivisor);
+    } else if (this.renderMode === 'halfblock') {
+      return this.terminalWidth;
+    }
+    return this.terminalWidth;
+  }
+
+  private getExpectedHeight(): number {
+    if (this.renderMode === 'sixel') {
+      return Math.floor((this.terminalHeight * this.cellPixelHeight) / this.sixelResolutionDivisor);
+    } else if (this.renderMode === 'halfblock') {
+      return this.terminalHeight * 2;
+    }
+    return this.terminalHeight;
+  }
+
+  // Render mode setters - base pixels per terminal cell
+  private static readonly MODE_SCALE: Record<RenderMode, {x: number, y: number}> = {
+    'basic':     { x: 1, y: 1 },   // 1 cell = 1 pixel
+    'halfblock': { x: 1, y: 2 },   // 2 vertical pixels per cell using ▀
+    'sixel':     { x: 1, y: 1 },   // Calculated dynamically based on cell size
+  };
+
+  // Sixel tunable parameters
+  private sixelOutputScale: number = 1;  // Output magnification (1 = native resolution)
+
+  // Estimated terminal cell size in pixels (typical monospace font)
+  // These can be overridden if terminal reports actual size
+  // Default to 16x32 for Retina/HiDPI displays (common in iTerm2)
+  private cellPixelWidth: number = 16;
+  private cellPixelHeight: number = 32;
+
+  // Sixel framebuffer resolution divisor (higher = lower res, faster)
+  private sixelResolutionDivisor: number = 8;
+
+  // Query terminal for actual pixel dimensions (async)
+  async detectTerminalPixelSize(): Promise<{ width: number; height: number } | null> {
+    return new Promise((resolve) => {
+      // Set timeout in case terminal doesn't respond
+      const timeout = setTimeout(() => {
+        process.stdin.removeListener('data', handler);
+        resolve(null);
+      }, 500);
+
+      let buffer = '';
+      const handler = (data: Buffer) => {
+        buffer += data.toString();
+        // Look for response: ESC [ 4 ; height ; width t
+        const match = buffer.match(/\x1b\[4;(\d+);(\d+)t/);
+        if (match) {
+          clearTimeout(timeout);
+          process.stdin.removeListener('data', handler);
+          const height = parseInt(match[1], 10);
+          const width = parseInt(match[2], 10);
+          resolve({ width, height });
+        }
+      };
+
+      process.stdin.on('data', handler);
+      // Query text area size in pixels (CSI 14 t)
+      process.stdout.write('\x1b[14t');
+    });
+  }
+
+  // Auto-detect and set cell pixel size from terminal
+  async autoDetectCellSize(): Promise<void> {
+    const pixels = await this.detectTerminalPixelSize();
+    if (pixels && pixels.width > 0 && pixels.height > 0) {
+      this.cellPixelWidth = Math.round(pixels.width / this.terminalWidth);
+      this.cellPixelHeight = Math.round(pixels.height / this.terminalHeight);
+      // Re-apply sixel mode if active
+      if (this.renderMode === 'sixel') {
+        this.setRenderMode('sixel');
+      }
+    }
+  }
+
+  setRenderMode(mode: RenderMode): void {
+    this.renderMode = mode;
+
+    let newWidth: number;
+    let newHeight: number;
+    let aspect: number;
+
+    if (mode === 'sixel') {
+      // For sixel: framebuffer should produce pixels that fill the terminal
+      // Terminal pixel dimensions = cells * cell_pixel_size
+      const termPixelWidth = this.terminalWidth * this.cellPixelWidth;
+      const termPixelHeight = this.terminalHeight * this.cellPixelHeight;
+
+      // Framebuffer size = target pixels / output scale, divided by resolution divisor
+      // Lower divisor = higher quality, slower
+      newWidth = Math.floor(termPixelWidth / this.sixelResolutionDivisor);
+      newHeight = Math.floor(termPixelHeight / this.sixelResolutionDivisor);
+
+      // Output scale should match resolution divisor so final output fills terminal
+      this.sixelOutputScale = this.sixelResolutionDivisor;
+
+      // Sixel pixels are square
+      aspect = termPixelWidth / termPixelHeight;
+    } else {
+      // Basic and halfblock modes
+      const scale = Renderer.MODE_SCALE[mode];
+      newWidth = this.terminalWidth * scale.x;
+      newHeight = this.terminalHeight * scale.y;
+
+      // Terminal chars are ~2x taller than wide
+      aspect = this.terminalWidth / (this.terminalHeight * 2);
+    }
+
+    // Always resize to ensure clean state
+    this.width = newWidth;
+    this.height = newHeight;
+
+    // Resize all buffers
+    this.framebuffer.resize(this.width, this.height);
+    this.prevFramebuffer.resize(this.width, this.height);
+    this.depthBuffer.resize(this.width, this.height);
+    this.rasterizer.resize(this.framebuffer, this.depthBuffer);
+
+    // Force clear with current clear color
+    this.framebuffer.clear('█', this.clearColor, this.clearColor);
+    this.prevFramebuffer.clear('█', this.clearColor, this.clearColor);
+
+    // Invalidate sixel frame hash to force redraw
+    this.framebuffer.invalidateFrameHash();
+
+    this.camera.setAspect(aspect);
+  }
+
+  // Set sixel resolution (1 = full res, 2 = half res, 4 = quarter res, etc.)
+  setSixelResolution(divisor: number): void {
+    this.sixelResolutionDivisor = Math.max(1, Math.min(32, divisor));
+    // Re-apply render mode to resize buffers
+    if (this.renderMode === 'sixel') {
+      this.setRenderMode('sixel');
+    }
+  }
+
+  getSixelResolution(): number {
+    return this.sixelResolutionDivisor;
+  }
+
+  // Set estimated cell pixel size (for accurate sixel sizing)
+  setCellPixelSize(width: number, height: number): void {
+    this.cellPixelWidth = width;
+    this.cellPixelHeight = height;
+    // Re-apply render mode if in sixel mode
+    if (this.renderMode === 'sixel') {
+      this.setRenderMode('sixel');
+    }
+  }
+
+  getRenderMode(): RenderMode {
+    return this.renderMode;
+  }
+
+  // Sixel output scale (magnification factor for filling terminal)
+  setSixelOutputScale(scale: number): void {
+    this.sixelOutputScale = Math.max(1, Math.min(16, scale));
+  }
+
+  getSixelOutputScale(): number {
+    return this.sixelOutputScale;
+  }
+
+  // Get current sixel settings for display
+  getSixelInfo(): { resolution: number, cellSize: string, targetPixels: string } {
+    const termPixelWidth = this.terminalWidth * this.cellPixelWidth;
+    const termPixelHeight = this.terminalHeight * this.cellPixelHeight;
+    return {
+      resolution: this.sixelResolutionDivisor,
+      cellSize: `${this.cellPixelWidth}x${this.cellPixelHeight}`,
+      targetPixels: `${termPixelWidth}x${termPixelHeight}`
+    };
+  }
+
+  // Frame rate cap settings
+  setTargetFps(fps: number): void {
+    this.targetFps = fps;
+    this.minFrameTime = fps > 0 ? 1000 / fps : 0;
+  }
+
+  getTargetFps(): number {
+    return this.targetFps;
+  }
+
+  // Check if enough time has passed for next frame (returns ms to wait, or 0 if ready)
+  getFrameDelay(): number {
+    if (this.targetFps <= 0) return 0;
+    const now = performance.now();
+    const elapsed = now - this.lastFrameTimestamp;
+    return Math.max(0, this.minFrameTime - elapsed);
+  }
+
+  // Mark frame as rendered (for frame rate limiting)
+  markFrameComplete(): void {
+    this.lastFrameTimestamp = performance.now();
+  }
+
+  // Async sixel output control
+  setAsyncSixelOutput(enabled: boolean): void {
+    this.asyncSixelOutput = enabled;
+  }
+
+  // Write output in chunks to avoid blocking (for sixel)
+  private writeOutputAsync(output: string): void {
+    if (!this.asyncSixelOutput || output.length < 10000) {
+      // Small outputs: write directly
+      process.stdout.write(output);
+      return;
+    }
+
+    // Large sixel outputs: split into chunks and write with setImmediate
+    const CHUNK_SIZE = 16384; // 16KB chunks
+    const chunks: string[] = [];
+    for (let i = 0; i < output.length; i += CHUNK_SIZE) {
+      chunks.push(output.slice(i, i + CHUNK_SIZE));
+    }
+
+    // Write first chunk immediately
+    if (chunks.length > 0) {
+      process.stdout.write(chunks[0]);
+    }
+
+    // Schedule remaining chunks
+    for (let i = 1; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      setImmediate(() => {
+        process.stdout.write(chunk);
+      });
+    }
+  }
+
+  setMSAAMode(mode: MSAAMode): void {
+    this.msaaMode = mode;
+    // Update rasterizer MSAA setting
+    const rasterizerMsaa = mode === 'none' ? 'none' : mode === '4x' ? '4x' : '16x';
+    this.rasterizer.setMSAAMode(rasterizerMsaa as any);
+  }
+
+  getMSAAMode(): MSAAMode {
+    return this.msaaMode;
   }
 
   getCamera(): Camera {
@@ -188,13 +468,41 @@ export class Renderer {
   }
 
   private clear(): void {
-    // Use full block for sky so it's visible (fg color is the sky)
-    this.framebuffer.clear('█', this.clearColor, Color.black());
+    // Clear with clearColor for both fg and bg (fg for basic mode, bg for half-block/sixel)
+    this.framebuffer.clear('█', this.clearColor, this.clearColor);
     this.depthBuffer.clear();
+    // Clear MSAA sample buffer with clear color
+    this.rasterizer.clearMSAASamples(this.clearColor);
   }
 
   render(): RenderStats {
     const startTime = performance.now();
+
+    // Check if we're showing full-screen UI (menu, server browser, lobby)
+    // These UI screens don't need 3D rendering at all
+    const isFullScreenUI = this.showMainMenu || this.showServerBrowser || this.showLobbyScreen;
+
+    // For full-screen UI, temporarily use basic mode framebuffer dimensions
+    // This prevents warping when sixel/halfblock mode is selected but UI is showing
+    if (isFullScreenUI) {
+      // Resize to terminal dimensions for proper UI text rendering
+      if (this.width !== this.terminalWidth || this.height !== this.terminalHeight) {
+        this.framebuffer.resize(this.terminalWidth, this.terminalHeight);
+        this.prevFramebuffer.resize(this.terminalWidth, this.terminalHeight);
+        this.depthBuffer.resize(this.terminalWidth, this.terminalHeight);
+        this.rasterizer.resize(this.framebuffer, this.depthBuffer);
+        this.width = this.terminalWidth;
+        this.height = this.terminalHeight;
+      }
+    } else if (this.renderMode !== 'basic') {
+      // When transitioning from UI to game, restore proper render mode dimensions
+      // Re-apply render mode to get correct framebuffer sizing
+      const expectedWidth = this.getExpectedWidth();
+      const expectedHeight = this.getExpectedHeight();
+      if (this.width !== expectedWidth || this.height !== expectedHeight) {
+        this.setRenderMode(this.renderMode);
+      }
+    }
 
     // Swap buffers for differential rendering
     if (this.enableDifferentialRendering) {
@@ -204,77 +512,92 @@ export class Renderer {
     // Clear buffers
     this.clear();
 
-    // Get camera matrices
-    const viewProjection = this.camera.viewProjectionMatrix;
-
     let totalTriangles = 0;
     let totalVertices = 0;
     let visibleObjects = 0;
 
-    // Render all objects
-    for (const obj of this.objects) {
-      if (obj.visible === false) continue;
+    // Skip 3D rendering when full-screen UI is showing (saves CPU)
+    if (!isFullScreenUI) {
+      // Get camera matrices
+      const viewProjection = this.camera.viewProjectionMatrix;
 
-      visibleObjects++;
-      totalTriangles += obj.mesh.triangles.length;
-      totalVertices += obj.mesh.vertices.length;
+      // Render all objects
+      for (const obj of this.objects) {
+        if (obj.visible === false) continue;
 
-      // Compute MVP matrix
-      const modelMatrix = obj.transform.matrix;
-      const mvpMatrix = Matrix4.multiply(viewProjection, modelMatrix);
+        visibleObjects++;
+        totalTriangles += obj.mesh.triangles.length;
+        totalVertices += obj.mesh.vertices.length;
 
-      // Rasterize the mesh
-      this.rasterizer.rasterizeMesh(obj.mesh, mvpMatrix, modelMatrix);
+        // Compute MVP matrix
+        const modelMatrix = obj.transform.matrix;
+        const mvpMatrix = Matrix4.multiply(viewProjection, modelMatrix);
+
+        // Rasterize the mesh
+        this.rasterizer.rasterizeMesh(obj.mesh, mvpMatrix, modelMatrix);
+      }
+
+      // Resolve MSAA immediately after mesh rasterization, before overlays
+      // This ensures the 3D scene is in the framebuffer before we draw bots/decals/HUD on top
+      if (this.msaaMode !== 'none') {
+        this.rasterizer.resolveMSAA();
+      }
+
+      // Render decals (bullet holes, etc.) - drawn on top of resolved 3D scene
+      this.renderDecals(viewProjection);
+
+      // Render bots as billboards - drawn on top of resolved 3D scene
+      this.renderBots(viewProjection);
+
+      // Render bullet tracers - drawn on top of resolved 3D scene
+      this.renderTracers(viewProjection);
     }
 
-    // Render decals (bullet holes, etc.)
-    this.renderDecals(viewProjection);
+    // Only draw game HUD elements when not in full-screen UI
+    if (!isFullScreenUI) {
+      // Draw stats overlay if enabled
+      if (this.showStats) {
+        this.drawStats(totalTriangles, totalVertices, visibleObjects);
+      }
 
-    // Render bots as billboards
-    this.renderBots(viewProjection);
+      // Draw crosshair at center
+      if (this.showCrosshair) {
+        this.drawCrosshair();
+      }
 
-    // Render bullet tracers
-    this.renderTracers(viewProjection);
-
-    // Draw stats overlay if enabled
-    if (this.showStats) {
-      this.drawStats(totalTriangles, totalVertices, visibleObjects);
+      // Draw weapon sprite
+      this.drawWeaponSprite();
     }
 
-    // Draw crosshair at center
-    if (this.showCrosshair) {
-      this.drawCrosshair();
+    // Only draw game HUD and effects when not in full-screen UI
+    if (!isFullScreenUI) {
+      // Draw HUD if enabled and data is set
+      if (this.showHUD && this.hudData) {
+        this.drawHUD(
+          this.hudData.health,
+          this.hudData.armor,
+          this.hudData.ammo,
+          this.hudData.reserveAmmo,
+          this.hudData.weaponName,
+          this.hudData.isReloading
+        );
+      }
+
+      // Draw game state UI elements
+      this.drawGameTimer();
+      this.drawKillFeed();
+
+      // Draw hit marker (when player hits enemy)
+      this.drawHitMarker();
+
+      // Draw damage direction indicators
+      this.drawDamageIndicators();
+
+      // Draw death effect (red vignette when dead)
+      this.drawDeathEffect();
     }
 
-    // Draw weapon sprite
-    this.drawWeaponSprite();
-
-    // Draw HUD if enabled and data is set
-    if (this.showHUD && this.hudData) {
-      this.drawHUD(
-        this.hudData.health,
-        this.hudData.armor,
-        this.hudData.ammo,
-        this.hudData.reserveAmmo,
-        this.hudData.weaponName,
-        this.hudData.isReloading
-      );
-    }
-
-    // Draw game state UI elements
-    this.drawGameTimer();
-    this.drawKillFeed();
-
-    // Draw hit marker (when player hits enemy)
-    this.drawHitMarker();
-
-    // Draw damage direction indicators
-    this.drawDamageIndicators();
-
-    // Draw death effect (red vignette when dead)
-    this.drawDeathEffect();
-
-    // Draw overlays (on top of everything)
+    // Draw overlays on top of the 3D scene (MSAA already resolved above)
     this.drawWarmupOverlay();
     this.drawRespawnOverlay();
     this.drawScoreboardOverlay();
@@ -282,14 +605,42 @@ export class Renderer {
     this.drawFreezeTimeOverlay();
     this.drawBuyMenuOverlay();
     this.drawMainMenuOverlay();
+    this.drawServerBrowserOverlay();
+    this.drawLobbyScreenOverlay();
     this.drawConsoleOverlay();
 
-    // Output to terminal
-    if (this.enableDifferentialRendering) {
-      process.stdout.write(this.framebuffer.toDiffAnsiString(this.prevFramebuffer));
-    } else {
-      this.framebuffer.render();
+    // Determine effective render mode
+    // Only force basic for full-screen UI (menu/browser/lobby) where framebuffer is resized to terminal dims
+    // In-game overlays (freeze time, scoreboard, buy menu, console) work fine with halfblock output
+    const effectiveMode = isFullScreenUI ? 'basic' : this.renderMode;
+
+    // Output to terminal based on render mode
+    let outputString: string;
+    switch (effectiveMode) {
+      case 'halfblock':
+        outputString = this.framebuffer.toHalfBlockAnsiString();
+        process.stdout.write(outputString);
+        break;
+      case 'sixel':
+        // Sixel uses differential rendering internally (returns empty if unchanged)
+        outputString = this.framebuffer.toScaledSixelString(this.sixelOutputScale);
+        if (outputString.length > 0) {
+          this.writeOutputAsync(outputString);
+        }
+        break;
+      case 'basic':
+      default:
+        if (this.enableDifferentialRendering) {
+          outputString = this.framebuffer.toDiffAnsiString(this.prevFramebuffer);
+        } else {
+          outputString = this.framebuffer.toAnsiString();
+        }
+        process.stdout.write(outputString);
+        break;
     }
+
+    // Mark frame complete for rate limiting
+    this.markFrameComplete();
 
     // Calculate timing
     const endTime = performance.now();
@@ -1506,12 +1857,22 @@ export class Renderer {
     const items = this.mainMenu.getCurrentItems();
     const selectedIndex = this.mainMenu.getSelectedIndex();
     const itemsStartY = titleY + 3;
+    const isSettingsScreen = this.mainMenu.getCurrentScreen() === 'settings';
 
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
       const isSelected = i === selectedIndex;
       const prefix = isSelected ? '> ' : '  ';
-      const text = prefix + item;
+
+      // For settings screen, show value alongside item
+      let text: string;
+      if (isSettingsScreen && item !== 'Back') {
+        const value = this.mainMenu.getSettingsValue(item);
+        text = prefix + item.padEnd(20) + value;
+      } else {
+        text = prefix + item;
+      }
+
       const color = isSelected ? selectedColor : normalColor;
       const x = Math.floor((this.width - text.length) / 2);
       this.framebuffer.drawText(x, itemsStartY + i * 2, text, color, bgDark);
@@ -1555,13 +1916,268 @@ export class Renderer {
       bgDark
     );
 
-    // Controls hint
-    const hint = 'W/S or Arrow keys: navigate | Enter: select | H: help | Esc: back';
+    // Controls hint (different for settings screen)
+    let hint: string;
+    if (isSettingsScreen) {
+      hint = 'W/S: navigate | A/D or Left/Right: adjust | Enter: select | Esc: back';
+    } else {
+      hint = 'W/S or Arrow keys: navigate | Enter: select | H: help | Esc: back';
+    }
     const hintY = this.height - 3;
     this.framebuffer.drawText(
       Math.floor((this.width - hint.length) / 2),
       hintY,
       hint,
+      descColor,
+      bgDark
+    );
+  }
+
+  // Draw server browser overlay
+  private drawServerBrowserOverlay(): void {
+    if (!this.showServerBrowser || !this.serverBrowser) return;
+
+    const bgDark = new Color(15, 15, 25);
+    const borderColor = new Color(80, 80, 120);
+    const titleColor = new Color(255, 215, 0);  // Gold
+    const selectedColor = new Color(100, 255, 100);  // Green
+    const normalColor = new Color(200, 200, 200);
+    const descColor = new Color(150, 150, 150);
+    const errorColor = new Color(255, 100, 100);
+
+    // Full screen background
+    for (let y = 0; y < this.height; y++) {
+      for (let x = 0; x < this.width; x++) {
+        this.framebuffer.setPixel(x, y, ' ', Color.white(), bgDark);
+      }
+    }
+
+    const screen = this.serverBrowser.getCurrentScreen();
+    const title = this.serverBrowser.getScreenTitle();
+
+    // Draw title
+    this.framebuffer.drawText(
+      Math.floor((this.width - title.length) / 2),
+      2,
+      title,
+      titleColor,
+      bgDark
+    );
+
+    // Draw border
+    for (let x = 2; x < this.width - 2; x++) {
+      this.framebuffer.setPixel(x, 4, '─', borderColor, bgDark);
+    }
+
+    if (screen === 'connecting') {
+      const msg = 'Connecting to server...';
+      this.framebuffer.drawText(
+        Math.floor((this.width - msg.length) / 2),
+        Math.floor(this.height / 2),
+        msg,
+        normalColor,
+        bgDark
+      );
+    } else if (screen === 'error') {
+      const error = this.serverBrowser.getError() || 'Unknown error';
+      this.framebuffer.drawText(
+        Math.floor((this.width - error.length) / 2),
+        Math.floor(this.height / 2),
+        error,
+        errorColor,
+        bgDark
+      );
+      const hint = 'Press Enter to continue';
+      this.framebuffer.drawText(
+        Math.floor((this.width - hint.length) / 2),
+        Math.floor(this.height / 2) + 2,
+        hint,
+        descColor,
+        bgDark
+      );
+    } else if (screen === 'room_list') {
+      // Draw column headers
+      const header = 'ROOM NAME              MAP        MODE         PLAYERS';
+      this.framebuffer.drawText(4, 5, header, descColor, bgDark);
+
+      for (let x = 2; x < this.width - 2; x++) {
+        this.framebuffer.setPixel(x, 6, '─', borderColor, bgDark);
+      }
+
+      // Draw rooms
+      const rooms = this.serverBrowser.getRooms();
+      const selectedIndex = this.serverBrowser.getSelectedIndex();
+
+      if (rooms.length === 0) {
+        const noRooms = 'No rooms available. Press C to create one.';
+        this.framebuffer.drawText(
+          Math.floor((this.width - noRooms.length) / 2),
+          8,
+          noRooms,
+          descColor,
+          bgDark
+        );
+      } else {
+        for (let i = 0; i < rooms.length && i < this.height - 12; i++) {
+          const room = rooms[i];
+          const isSelected = i === selectedIndex;
+          const prefix = isSelected ? '>' : ' ';
+          const name = room.name.substring(0, 20).padEnd(20);
+          const map = room.map.substring(0, 10).padEnd(10);
+          const mode = (room.mode === 'deathmatch' ? 'DM' : 'Comp').padEnd(12);
+          const players = `${room.playerCount}/${room.maxPlayers}`;
+
+          const line = `${prefix} ${name} ${map} ${mode} ${players}`;
+          const color = isSelected ? selectedColor : normalColor;
+          this.framebuffer.drawText(4, 7 + i, line, color, bgDark);
+        }
+      }
+    } else if (screen === 'create_room') {
+      // Draw create room form
+      const fields = this.serverBrowser.getCreateRoomFields();
+      const selectedField = this.serverBrowser.getCreateRoomField();
+
+      for (let i = 0; i < fields.length; i++) {
+        const isSelected = i === selectedField;
+        const prefix = isSelected ? '> ' : '  ';
+        const label = fields[i].padEnd(15);
+        const value = this.serverBrowser.getFieldValue(i);
+
+        const valuePart = i === 0 ? `[${value.padEnd(16)}]` : `< ${value} >`;
+        const line = `${prefix}${label}: ${valuePart}`;
+
+        const color = isSelected ? selectedColor : normalColor;
+        this.framebuffer.drawText(10, 6 + i * 2, line, color, bgDark);
+      }
+    } else if (screen === 'joining') {
+      const msg = 'Joining room...';
+      this.framebuffer.drawText(
+        Math.floor((this.width - msg.length) / 2),
+        Math.floor(this.height / 2),
+        msg,
+        normalColor,
+        bgDark
+      );
+    }
+
+    // Draw help text at bottom
+    const helpText = this.serverBrowser.getHelpText();
+    this.framebuffer.drawText(
+      Math.floor((this.width - helpText.length) / 2),
+      this.height - 3,
+      helpText,
+      descColor,
+      bgDark
+    );
+  }
+
+  // Draw lobby screen overlay
+  private drawLobbyScreenOverlay(): void {
+    if (!this.showLobbyScreen || !this.lobbyScreen) return;
+
+    const bgDark = new Color(15, 15, 25);
+    const borderColor = new Color(80, 80, 120);
+    const titleColor = new Color(255, 215, 0);  // Gold
+    const readyColor = new Color(100, 255, 100);  // Green
+    const notReadyColor = new Color(255, 100, 100);  // Red
+    const normalColor = new Color(200, 200, 200);
+    const descColor = new Color(150, 150, 150);
+    const tColor = new Color(255, 180, 80);  // Orange for T
+    const ctColor = new Color(100, 150, 255); // Blue for CT
+
+    // Full screen background
+    for (let y = 0; y < this.height; y++) {
+      for (let x = 0; x < this.width; x++) {
+        this.framebuffer.setPixel(x, y, ' ', Color.white(), bgDark);
+      }
+    }
+
+    // Title (room name or countdown)
+    const title = this.lobbyScreen.getScreenTitle();
+    this.framebuffer.drawText(
+      Math.floor((this.width - title.length) / 2),
+      2,
+      title,
+      titleColor,
+      bgDark
+    );
+
+    // Room description
+    const desc = this.lobbyScreen.getRoomDescription();
+    if (desc) {
+      this.framebuffer.drawText(
+        Math.floor((this.width - desc.length) / 2),
+        3,
+        desc,
+        descColor,
+        bgDark
+      );
+    }
+
+    // Draw border
+    for (let x = 2; x < this.width - 2; x++) {
+      this.framebuffer.setPixel(x, 5, '─', borderColor, bgDark);
+    }
+
+    // Draw players by team
+    const playersByTeam = this.lobbyScreen.getPlayersByTeam();
+    const columnWidth = Math.floor((this.width - 10) / 3);
+
+    // T team column
+    const tHeader = '[ TERRORISTS ]';
+    this.framebuffer.drawText(4, 6, tHeader, tColor, bgDark);
+    for (let i = 0; i < playersByTeam.T.length && i < 8; i++) {
+      const p = playersByTeam.T[i];
+      const readyMark = p.isReady ? '✓' : '○';
+      const hostMark = p.isHost ? '★' : ' ';
+      const line = `${hostMark}${readyMark} ${p.name}`;
+      const color = p.isReady ? readyColor : notReadyColor;
+      this.framebuffer.drawText(4, 7 + i, line, color, bgDark);
+    }
+
+    // CT team column
+    const ctHeader = '[ COUNTER-T ]';
+    const ctX = 4 + columnWidth;
+    this.framebuffer.drawText(ctX, 6, ctHeader, ctColor, bgDark);
+    for (let i = 0; i < playersByTeam.CT.length && i < 8; i++) {
+      const p = playersByTeam.CT[i];
+      const readyMark = p.isReady ? '✓' : '○';
+      const hostMark = p.isHost ? '★' : ' ';
+      const line = `${hostMark}${readyMark} ${p.name}`;
+      const color = p.isReady ? readyColor : notReadyColor;
+      this.framebuffer.drawText(ctX, 7 + i, line, color, bgDark);
+    }
+
+    // Spectators column
+    const specHeader = '[ SPECTATORS ]';
+    const specX = 4 + columnWidth * 2;
+    this.framebuffer.drawText(specX, 6, specHeader, descColor, bgDark);
+    for (let i = 0; i < playersByTeam.SPECTATOR.length && i < 8; i++) {
+      const p = playersByTeam.SPECTATOR[i];
+      const readyMark = p.isReady ? '✓' : '○';
+      const hostMark = p.isHost ? '★' : ' ';
+      const line = `${hostMark}${readyMark} ${p.name}`;
+      const color = p.isReady ? readyColor : normalColor;
+      this.framebuffer.drawText(specX, 7 + i, line, color, bgDark);
+    }
+
+    // Ready count
+    const readyCount = this.lobbyScreen.getReadyCount();
+    const readyText = `Ready: ${readyCount.ready}/${readyCount.total}`;
+    this.framebuffer.drawText(
+      Math.floor((this.width - readyText.length) / 2),
+      this.height - 5,
+      readyText,
+      readyCount.ready === readyCount.total ? readyColor : normalColor,
+      bgDark
+    );
+
+    // Help text at bottom
+    const helpText = this.lobbyScreen.getHelpText();
+    this.framebuffer.drawText(
+      Math.floor((this.width - helpText.length) / 2),
+      this.height - 3,
+      helpText,
       descColor,
       bgDark
     );
@@ -1601,6 +2217,26 @@ export class Renderer {
     this.buyMenu = menu;
   }
 
+  // Server browser
+  setServerBrowser(browser: ServerBrowser | null, show: boolean): void {
+    this.serverBrowser = browser;
+    this.showServerBrowser = show;
+  }
+
+  isServerBrowserShown(): boolean {
+    return this.showServerBrowser;
+  }
+
+  // Lobby screen
+  setLobbyScreen(lobby: LobbyScreen | null, show: boolean): void {
+    this.lobbyScreen = lobby;
+    this.showLobbyScreen = show;
+  }
+
+  isLobbyScreenShown(): boolean {
+    return this.showLobbyScreen;
+  }
+
   // Dropped weapons
   setDroppedWeapons(weapons: DroppedWeapon[]): void {
     this.droppedWeapons = weapons;
@@ -1628,10 +2264,27 @@ export class Renderer {
 
   // Render a single frame without the full pipeline (for UI overlays, etc.)
   renderDirect(): void {
-    if (this.enableDifferentialRendering) {
-      process.stdout.write(this.framebuffer.toDiffAnsiString(this.prevFramebuffer));
-    } else {
-      this.framebuffer.render();
+    let outputString: string;
+    switch (this.renderMode) {
+      case 'halfblock':
+        outputString = this.framebuffer.toHalfBlockAnsiString();
+        process.stdout.write(outputString);
+        break;
+      case 'sixel':
+        outputString = this.framebuffer.toScaledSixelString(this.sixelOutputScale);
+        if (outputString.length > 0) {
+          this.writeOutputAsync(outputString);
+        }
+        break;
+      case 'basic':
+      default:
+        if (this.enableDifferentialRendering) {
+          outputString = this.framebuffer.toDiffAnsiString(this.prevFramebuffer);
+        } else {
+          outputString = this.framebuffer.toAnsiString();
+        }
+        process.stdout.write(outputString);
+        break;
     }
   }
 

@@ -205,6 +205,11 @@ export interface StartGameMessage {
   type: 'start_game';
 }
 
+export interface ChangeTeamMessage {
+  type: 'change_team';
+  team: TeamId;
+}
+
 export type ClientMessage =
   | ListRoomsMessage
   | CreateRoomMessage
@@ -219,7 +224,8 @@ export type ClientMessage =
   | SelectWeaponMessage
   | ChatMessage
   | ReadyMessage
-  | StartGameMessage;
+  | StartGameMessage
+  | ChangeTeamMessage;
 
 // ============ Server → Client Messages ============
 
@@ -351,6 +357,145 @@ export type ServerMessage =
   | AssignedTeamMessage
   | InputAckMessage;
 
+// ============ Pool Server Info ============
+
+export interface PoolServerInfo {
+  id: string;
+  name: string;
+  endpoint: string;         // WebSocket URL for direct client connections
+  maxRooms: number;
+  currentRooms: number;
+  playerCount: number;
+  load: number;             // 0-100 percentage
+  lastHeartbeat: number;    // Timestamp
+  rooms: RoomInfo[];
+}
+
+export interface AggregatedRoomInfo extends RoomInfo {
+  poolId: string;           // Which pool server hosts this room
+  poolName: string;         // Display name of pool server
+  poolEndpoint: string;     // Direct connection URL
+}
+
+// ============ Pool Server → Hub Messages ============
+
+export interface PoolRegisterMessage {
+  type: 'pool_register';
+  serverName: string;
+  endpoint: string;         // Public endpoint for client connections
+  maxRooms: number;
+}
+
+export interface PoolHeartbeatMessage {
+  type: 'pool_heartbeat';
+  rooms: RoomInfo[];
+  playerCount: number;
+  load: number;
+}
+
+export interface PoolRoomCreatedMessage {
+  type: 'pool_room_created';
+  room: RoomInfo;
+}
+
+export interface PoolRoomClosedMessage {
+  type: 'pool_room_closed';
+  roomId: string;
+}
+
+export interface PoolUnregisterMessage {
+  type: 'pool_unregister';
+}
+
+export type PoolToHubMessage =
+  | PoolRegisterMessage
+  | PoolHeartbeatMessage
+  | PoolRoomCreatedMessage
+  | PoolRoomClosedMessage
+  | PoolUnregisterMessage;
+
+// ============ Hub → Pool Server Messages ============
+
+export interface PoolAcceptedMessage {
+  type: 'pool_accepted';
+  poolId: string;
+}
+
+export interface PoolRejectedMessage {
+  type: 'pool_rejected';
+  reason: string;
+}
+
+export interface PoolPingMessage {
+  type: 'pool_ping';
+}
+
+export type HubToPoolMessage =
+  | PoolAcceptedMessage
+  | PoolRejectedMessage
+  | PoolPingMessage;
+
+// ============ Client → Hub Messages ============
+
+export interface HubListRoomsMessage {
+  type: 'hub_list_rooms';
+}
+
+export interface HubGetEndpointMessage {
+  type: 'hub_get_endpoint';
+  roomId: string;
+}
+
+export interface HubCreateRoomMessage {
+  type: 'hub_create_room';
+  config: RoomConfig;
+  preferredPool?: string;   // Optional: prefer specific pool server
+}
+
+export type ClientToHubMessage =
+  | HubListRoomsMessage
+  | HubGetEndpointMessage
+  | HubCreateRoomMessage;
+
+// ============ Hub → Client Messages ============
+
+export interface HubRoomListMessage {
+  type: 'hub_room_list';
+  rooms: AggregatedRoomInfo[];
+  pools: { id: string; name: string; playerCount: number }[];
+}
+
+export interface HubRoomEndpointMessage {
+  type: 'hub_room_endpoint';
+  roomId: string;
+  endpoint: string;
+  token: string;            // Auth token for joining
+}
+
+export interface HubRoomNotFoundMessage {
+  type: 'hub_room_not_found';
+  roomId: string;
+}
+
+export interface HubRoomCreatedMessage {
+  type: 'hub_room_created';
+  roomId: string;
+  endpoint: string;
+  token: string;
+}
+
+export interface HubErrorMessage {
+  type: 'hub_error';
+  error: string;
+}
+
+export type HubToClientMessage =
+  | HubRoomListMessage
+  | HubRoomEndpointMessage
+  | HubRoomNotFoundMessage
+  | HubRoomCreatedMessage
+  | HubErrorMessage;
+
 // ============ Helpers ============
 
 export function isClientMessage(msg: unknown): msg is ClientMessage {
@@ -370,5 +515,49 @@ export function parseClientMessage(data: string): ClientMessage | null {
 }
 
 export function serializeServerMessage(msg: ServerMessage): string {
+  return JSON.stringify(msg);
+}
+
+export function isPoolToHubMessage(msg: unknown): msg is PoolToHubMessage {
+  return typeof msg === 'object' && msg !== null && 'type' in msg;
+}
+
+export function parsePoolToHubMessage(data: string): PoolToHubMessage | null {
+  try {
+    const msg = JSON.parse(data);
+    if (isPoolToHubMessage(msg)) {
+      return msg;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export function isClientToHubMessage(msg: unknown): msg is ClientToHubMessage {
+  return typeof msg === 'object' && msg !== null && 'type' in msg;
+}
+
+export function parseClientToHubMessage(data: string): ClientToHubMessage | null {
+  try {
+    const msg = JSON.parse(data);
+    if (isClientToHubMessage(msg)) {
+      return msg;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export function serializeHubToPoolMessage(msg: HubToPoolMessage): string {
+  return JSON.stringify(msg);
+}
+
+export function serializeHubToClientMessage(msg: HubToClientMessage): string {
+  return JSON.stringify(msg);
+}
+
+export function serializePoolToHubMessage(msg: PoolToHubMessage): string {
   return JSON.stringify(msg);
 }

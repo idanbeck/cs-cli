@@ -15,6 +15,14 @@ export class Framebuffer {
   private defaultFg: Color = Color.white();
   private defaultBg: Color = Color.black();
 
+  // Sixel performance settings
+  public sixelQuantLevel: number = 16;  // Color quantization (higher = fewer colors, faster)
+  public sixelMaxColors: number = 256;  // Max palette size
+
+  // Frame hash for differential rendering
+  private frameHash: number = 0;
+  private lastSixelOutput: string = '';
+
   constructor(width: number, height: number) {
     this.width = width;
     this.height = height;
@@ -135,6 +143,11 @@ export class Framebuffer {
     this.drawText(x, y, text, fg, bg);
   }
 
+  // Half-block character for rendering two vertical pixels per cell
+  private static readonly UPPER_HALF = '▀';
+  private static readonly LOWER_HALF = '▄';
+  private static readonly FULL_BLOCK = '█';
+
   // Render to ANSI string (optimized with color batching)
   toAnsiString(): string {
     const lines: string[] = [];
@@ -163,6 +176,313 @@ export class Framebuffer {
     }
 
     return CURSOR_HOME + lines.join('\n') + RESET;
+  }
+
+  // Render to half-block ANSI string (2x vertical resolution)
+  // Each terminal row represents 2 framebuffer rows
+  // Upper half-block (▀) with fg=top color, bg=bottom color
+  // Text characters are rendered as full-block text (not half-block)
+
+  // Check if a character is a solid pixel (for half-block combining)
+  // Only solid blocks and spaces are combined into half-blocks
+  // Everything else (text, box drawing, shading chars) renders as full characters
+  private static isSolidPixel(char: string): boolean {
+    return char === '█' || char === ' ';
+  }
+
+  toHalfBlockAnsiString(): string {
+    const lines: string[] = [];
+    let currentFg: string | null = null;
+    let currentBg: string | null = null;
+
+    // Process two rows at a time
+    for (let y = 0; y < this.height; y += 2) {
+      let line = '';
+
+      for (let x = 0; x < this.width; x++) {
+        // Top pixel (y)
+        const topPixel = this.pixels[y * this.width + x];
+        // Bottom pixel (y+1) - if exists, otherwise use top
+        const bottomPixel = (y + 1 < this.height)
+          ? this.pixels[(y + 1) * this.width + x]
+          : topPixel;
+
+        const topIsSolid = Framebuffer.isSolidPixel(topPixel.char);
+        const bottomIsSolid = Framebuffer.isSolidPixel(bottomPixel.char);
+
+        let outputChar: string;
+        let fgColor: Color;
+        let bgColor: Color;
+
+        if (!topIsSolid) {
+          // Top pixel is a character (text, box drawing, shading) - render as full character
+          outputChar = topPixel.char;
+          fgColor = topPixel.fg;
+          bgColor = topPixel.bg;
+        } else if (!bottomIsSolid) {
+          // Bottom pixel is a character - render as full character
+          outputChar = bottomPixel.char;
+          fgColor = bottomPixel.fg;
+          bgColor = bottomPixel.bg;
+        } else {
+          // Both are solid pixels (█ or space) - use half-block rendering
+          // Upper half-block: foreground = top color, background = bottom color
+          outputChar = Framebuffer.UPPER_HALF;
+          fgColor = topPixel.bg;  // Use bg as the pixel color for solid pixels
+          bgColor = bottomPixel.bg;
+        }
+
+        const fgAnsi = fgColor.toFgAnsi();
+        const bgAnsi = bgColor.toBgAnsi();
+
+        // Only emit color codes when they change
+        if (fgAnsi !== currentFg || bgAnsi !== currentBg) {
+          line += fgAnsi + bgAnsi;
+          currentFg = fgAnsi;
+          currentBg = bgAnsi;
+        }
+
+        line += outputChar;
+      }
+
+      lines.push(line);
+    }
+
+    return CURSOR_HOME + lines.join('\n') + RESET;
+  }
+
+  // Render to Sixel graphics format (true pixel rendering)
+  // Sixel is supported by iTerm2, mlterm, xterm (with config), etc.
+  // Optimized algorithm: process by row, track colors per column, use RLE
+  toSixelString(): string {
+    // Aggressive quantization to reduce colors (divide by 16 for ~16 levels per channel)
+    const QUANT = 16;
+
+    // Build color palette with aggressive quantization
+    const colorMap = new Map<string, number>();
+    const colors: Color[] = [];
+
+    for (const pixel of this.pixels) {
+      const qr = Math.floor(pixel.bg.r / QUANT) * QUANT;
+      const qg = Math.floor(pixel.bg.g / QUANT) * QUANT;
+      const qb = Math.floor(pixel.bg.b / QUANT) * QUANT;
+      const key = `${qr},${qg},${qb}`;
+
+      if (!colorMap.has(key)) {
+        colorMap.set(key, colors.length);
+        colors.push(new Color(qr, qg, qb));
+      }
+    }
+
+    // Build sixel output
+    const parts: string[] = ['\x1bPq']; // Start sixel
+
+    // Define colors
+    for (let i = 0; i < colors.length; i++) {
+      const c = colors[i];
+      const r = Math.round(c.r / 255 * 100);
+      const g = Math.round(c.g / 255 * 100);
+      const b = Math.round(c.b / 255 * 100);
+      parts.push(`#${i};2;${r};${g};${b}`);
+    }
+
+    // Pre-compute color indices for all pixels
+    const colorIndices = new Uint16Array(this.pixels.length);
+    for (let i = 0; i < this.pixels.length; i++) {
+      const c = this.pixels[i].bg;
+      const qr = Math.floor(c.r / QUANT) * QUANT;
+      const qg = Math.floor(c.g / QUANT) * QUANT;
+      const qb = Math.floor(c.b / QUANT) * QUANT;
+      colorIndices[i] = colorMap.get(`${qr},${qg},${qb}`)!;
+    }
+
+    // Process sixel rows (6 pixels high each)
+    for (let y = 0; y < this.height; y += 6) {
+      // Build sixel values for each column, indexed by color
+      const colorData = new Map<number, Uint8Array>();
+
+      for (let x = 0; x < this.width; x++) {
+        // Get the 6 pixels in this column (or fewer at bottom edge)
+        for (let dy = 0; dy < 6 && y + dy < this.height; dy++) {
+          const pixelIdx = (y + dy) * this.width + x;
+          const colorIdx = colorIndices[pixelIdx];
+
+          if (!colorData.has(colorIdx)) {
+            colorData.set(colorIdx, new Uint8Array(this.width));
+          }
+          colorData.get(colorIdx)![x] |= (1 << dy);
+        }
+      }
+
+      // Output data for each color that appears in this row
+      for (const [colorIdx, data] of colorData) {
+        parts.push(`#${colorIdx}`);
+
+        // Simple RLE: consecutive same values
+        let i = 0;
+        while (i < this.width) {
+          const val = data[i];
+          let count = 1;
+          while (i + count < this.width && data[i + count] === val && count < 255) {
+            count++;
+          }
+
+          const char = String.fromCharCode(63 + val);
+          if (count > 3) {
+            parts.push(`!${count}${char}`);
+          } else {
+            parts.push(char.repeat(count));
+          }
+          i += count;
+        }
+
+        parts.push('$'); // Carriage return
+      }
+
+      parts.push('-'); // New sixel row
+    }
+
+    parts.push('\x1b\\'); // End sixel
+    return CURSOR_HOME + parts.join('');
+  }
+
+  // Compute a fast hash of pixel colors for change detection
+  private computeFrameHash(): number {
+    let hash = 0;
+    // Sample pixels for fast hash (every 8th pixel)
+    for (let i = 0; i < this.pixels.length; i += 8) {
+      const c = this.pixels[i].bg;
+      hash = ((hash << 5) - hash + c.r + (c.g << 8) + (c.b << 16)) | 0;
+    }
+    return hash;
+  }
+
+  // Check if frame has changed since last sixel render
+  hasFrameChanged(): boolean {
+    const newHash = this.computeFrameHash();
+    if (newHash === this.frameHash) {
+      return false;
+    }
+    this.frameHash = newHash;
+    return true;
+  }
+
+  // Render to Sixel with output scaling (each framebuffer pixel becomes scale×scale sixel pixels)
+  // Optimized with: configurable quantization, max color limit, better RLE, differential skip
+  toScaledSixelString(scale: number = 2, forceFull: boolean = false): string {
+    // Differential rendering: skip if frame unchanged
+    if (!forceFull && !this.hasFrameChanged()) {
+      return ''; // Return empty - nothing to update
+    }
+
+    const QUANT = this.sixelQuantLevel;
+    const scaledWidth = this.width * scale;
+    const scaledHeight = this.height * scale;
+
+    // Build color palette with configurable quantization
+    const colorMap = new Map<string, number>();
+    const colors: Color[] = [];
+
+    for (const pixel of this.pixels) {
+      const qr = Math.floor(pixel.bg.r / QUANT) * QUANT;
+      const qg = Math.floor(pixel.bg.g / QUANT) * QUANT;
+      const qb = Math.floor(pixel.bg.b / QUANT) * QUANT;
+      const key = `${qr},${qg},${qb}`;
+
+      if (!colorMap.has(key) && colors.length < this.sixelMaxColors) {
+        colorMap.set(key, colors.length);
+        colors.push(new Color(qr, qg, qb));
+      }
+    }
+
+    // Build sixel output
+    const parts: string[] = ['\x1bPq']; // Start sixel
+
+    // Define colors
+    for (let i = 0; i < colors.length; i++) {
+      const c = colors[i];
+      const r = Math.round(c.r / 255 * 100);
+      const g = Math.round(c.g / 255 * 100);
+      const b = Math.round(c.b / 255 * 100);
+      parts.push(`#${i};2;${r};${g};${b}`);
+    }
+
+    // Pre-compute color indices for all pixels (find nearest if over max)
+    const colorIndices = new Uint16Array(this.pixels.length);
+    for (let i = 0; i < this.pixels.length; i++) {
+      const c = this.pixels[i].bg;
+      const qr = Math.floor(c.r / QUANT) * QUANT;
+      const qg = Math.floor(c.g / QUANT) * QUANT;
+      const qb = Math.floor(c.b / QUANT) * QUANT;
+      const key = `${qr},${qg},${qb}`;
+      const idx = colorMap.get(key);
+      colorIndices[i] = idx !== undefined ? idx : 0;
+    }
+
+    // Process sixel rows (6 pixels high each) in scaled space
+    for (let scaledY = 0; scaledY < scaledHeight; scaledY += 6) {
+      // Build sixel values for each column, indexed by color
+      const colorData = new Map<number, Uint8Array>();
+
+      for (let scaledX = 0; scaledX < scaledWidth; scaledX++) {
+        // Map scaled coords back to framebuffer coords
+        const fbX = Math.floor(scaledX / scale);
+
+        // Get the 6 pixels in this column (or fewer at bottom edge)
+        for (let dy = 0; dy < 6 && scaledY + dy < scaledHeight; dy++) {
+          const fbY = Math.floor((scaledY + dy) / scale);
+          const pixelIdx = fbY * this.width + fbX;
+          const colorIdx = colorIndices[pixelIdx];
+
+          if (!colorData.has(colorIdx)) {
+            colorData.set(colorIdx, new Uint8Array(scaledWidth));
+          }
+          colorData.get(colorIdx)![scaledX] |= (1 << dy);
+        }
+      }
+
+      // Output data for each color that appears in this row
+      for (const [colorIdx, data] of colorData) {
+        parts.push(`#${colorIdx}`);
+
+        // Optimized RLE with extended counts
+        let i = 0;
+        while (i < scaledWidth) {
+          const val = data[i];
+          let count = 1;
+          // Allow larger RLE runs (up to 32767)
+          while (i + count < scaledWidth && data[i + count] === val && count < 32767) {
+            count++;
+          }
+
+          const char = String.fromCharCode(63 + val);
+          if (count > 3) {
+            parts.push(`!${count}${char}`);
+          } else {
+            parts.push(char.repeat(count));
+          }
+          i += count;
+        }
+
+        parts.push('$'); // Carriage return
+      }
+
+      parts.push('-'); // New sixel row
+    }
+
+    parts.push('\x1b\\'); // End sixel
+    this.lastSixelOutput = CURSOR_HOME + parts.join('');
+    return this.lastSixelOutput;
+  }
+
+  // Get last sixel output (for async writes)
+  getLastSixelOutput(): string {
+    return this.lastSixelOutput;
+  }
+
+  // Reset frame hash (force next render to be full)
+  invalidateFrameHash(): void {
+    this.frameHash = 0;
   }
 
   // Render with differential update (only changed pixels)

@@ -431,6 +431,11 @@ export class GameMode {
   }
 
   canBuy(): boolean {
+    // In deathmatch, can buy anytime (no economy pressure)
+    if (this.config.type === 'deathmatch') {
+      return this.phase === 'live' || this.phase === 'warmup';
+    }
+    // In competitive, only during freeze or warmup
     return this.phase === 'freeze' || this.phase === 'warmup';
   }
 

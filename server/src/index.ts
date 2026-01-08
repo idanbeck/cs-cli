@@ -1,117 +1,167 @@
-// CS-CLI Multiplayer Game Server
-// WebSocket server for handling multiplayer game rooms
+// CS-CLI Multiplayer Server
+// Supports multiple startup modes:
+//   Default: Hub + built-in pool server (standalone)
+//   --hub-only: Hub only (no games, just routing)
+//   --pool --hub=URL: Pool server that connects to external hub
 
-import { WebSocketServer, WebSocket } from 'ws';
-import { RoomManager } from './RoomManager.js';
-import { parseClientMessage } from './protocol.js';
-import { DEFAULT_SERVER_CONFIG, ServerConfig } from './types.js';
+import { HubServer } from './hub/HubServer.js';
+import { GameServer } from './pool/GameServer.js';
+import { DEFAULT_SERVER_CONFIG } from './types.js';
 
-// Server configuration from environment or defaults
-const config: ServerConfig = {
-  ...DEFAULT_SERVER_CONFIG,
-  port: parseInt(process.env.PORT || '8080', 10),
-  tickRate: parseInt(process.env.TICK_RATE || '60', 10),
-  broadcastRate: parseInt(process.env.BROADCAST_RATE || '20', 10),
-  maxRooms: parseInt(process.env.MAX_ROOMS || '100', 10),
-  maxPlayersPerRoom: parseInt(process.env.MAX_PLAYERS || '10', 10),
-};
+// Parse command line arguments
+function parseArgs(): {
+  mode: 'standalone' | 'hub-only' | 'pool';
+  hubUrl?: string;
+  serverName: string;
+  port: number;
+  hubPort: number;
+  maxRooms: number;
+} {
+  const args = process.argv.slice(2);
+  const parsed: ReturnType<typeof parseArgs> = {
+    mode: 'standalone',
+    serverName: 'CS-CLI Server',
+    port: parseInt(process.env.PORT || '8080', 10),
+    hubPort: parseInt(process.env.HUB_PORT || '8081', 10),
+    maxRooms: parseInt(process.env.MAX_ROOMS || '100', 10),
+  };
 
-// Create room manager
-const roomManager = new RoomManager(config);
+  for (const arg of args) {
+    if (arg === '--hub-only') {
+      parsed.mode = 'hub-only';
+    } else if (arg === '--pool') {
+      parsed.mode = 'pool';
+    } else if (arg.startsWith('--hub=')) {
+      parsed.hubUrl = arg.substring(6);
+    } else if (arg.startsWith('--name=')) {
+      parsed.serverName = arg.substring(7);
+    } else if (arg.startsWith('--port=')) {
+      parsed.port = parseInt(arg.substring(7), 10);
+    } else if (arg.startsWith('--hub-port=')) {
+      parsed.hubPort = parseInt(arg.substring(11), 10);
+    } else if (arg.startsWith('--max-rooms=')) {
+      parsed.maxRooms = parseInt(arg.substring(12), 10);
+    }
+  }
 
-// Client ID tracking (WebSocket -> clientId)
-const socketToClientId = new WeakMap<WebSocket, string>();
+  // Pool mode requires hub URL
+  if (parsed.mode === 'pool' && !parsed.hubUrl) {
+    console.error('Error: Pool mode requires --hub=URL');
+    process.exit(1);
+  }
 
-// Create WebSocket server
-const wss = new WebSocketServer({
-  port: config.port,
-  perMessageDeflate: false, // Disable compression for lower latency
-});
+  return parsed;
+}
 
-console.log(`
+const config = parseArgs();
+
+// Track servers for shutdown
+let hubServer: HubServer | null = null;
+let gameServer: GameServer | null = null;
+
+// Start based on mode
+switch (config.mode) {
+  case 'standalone':
+    // Run hub + built-in pool server
+    console.log(`
   ╔═══════════════════════════════════════════════════╗
   ║                                                   ║
-  ║   CS-CLI Multiplayer Server                       ║
+  ║   CS-CLI Server (Standalone Mode)                 ║
   ║                                                   ║
-  ║   Port: ${config.port.toString().padEnd(41)}║
-  ║   Tick Rate: ${config.tickRate.toString().padEnd(36)}║
-  ║   Broadcast Rate: ${config.broadcastRate.toString().padEnd(31)}║
+  ║   Hub Port: ${config.hubPort.toString().padEnd(37)}║
+  ║   Game Port: ${config.port.toString().padEnd(36)}║
   ║   Max Rooms: ${config.maxRooms.toString().padEnd(36)}║
-  ║   Max Players/Room: ${config.maxPlayersPerRoom.toString().padEnd(28)}║
-  ║                                                   ║
-  ║   Server is running...                            ║
   ║                                                   ║
   ╚═══════════════════════════════════════════════════╝
 `);
 
-// Handle new connections
-wss.on('connection', (socket, request) => {
-  const clientIp = request.socket.remoteAddress || 'unknown';
-  const clientId = roomManager.addClient(socket);
-  socketToClientId.set(socket, clientId);
+    // Start hub server
+    hubServer = new HubServer({
+      port: config.hubPort,
+    });
+    hubServer.start();
 
-  console.log(`New connection from ${clientIp} (${clientId})`);
+    // Start built-in game server that connects to hub
+    gameServer = new GameServer({
+      ...DEFAULT_SERVER_CONFIG,
+      port: config.port,
+      maxRooms: config.maxRooms,
+      serverName: config.serverName,
+      publicEndpoint: `ws://localhost:${config.port}`,
+      hubUrl: `ws://localhost:${config.hubPort}`,
+    });
+    gameServer.start();
+    break;
 
-  // Handle messages
-  socket.on('message', (data) => {
-    try {
-      const message = parseClientMessage(data.toString());
-      if (message) {
-        roomManager.handleMessage(clientId, message);
-      } else {
-        console.warn(`Invalid message from ${clientId}:`, data.toString().substring(0, 100));
-      }
-    } catch (error) {
-      console.error(`Error processing message from ${clientId}:`, error);
-    }
-  });
+  case 'hub-only':
+    // Run only the hub server
+    console.log(`
+  ╔═══════════════════════════════════════════════════╗
+  ║                                                   ║
+  ║   CS-CLI Hub Server (Hub-Only Mode)               ║
+  ║                                                   ║
+  ║   Port: ${config.hubPort.toString().padEnd(41)}║
+  ║                                                   ║
+  ║   Waiting for pool servers to connect...          ║
+  ║                                                   ║
+  ╚═══════════════════════════════════════════════════╝
+`);
 
-  // Handle disconnection
-  socket.on('close', (code, reason) => {
-    console.log(`Connection closed: ${clientId} (code: ${code})`);
-    roomManager.removeClient(clientId);
-  });
+    hubServer = new HubServer({
+      port: config.hubPort,
+    });
+    hubServer.start();
+    break;
 
-  // Handle errors
-  socket.on('error', (error) => {
-    console.error(`Socket error for ${clientId}:`, error.message);
-  });
+  case 'pool':
+    // Run game server that connects to external hub
+    console.log(`
+  ╔═══════════════════════════════════════════════════╗
+  ║                                                   ║
+  ║   CS-CLI Pool Server                              ║
+  ║                                                   ║
+  ║   Name: ${config.serverName.substring(0, 40).padEnd(40)}║
+  ║   Port: ${config.port.toString().padEnd(41)}║
+  ║   Hub: ${config.hubUrl!.substring(0, 42).padEnd(42)}║
+  ║   Max Rooms: ${config.maxRooms.toString().padEnd(36)}║
+  ║                                                   ║
+  ╚═══════════════════════════════════════════════════╝
+`);
 
-  // Send welcome message (optional)
-  socket.send(JSON.stringify({
-    type: 'room_list',
-    rooms: roomManager.listRooms(),
-  }));
-});
-
-// Handle server errors
-wss.on('error', (error) => {
-  console.error('WebSocket server error:', error);
-});
+    gameServer = new GameServer({
+      ...DEFAULT_SERVER_CONFIG,
+      port: config.port,
+      maxRooms: config.maxRooms,
+      serverName: config.serverName,
+      publicEndpoint: `ws://localhost:${config.port}`,
+      hubUrl: config.hubUrl,
+    });
+    gameServer.start();
+    break;
+}
 
 // Graceful shutdown
 function shutdown() {
   console.log('\nShutting down server...');
 
-  // Close all connections
-  wss.clients.forEach((socket) => {
-    socket.close(1001, 'Server shutting down');
-  });
+  if (gameServer) {
+    gameServer.stop();
+  }
 
-  // Stop room manager
-  roomManager.shutdown();
-
-  // Close server
-  wss.close(() => {
-    console.log('Server closed');
-    process.exit(0);
-  });
+  if (hubServer) {
+    hubServer.stop();
+  }
 
   // Force exit after 5 seconds
   setTimeout(() => {
     console.log('Force exit');
     process.exit(1);
   }, 5000);
+
+  setTimeout(() => {
+    console.log('Server closed');
+    process.exit(0);
+  }, 1000);
 }
 
 process.on('SIGINT', shutdown);
@@ -119,11 +169,19 @@ process.on('SIGTERM', shutdown);
 
 // Stats logging
 setInterval(() => {
-  const stats = roomManager.getStats();
-  if (stats.clients > 0 || stats.rooms > 0) {
-    console.log(`Stats: ${stats.clients} clients, ${stats.rooms} rooms`);
+  if (hubServer) {
+    const stats = hubServer.getStats();
+    if (stats.pools > 0 || stats.rooms > 0 || stats.players > 0) {
+      console.log(`[Hub] ${stats.pools} pools, ${stats.rooms} rooms, ${stats.players} players`);
+    }
   }
-}, 60000); // Log every minute
+  if (gameServer) {
+    const stats = gameServer.getStats();
+    if (stats.clients > 0 || stats.rooms > 0) {
+      console.log(`[Game] ${stats.clients} clients, ${stats.rooms} rooms, hub: ${stats.hubConnected}`);
+    }
+  }
+}, 60000);
 
 // Export for testing
-export { wss, roomManager, config };
+export { hubServer, gameServer, config };

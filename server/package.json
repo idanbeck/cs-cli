@@ -7,6 +7,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
+    "start:hub": "node dist/index.js --hub-only",
+    "start:pool": "node dist/index.js --pool",
     "dev": "tsc --watch & node --watch dist/index.js"
   },
   "dependencies": {

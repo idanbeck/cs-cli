@@ -20,6 +20,10 @@ export class RoomManager {
   // Cleanup interval
   private cleanupInterval: ReturnType<typeof setInterval> | null = null;
 
+  // Event callbacks (for hub notification)
+  onRoomCreated?: (room: RoomInfo) => void;
+  onRoomClosed?: (roomId: string) => void;
+
   constructor(config: Partial<ServerConfig> = {}) {
     this.config = { ...DEFAULT_SERVER_CONFIG, ...config };
 
@@ -91,6 +95,9 @@ export class RoomManager {
     this.rooms.set(roomId, room);
 
     console.log(`Room created: ${roomId} by ${clientId} (${config.name})`);
+
+    // Notify hub if callback is set
+    this.onRoomCreated?.(room.getInfo());
 
     // Auto-join the creator
     this.joinRoom(clientId, roomId, client.name || 'Host');
@@ -199,6 +206,9 @@ export class RoomManager {
     room.stop();
     this.rooms.delete(roomId);
     console.log(`Room removed: ${roomId}`);
+
+    // Notify hub if callback is set
+    this.onRoomClosed?.(roomId);
   }
 
   listRooms(): RoomInfo[] {
