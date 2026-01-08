@@ -19,6 +19,7 @@ export interface LobbyState {
   isReady: boolean;
   countdown: number | null;  // null = not starting, number = seconds until start
   chatMessages: { sender: string; message: string; teamOnly: boolean }[];
+  activityLog: string[];  // Activity log for player actions
 }
 
 export class LobbyScreen {
@@ -33,6 +34,7 @@ export class LobbyScreen {
       isReady: false,
       countdown: null,
       chatMessages: [],
+      activityLog: [],
     };
   }
 
@@ -52,6 +54,11 @@ export class LobbyScreen {
 
   setLocalTeam(team: TeamId): void {
     this.state.localTeam = team;
+    // Also update the player in the players array
+    const player = this.state.players.find(p => p.id === this.state.localPlayerId);
+    if (player) {
+      player.team = team;
+    }
   }
 
   addPlayer(id: string, name: string, isHost: boolean = false): void {
@@ -66,16 +73,35 @@ export class LobbyScreen {
       isReady: false,
       isHost,
     });
+
+    this.addActivity(`${name} joined the lobby`);
   }
 
   removePlayer(id: string): void {
+    const player = this.state.players.find(p => p.id === id);
+    if (player) {
+      this.addActivity(`${player.name} left the lobby`);
+    }
     this.state.players = this.state.players.filter(p => p.id !== id);
+  }
+
+  addActivity(message: string): void {
+    this.state.activityLog.push(message);
+    // Keep only last 8 messages
+    if (this.state.activityLog.length > 8) {
+      this.state.activityLog.shift();
+    }
+  }
+
+  getActivityLog(): string[] {
+    return this.state.activityLog;
   }
 
   setPlayerReady(id: string, ready: boolean): void {
     const player = this.state.players.find(p => p.id === id);
     if (player) {
       player.isReady = ready;
+      this.addActivity(`${player.name} is ${ready ? 'ready' : 'not ready'}`);
     }
 
     // Update local state if it's us
@@ -87,11 +113,19 @@ export class LobbyScreen {
   setPlayerTeam(id: string, team: TeamId): void {
     const player = this.state.players.find(p => p.id === id);
     if (player) {
+      const oldTeam = player.team;
       player.team = team;
+      if (oldTeam !== team) {
+        const teamName = team === 'T' ? 'Terrorists' : team === 'CT' ? 'Counter-Terrorists' : 'Spectators';
+        this.addActivity(`${player.name} joined ${teamName}`);
+      }
     }
   }
 
   setCountdown(seconds: number | null): void {
+    if (seconds !== null && this.state.countdown === null) {
+      this.addActivity('Game starting!');
+    }
     this.state.countdown = seconds;
   }
 
@@ -242,6 +276,7 @@ export class LobbyScreen {
       isReady: false,
       countdown: null,
       chatMessages: [],
+      activityLog: [],
     };
   }
 }

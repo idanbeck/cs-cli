@@ -321,6 +321,12 @@ export interface PlayerReadyMessage {
   ready: boolean;
 }
 
+export interface PlayerTeamChangedMessage {
+  type: 'player_team_changed';
+  playerId: string;
+  team: TeamId;
+}
+
 export interface GameStartingMessage {
   type: 'game_starting';
   countdown: number;
@@ -353,6 +359,7 @@ export type ServerMessage =
   | WeaponPickedUpMessage
   | ChatReceivedMessage
   | PlayerReadyMessage
+  | PlayerTeamChangedMessage
   | GameStartingMessage
   | AssignedTeamMessage
   | InputAckMessage;

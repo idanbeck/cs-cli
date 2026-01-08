@@ -90,6 +90,58 @@ export class BotManager {
     return this.spawnPoints;
   }
 
+  // Get a spawn point that's far from all given positions
+  // Returns the spawn point with the maximum minimum distance to any entity
+  getSpreadSpawnPoint(spawnPoints: Vector3[], avoidPositions: Vector3[]): Vector3 {
+    if (spawnPoints.length === 0) {
+      return new Vector3(0, 0, 0);
+    }
+
+    if (avoidPositions.length === 0) {
+      // No positions to avoid, pick random
+      return spawnPoints[Math.floor(Math.random() * spawnPoints.length)];
+    }
+
+    // Find the spawn with maximum minimum distance to any entity
+    let bestSpawn = spawnPoints[0];
+    let bestMinDist = -1;
+
+    for (const spawn of spawnPoints) {
+      // Find minimum distance from this spawn to any entity
+      let minDist = Infinity;
+      for (const pos of avoidPositions) {
+        const dx = spawn.x - pos.x;
+        const dz = spawn.z - pos.z;  // Use horizontal distance only
+        const dist = Math.sqrt(dx * dx + dz * dz);
+        if (dist < minDist) {
+          minDist = dist;
+        }
+      }
+
+      // If this spawn's minimum distance is greater, it's a better choice
+      if (minDist > bestMinDist) {
+        bestMinDist = minDist;
+        bestSpawn = spawn;
+      }
+    }
+
+    return bestSpawn;
+  }
+
+  // Get all entity positions (bots + optional player)
+  getAllEntityPositions(includePlayer?: Player): Vector3[] {
+    const positions: Vector3[] = [];
+    for (const bot of this.bots) {
+      if (bot.isAlive) {
+        positions.push(bot.position.clone());
+      }
+    }
+    if (includePlayer && includePlayer.isAlive) {
+      positions.push(includePlayer.position.clone());
+    }
+    return positions;
+  }
+
   // Assign bots to teams (balances between T and CT)
   assignBotsToTeams(playerName: string): void {
     const teamManager = getTeamManager();
@@ -116,13 +168,23 @@ export class BotManager {
     }
   }
 
-  // Respawn all bots for a new round
-  respawnAllBots(now: number): void {
+  // Respawn all bots for a new round (with spread spawning)
+  respawnAllBots(now: number, player?: Player): void {
+    // Track positions as we spawn to spread bots out
+    const spawnedPositions: Vector3[] = [];
+
+    // Include player position if provided
+    if (player && player.isAlive) {
+      spawnedPositions.push(player.position.clone());
+    }
+
     for (const bot of this.bots) {
       const spawnPoints = this.getSpawnPointsForTeam(bot.team);
       if (spawnPoints.length > 0) {
-        const spawnIndex = Math.floor(Math.random() * spawnPoints.length);
-        const spawn = spawnPoints[spawnIndex];
+        // Use spread spawning to place bots far from each other
+        const spawn = this.getSpreadSpawnPoint(spawnPoints, spawnedPositions);
+        spawnedPositions.push(spawn.clone());
+
         // keepInventory = true if bot was alive, false if dead
         bot.respawn(spawn, Math.random() * Math.PI * 2, bot.isAlive);
         bot.setState('idle', now);
@@ -251,7 +313,7 @@ export class BotManager {
       if (!bot.isAlive) {
         // Handle respawn (only if enabled)
         if (this.respawnEnabled) {
-          this.handleRespawn(bot, now);
+          this.handleRespawn(bot, now, player);
         }
         continue;
       }
@@ -423,14 +485,14 @@ export class BotManager {
   }
 
   // Handle bot respawn
-  private handleRespawn(bot: Bot, now: number): void {
+  private handleRespawn(bot: Bot, now: number, player?: Player): void {
     // Check if enough time has passed since death
     // (using stateStartTime as death time)
     if (now - bot.stateStartTime > this.respawnDelay) {
-      // Respawn at random spawn point
+      // Respawn at spawn point far from other entities
       if (this.spawnPoints.length > 0) {
-        const spawnIndex = Math.floor(Math.random() * this.spawnPoints.length);
-        const spawn = this.spawnPoints[spawnIndex];
+        const avoidPositions = this.getAllEntityPositions(player);
+        const spawn = this.getSpreadSpawnPoint(this.spawnPoints, avoidPositions);
         bot.respawn(spawn, Math.random() * Math.PI * 2);
         bot.setState('idle', now);
       }

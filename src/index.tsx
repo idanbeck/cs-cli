@@ -34,6 +34,7 @@ import {
 // Keys are considered "held" for a short duration after each keypress
 const KEY_HOLD_MS = 120; // How long a key stays "pressed" after last stdin event
 import { MapLoader, LoadedMap } from './maps/MapLoader.js';
+import { MapRegistry } from './maps/MapRegistry.js';
 import { dm_arena } from './maps/maps/dm_arena.js';
 import { AABB } from './maps/MapFormat.js';
 import { moveAndSlide, checkOnGround, setCollisionEnabled, rayAABBIntersection } from './physics/Collision.js';
@@ -41,7 +42,7 @@ import { Player } from './game/Player.js';
 import { WeaponSlot } from './game/Weapon.js';
 import { getWeaponSprite } from './game/WeaponSprites.js';
 import { BotManager } from './ai/BotManager.js';
-import { GameMode, DEFAULT_DEATHMATCH_CONFIG, DEFAULT_COMPETITIVE_CONFIG, GameModeType } from './game/GameMode.js';
+import { GameMode, DEFAULT_DEATHMATCH_CONFIG, DEFAULT_COMPETITIVE_CONFIG, DEFAULT_SOLO_CONFIG, GameModeType } from './game/GameMode.js';
 import { getSoundEngine, playSound, playSoundAt, SoundType } from './audio/SoundEngine.js';
 import { getGameConsole, consoleLog, consoleWarn, consoleError, consoleDebug } from './ui/Console.js';
 import { getMainMenu, MainMenu, RenderMode, MSAAMode } from './ui/MainMenu.js';
@@ -53,6 +54,8 @@ interface CLIOptions {
   msaaMode: MSAAMode;
   help: boolean;
   debug: boolean;
+  debugMap?: string;  // Map ID for debug map mode
+  listMaps: boolean;  // List available maps
 }
 
 // Graphics quality presets
@@ -73,6 +76,7 @@ function parseArgs(): CLIOptions {
     msaaMode: 'none',
     help: false,
     debug: false,
+    listMaps: false,
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -134,6 +138,14 @@ function parseArgs(): CLIOptions {
       } else if (value === '16x' || value === '16') {
         options.msaaMode = '16x';
       }
+    } else if (arg === '--debug-map' || arg === '--map') {
+      options.debugMap = args[++i];
+    } else if (arg.startsWith('--debug-map=')) {
+      options.debugMap = arg.split('=')[1];
+    } else if (arg.startsWith('--map=')) {
+      options.debugMap = arg.split('=')[1];
+    } else if (arg === '--list-maps' || arg === '--maps') {
+      options.listMaps = true;
     }
   }
 
@@ -162,6 +174,11 @@ Advanced Options:
                             none|off|0 - No anti-aliasing (default)
                             4x|4       - 4x MSAA
                             16x|16     - 16x MSAA
+
+Map Debug:
+  --map <id>              Load map in debug mode (noclip, no bots)
+  --debug-map <id>        Same as --map
+  --list-maps, --maps     List all available maps
 
 Other:
   -h, --help              Show this help message
@@ -555,6 +572,445 @@ const GRAVITY = 20; // units per second^2
 const JUMP_VELOCITY = 8; // units per second
 const GROUND_Y = 1.7; // eye height
 const PLAYER_RADIUS = 0.4;
+// Map debug mode: load a map and fly around with noclip
+async function runMapDebugMode(mapId: string, initialRenderMode: RenderMode, initialMsaaMode: MSAAMode): Promise<void> {
+  const { Renderer } = await import('./engine/Renderer.js');
+  const { Vector3 } = await import('./engine/math/Vector3.js');
+  const { Color, CURSOR_HIDE, ALT_SCREEN_ON, ALT_SCREEN_OFF, RESET } = await import('./utils/Colors.js');
+  const { degToRad } = await import('./engine/math/MathUtils.js');
+  const fs = await import('fs');
+
+  // Debug log file
+  const LOG_PATH = '/tmp/cs_map_debug.log';
+  const log = (msg: string) => {
+    fs.appendFileSync(LOG_PATH, `${new Date().toISOString()} ${msg}\n`);
+  };
+  fs.writeFileSync(LOG_PATH, `=== Map Debug Session: ${mapId} ===\n`);
+  fs.appendFileSync(LOG_PATH, `Started: ${new Date().toISOString()}\n\n`);
+
+  // Initialize map registry and load map
+  MapRegistry.initialize();
+  const mapInfo = MapRegistry.getMap(mapId);
+  if (!mapInfo) {
+    console.error(`Map not found: ${mapId}`);
+    console.log('\nAvailable maps:');
+    for (const m of MapRegistry.getAvailableMaps()) {
+      console.log(`  ${m.id}`);
+    }
+    process.exit(1);
+  }
+
+  log(`Loading map: ${mapInfo.name} (${mapId})`);
+  log(`  BSP path: ${mapInfo.bspPath}`);
+  log(`  WAD paths: ${mapInfo.wadPaths?.join(', ') || 'none'}`);
+  log(`  Type: ${mapInfo.type}`);
+  log(`  Modes: ${mapInfo.modes}`);
+
+  console.log(`Loading ${mapInfo.name}...`);
+  console.log(`Log file: ${LOG_PATH}`);
+
+  let loadedMap;
+  try {
+    loadedMap = await MapRegistry.loadMap(mapId);
+    log(`\nMap loaded successfully:`);
+    log(`  Render objects: ${loadedMap.renderObjects.length}`);
+    log(`  Spawns: ${loadedMap.spawns.length}`);
+    log(`  Colliders: ${loadedMap.colliders.length}`);
+    log(`  Ambient light: ${loadedMap.ambientLight}`);
+    log(`  Sky color: RGB(${loadedMap.skyColor.r}, ${loadedMap.skyColor.g}, ${loadedMap.skyColor.b})`);
+    log(`  Bounds: (${loadedMap.bounds.min.x.toFixed(1)}, ${loadedMap.bounds.min.y.toFixed(1)}, ${loadedMap.bounds.min.z.toFixed(1)}) to (${loadedMap.bounds.max.x.toFixed(1)}, ${loadedMap.bounds.max.y.toFixed(1)}, ${loadedMap.bounds.max.z.toFixed(1)})`);
+  } catch (e: any) {
+    log(`\nERROR loading map: ${e.message}`);
+    log(e.stack || '');
+    console.error(`Failed to load map: ${e.message}`);
+    process.exit(1);
+  }
+
+  // Analyze render objects
+  log(`\n=== Render Objects Analysis ===`);
+  let totalTris = 0;
+  let totalVerts = 0;
+  const materialStats: Map<string, { count: number; tris: number; hasTexture: boolean }> = new Map();
+
+  for (let i = 0; i < loadedMap.renderObjects.length; i++) {
+    const obj = loadedMap.renderObjects[i];
+    const mesh = obj.mesh;
+    const matName = mesh.material?.name || 'unnamed';
+    const hasTexture = !!mesh.material?.texture;
+    const tris = mesh.triangles.length;
+    const verts = mesh.vertices.length;
+
+    totalTris += tris;
+    totalVerts += verts;
+
+    if (!materialStats.has(matName)) {
+      materialStats.set(matName, { count: 0, tris: 0, hasTexture });
+    }
+    const stat = materialStats.get(matName)!;
+    stat.count++;
+    stat.tris += tris;
+  }
+
+  log(`\nTotal triangles: ${totalTris}`);
+  log(`Total vertices: ${totalVerts}`);
+  log(`\nMaterials (${materialStats.size}):`);
+
+  const sortedMats = Array.from(materialStats.entries()).sort((a, b) => b[1].tris - a[1].tris);
+  let missingTextures = 0;
+  for (const [name, stat] of sortedMats) {
+    const texStatus = stat.hasTexture ? 'OK' : 'MISSING';
+    if (!stat.hasTexture) missingTextures++;
+    log(`  ${name.padEnd(30)} ${stat.tris.toString().padStart(6)} tris, ${stat.count.toString().padStart(3)} objs, tex: ${texStatus}`);
+  }
+
+  if (missingTextures > 0) {
+    log(`\nWARNING: ${missingTextures} materials missing textures`);
+  }
+
+  // Analyze spawns
+  log(`\n=== Spawn Points (${loadedMap.spawns.length}) ===`);
+  for (let i = 0; i < loadedMap.spawns.length; i++) {
+    const sp = loadedMap.spawns[i];
+    log(`  ${i + 1}: pos=(${sp.position[0].toFixed(1)}, ${sp.position[1].toFixed(1)}, ${sp.position[2].toFixed(1)}) angle=${sp.angle.toFixed(0)}° team=${sp.team || 'none'}`);
+  }
+
+  console.log(`Loaded: ${loadedMap.renderObjects.length} objects, ${totalTris} tris, ${loadedMap.spawns.length} spawns`);
+  if (missingTextures > 0) {
+    console.log(`Warning: ${missingTextures} missing textures (see log)`);
+  }
+
+  // Create renderer
+  const width = process.stdout.columns || 80;
+  const height = process.stdout.rows ? process.stdout.rows - 2 : 22;
+  const renderer = new Renderer(width, height);
+
+  // Better defaults for BSP map viewing
+  renderer.setRenderMode('halfblock');  // Better quality
+  renderer.setMSAAMode('4x');  // Smooth edges
+  renderer.showCrosshair = true;
+  renderer.showHUD = false;
+  renderer.showStats = true;
+  renderer.setClearColor(loadedMap.skyColor);
+  renderer.getRasterizer().ambientLight = loadedMap.ambientLight;
+  renderer.getRasterizer().enableLighting = true;
+  renderer.getRasterizer().enableDepthShading = true;
+  renderer.getRasterizer().maxDepth = 500;  // Large for BSP maps
+  renderer.getRasterizer().nearPlane = 0.01;  // Allow closer objects
+  renderer.getRasterizer().enableBackfaceCulling = false;  // Off for BSP - geometry is complex
+
+  // Add map objects
+  for (const obj of loadedMap.renderObjects) {
+    renderer.addObject(obj);
+  }
+
+  // Camera setup - start at first spawn
+  const camera = renderer.getCamera();
+  const spawn = loadedMap.spawns[0] || { position: [0, 2, 0], angle: 0 };
+  camera.setPosition(spawn.position[0], spawn.position[1] + 1.7, spawn.position[2]);
+  camera.setYaw(degToRad(spawn.angle));
+  camera.setPitch(0);
+  camera.fov = degToRad(90);
+  camera.aspect = width / height;
+  camera.near = 0.01;  // Allow closer objects for BSP
+  camera.far = 500;    // Large for BSP maps
+
+  // Create mouse handler for capture
+  const mouseHandler = new MouseHandler(width, height);
+  mouseHandler.setNativeMouseMode(false);  // We'll use native input if available
+
+  log(`\n=== Debug Session Started ===`);
+  log(`Initial position: (${spawn.position[0].toFixed(1)}, ${spawn.position[1].toFixed(1)}, ${spawn.position[2].toFixed(1)})`);
+  log(`Render mode: ${initialRenderMode}, MSAA: ${initialMsaaMode}`);
+
+  // Noclip flying state
+  let yaw = degToRad(spawn.angle);
+  let pitch = 0;
+  const flySpeed = 0.5;
+  const mouseSensitivity = 0.003;
+  let spawnIndex = 0;
+
+  // Try to init native keyboard/mouse
+  let useNativeInput = false;
+  try {
+    const nativeAvailable = await isNativeKeyboardAvailable();
+    if (nativeAvailable) {
+      await initNativeKeyboard();
+      useNativeInput = true;
+      mouseHandler.setNativeMouseMode(true);  // Skip robotjs capture, use native
+      log(`Native keyboard/mouse: ENABLED`);
+      console.log('Native input enabled - use mouse to look, click to capture');
+    } else {
+      log(`Native keyboard/mouse: NOT AVAILABLE`);
+      console.log('Using keyboard only - IJKL/arrows to look');
+    }
+  } catch (e: any) {
+    log(`Native keyboard/mouse error: ${e.message}`);
+    console.log('Using keyboard only - IJKL/arrows to look');
+  }
+
+  // Enter alt screen
+  process.stdout.write(ALT_SCREEN_ON + CURSOR_HIDE);
+
+  // Enable mouse tracking in terminal (for click-to-capture and fallback mouse)
+  mouseHandler.enable();
+
+  // Raw mode for keyboard (fallback)
+  if (process.stdin.isTTY) {
+    process.stdin.setRawMode(true);
+  }
+  process.stdin.resume();
+
+  let running = true;
+  let escapeSequence = '';
+
+  // Stdin key handler (fallback when native not available)
+  process.stdin.on('data', (data) => {
+    const str = data.toString();
+
+    // Try to parse mouse events first
+    if (mouseHandler.parseMouseEvent(str)) {
+      // Mouse event handled - apply deltas if captured
+      if (mouseHandler.isCaptured() && !useNativeInput) {
+        const delta = mouseHandler.getPitchYawDelta();
+        pitch = Math.max(-Math.PI / 2 + 0.1, Math.min(Math.PI / 2 - 0.1, pitch + delta.pitch));
+        yaw += delta.yaw;
+        camera.setYaw(yaw);
+        camera.setPitch(pitch);
+      }
+      return;
+    }
+
+    // Handle escape sequences for arrow keys (left/right inverted to match natural feel)
+    if (str.startsWith('\x1b[')) {
+      if (str === '\x1b[A') { pitch = Math.min(Math.PI / 2 - 0.1, pitch + 0.05); }  // Up
+      else if (str === '\x1b[B') { pitch = Math.max(-Math.PI / 2 + 0.1, pitch - 0.05); }  // Down
+      else if (str === '\x1b[C') { yaw -= 0.05; }  // Right arrow = turn right
+      else if (str === '\x1b[D') { yaw += 0.05; }  // Left arrow = turn left
+      camera.setYaw(yaw);
+      camera.setPitch(pitch);
+      return;
+    }
+
+    for (const char of str) {
+      const code = char.charCodeAt(0);
+
+      // Quit only on Q or Ctrl+C (not ESC alone, since arrow keys send ESC prefix)
+      if (char === 'q' || char === 'Q' || code === 3) {
+        running = false;
+        return;
+      }
+
+      // Movement - match Camera.getForward() and getRight()
+      const forward = new Vector3(
+        -Math.sin(yaw) * Math.cos(pitch),
+        Math.sin(pitch),
+        -Math.cos(yaw) * Math.cos(pitch)
+      );
+      const right = new Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
+      const up = new Vector3(0, 1, 0);
+
+      if (char === 'w' || char === 'W') {
+        camera.position = camera.position.add(forward.scale(flySpeed));
+      } else if (char === 's' || char === 'S') {
+        camera.position = camera.position.add(forward.scale(-flySpeed));
+      } else if (char === 'a' || char === 'A') {
+        camera.position = camera.position.add(right.scale(-flySpeed));
+      } else if (char === 'd' || char === 'D') {
+        camera.position = camera.position.add(right.scale(flySpeed));
+      } else if (char === ' ' || char === 'e' || char === 'E') {
+        camera.position = camera.position.add(up.scale(flySpeed));
+      } else if (char === 'c' || char === 'C') {
+        camera.position = camera.position.add(up.scale(-flySpeed));
+      }
+
+      // Look with IJKL (J=left, L=right, I=up, K=down)
+      if (char === 'j' || char === 'J') { yaw += 0.05; }  // Turn left
+      else if (char === 'l' || char === 'L') { yaw -= 0.05; }  // Turn right
+      else if (char === 'i' || char === 'I') { pitch = Math.min(Math.PI / 2 - 0.1, pitch + 0.05); }
+      else if (char === 'k' || char === 'K') { pitch = Math.max(-Math.PI / 2 + 0.1, pitch - 0.05); }
+
+      // Cycle spawn points
+      if (char === 'n' || char === 'N') {
+        spawnIndex = (spawnIndex + 1) % loadedMap.spawns.length;
+        const sp = loadedMap.spawns[spawnIndex];
+        camera.setPosition(sp.position[0], sp.position[1] + 1.7, sp.position[2]);
+        yaw = degToRad(sp.angle);
+        pitch = 0;
+        log(`Teleported to spawn ${spawnIndex + 1}: (${sp.position[0].toFixed(1)}, ${sp.position[1].toFixed(1)}, ${sp.position[2].toFixed(1)})`);
+      } else if (char === 'p' || char === 'P') {
+        spawnIndex = (spawnIndex - 1 + loadedMap.spawns.length) % loadedMap.spawns.length;
+        const sp = loadedMap.spawns[spawnIndex];
+        camera.setPosition(sp.position[0], sp.position[1] + 1.7, sp.position[2]);
+        yaw = degToRad(sp.angle);
+        pitch = 0;
+        log(`Teleported to spawn ${spawnIndex + 1}: (${sp.position[0].toFixed(1)}, ${sp.position[1].toFixed(1)}, ${sp.position[2].toFixed(1)})`);
+      }
+
+      // Render mode toggle (R)
+      if (char === 'r' || char === 'R') {
+        const modes: RenderMode[] = ['basic', 'halfblock'];
+        const current = modes.indexOf(renderer.getRenderMode());
+        const next = (current + 1) % modes.length;
+        process.stdout.write('\x1b[2J\x1b[H');
+        renderer.setRenderMode(modes[next]);
+        log(`Render mode: ${modes[next]}`);
+      }
+
+      // MSAA toggle (M)
+      if (char === 'm' || char === 'M') {
+        const modes: MSAAMode[] = ['none', '4x', '16x'];
+        const current = modes.indexOf(renderer.getMSAAMode());
+        const next = (current + 1) % modes.length;
+        renderer.setMSAAMode(modes[next]);
+        log(`MSAA: ${modes[next]}`);
+      }
+
+      // Texture toggle (T)
+      if (char === 't' || char === 'T') {
+        const rast = renderer.getRasterizer();
+        rast.enableTextures = !rast.enableTextures;
+        log(`Textures: ${rast.enableTextures ? 'ON' : 'OFF'}`);
+      }
+
+      // Texture filter toggle (F)
+      if (char === 'f' || char === 'F') {
+        const rast = renderer.getRasterizer();
+        const filters: Array<'normal' | 'pixelated' | 'blockavg'> = ['normal', 'pixelated', 'blockavg'];
+        const current = filters.indexOf(rast.textureFilter);
+        const next = (current + 1) % filters.length;
+        rast.textureFilter = filters[next];
+        log(`Texture filter: ${filters[next]}`);
+      }
+
+      // AO toggle (O)
+      if (char === 'o' || char === 'O') {
+        const rast = renderer.getRasterizer();
+        rast.enableAmbientOcclusion = !rast.enableAmbientOcclusion;
+        log(`Ambient Occlusion: ${rast.enableAmbientOcclusion ? 'ON' : 'OFF'}`);
+      }
+
+      // Backface culling toggle (B)
+      if (char === 'b' || char === 'B') {
+        const rast = renderer.getRasterizer();
+        rast.enableBackfaceCulling = !rast.enableBackfaceCulling;
+        log(`Backface culling: ${rast.enableBackfaceCulling ? 'ON' : 'OFF'}`);
+      }
+
+      // White texture mode toggle (G for "ghost" mode)
+      if (char === 'g' || char === 'G') {
+        const rast = renderer.getRasterizer();
+        rast.whiteTextureMode = !rast.whiteTextureMode;
+        log(`White texture mode: ${rast.whiteTextureMode ? 'ON' : 'OFF'}`);
+      }
+
+      // Lighting toggle (H)
+      if (char === 'h' || char === 'H') {
+        const rast = renderer.getRasterizer();
+        rast.enableLighting = !rast.enableLighting;
+        log(`Lighting: ${rast.enableLighting ? 'ON' : 'OFF'}`);
+      }
+
+      camera.setYaw(yaw);
+      camera.setPitch(pitch);
+    }
+  });
+
+  // Render loop
+  const frameTime = 1000 / 30; // 30 FPS
+  let frameCount = 0;
+
+  while (running) {
+    // Update native input if available
+    if (useNativeInput) {
+      updateNativeKeyboard();
+
+      // Mouse look (invert X for natural feel - moving mouse right turns view right)
+      const mouseDelta = getNativeMouseDelta();
+      if (mouseDelta.x !== 0 || mouseDelta.y !== 0) {
+        yaw -= mouseDelta.x * mouseSensitivity;  // Inverted for natural feel
+        pitch -= mouseDelta.y * mouseSensitivity;
+        pitch = Math.max(-Math.PI / 2 + 0.1, Math.min(Math.PI / 2 - 0.1, pitch));
+        camera.setYaw(yaw);
+        camera.setPitch(pitch);
+      }
+
+      // WASD movement via native - match Camera.getForward() and getRight()
+      const forward = new Vector3(
+        -Math.sin(yaw) * Math.cos(pitch),
+        Math.sin(pitch),
+        -Math.cos(yaw) * Math.cos(pitch)
+      );
+      const right = new Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
+      const up = new Vector3(0, 1, 0);
+
+      if (isGameKeyDown('W')) camera.position = camera.position.add(forward.scale(flySpeed * 0.1));
+      if (isGameKeyDown('S')) camera.position = camera.position.add(forward.scale(-flySpeed * 0.1));
+      if (isGameKeyDown('A')) camera.position = camera.position.add(right.scale(-flySpeed * 0.1));
+      if (isGameKeyDown('D')) camera.position = camera.position.add(right.scale(flySpeed * 0.1));
+      if (isGameKeyDown('Space')) camera.position = camera.position.add(up.scale(flySpeed * 0.1));
+      if (isGameKeyDown('C')) camera.position = camera.position.add(up.scale(-flySpeed * 0.1));
+
+      // Q to quit
+      if (wasGameKeyJustPressed('Q') || wasGameKeyJustPressed('Escape')) {
+        running = false;
+      }
+    }
+
+    // Render
+    renderer.render();
+
+    // Apply AO post-process
+    renderer.getRasterizer().applyAmbientOcclusion();
+
+    // Get current settings for display
+    const rast = renderer.getRasterizer();
+    const renderMode = renderer.getRenderMode();
+    const msaaMode = renderer.getMSAAMode();
+    const texOn = rast.enableTextures;
+    const texFilter = rast.textureFilter;
+    const aoOn = rast.enableAmbientOcclusion;
+    const bfcOn = rast.enableBackfaceCulling;
+    const whiteMode = rast.whiteTextureMode;
+    const lightOn = rast.enableLighting;
+
+    // Overlay
+    const inputMode = useNativeInput ? 'NATIVE' : 'STDIN';
+    const infoLines = [
+      `MAP: ${loadedMap.name} | SPAWN[N/P]: ${spawnIndex + 1}/${loadedMap.spawns.length} | Input: ${inputMode}`,
+      `POS: ${camera.position.x.toFixed(1)}, ${camera.position.y.toFixed(1)}, ${camera.position.z.toFixed(1)} | YAW: ${(yaw * 180 / Math.PI).toFixed(0)}° PITCH: ${(pitch * 180 / Math.PI).toFixed(0)}° | TRIS: ${totalTris}`,
+      `[R]ender:${renderMode} [M]SAA:${msaaMode} [T]ex:${texOn ? 'ON' : 'OFF'} [F]ilter:${texFilter}`,
+      `[O]AO:${aoOn ? 'ON' : 'OFF'} [B]FC:${bfcOn ? 'ON' : 'OFF'} [G]host:${whiteMode ? 'ON' : 'OFF'} Lig[H]t:${lightOn ? 'ON' : 'OFF'}`,
+      `WASD=move SPACE/C=up/down IJKL/Mouse=look [Q]uit`,
+    ];
+
+    for (let i = 0; i < infoLines.length; i++) {
+      process.stdout.write(`\x1b[${i + 1};1H\x1b[43;30m ${infoLines[i].padEnd(70)} \x1b[0m`);
+    }
+
+    frameCount++;
+    await new Promise(resolve => setTimeout(resolve, frameTime));
+  }
+
+  // Cleanup
+  log(`\n=== Session Ended ===`);
+  log(`Total frames: ${frameCount}`);
+  log(`Final position: (${camera.position.x.toFixed(1)}, ${camera.position.y.toFixed(1)}, ${camera.position.z.toFixed(1)})`);
+
+  mouseHandler.release();
+  mouseHandler.disable();
+  if (useNativeInput) {
+    stopNativeKeyboard();
+  }
+  process.stdout.write(ALT_SCREEN_OFF + RESET + '\x1b[?25h');
+  if (process.stdin.isTTY) {
+    process.stdin.setRawMode(false);
+  }
+  process.stdin.pause();
+  console.log('Map debug mode exited.');
+  console.log(`Log saved to: ${LOG_PATH}`);
+  process.exit(0);
+}
+
 const PLAYER_HEIGHT = 1.7;
 
 interface GameProps {
@@ -562,7 +1018,7 @@ interface GameProps {
   initialMSAAMode?: MSAAMode;
 }
 
-function Game({ initialRenderMode = 'basic', initialMSAAMode = 'none' }: GameProps) {
+function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameProps) {
   const { exit } = useApp();
   const { stdout } = useStdout();
 
@@ -642,18 +1098,47 @@ function Game({ initialRenderMode = 'basic', initialMSAAMode = 'none' }: GamePro
   // Collision enabled ref (for debug toggle)
   const collisionEnabledRef = useRef(true);
 
-  // Load map
-  const [loadedMap] = useState<LoadedMap>(() => {
-    return MapLoader.load(dm_arena);
-  });
+  // Load map (use ref so we can switch maps dynamically)
+  const loadedMapRef = useRef<LoadedMap>(MapLoader.load(dm_arena));
+  const currentMapIdRef = useRef<string>('dm_arena');
 
   // Colliders ref for physics
-  const collidersRef = useRef<AABB[]>(loadedMap.colliders);
+  const collidersRef = useRef<AABB[]>(loadedMapRef.current.colliders);
+
+  // Function to load a new map
+  const loadMapAsync = async (mapId: string): Promise<boolean> => {
+    try {
+      const newMap = await MapRegistry.loadMap(mapId);
+      loadedMapRef.current = newMap;
+      currentMapIdRef.current = mapId;
+      collidersRef.current = newMap.colliders;
+
+      // Update renderer with new map
+      renderer.clearObjects();
+
+      // Add map objects (no ground plane - BSP maps have their own floors)
+      for (const obj of newMap.renderObjects) {
+        renderer.addObject(obj);
+      }
+
+      // Update sky and lighting
+      renderer.setClearColor(newMap.skyColor);
+      renderer.getRasterizer().ambientLight = newMap.ambientLight;
+
+      // Update bot spawns
+      botManager.setSpawnPoints(newMap.spawns);
+
+      return true;
+    } catch (error) {
+      consoleError(`Failed to load map ${mapId}: ${error}`);
+      return false;
+    }
+  };
 
   // Bot manager
   const [botManager] = useState(() => {
     const manager = new BotManager();
-    manager.setSpawnPoints(loadedMap.spawns);
+    manager.setSpawnPoints(loadedMapRef.current.spawns);
     return manager;
   });
 
@@ -684,16 +1169,8 @@ function Game({ initialRenderMode = 'basic', initialMSAAMode = 'none' }: GamePro
   const isMultiplayerRef = useRef(false);
 
   const [scene] = useState(() => {
-    const objects: RenderObject[] = [];
-
-    // Add ground plane (larger for expanded map)
-    const ground = MapLoader.createGroundPlane(140, 140, 'concrete_light', 32);
-    objects.push(ground);
-
-    // Add all map objects
-    objects.push(...loadedMap.renderObjects);
-
-    return objects;
+    // Just use map objects (no ground plane - BSP maps have their own floors)
+    return [...loadedMapRef.current.renderObjects];
   });
 
   // Set up scene
@@ -704,16 +1181,16 @@ function Game({ initialRenderMode = 'basic', initialMSAAMode = 'none' }: GamePro
     renderer.showStats = true;
 
     // Set sky color from map
-    renderer.setClearColor(loadedMap.skyColor);
+    renderer.setClearColor(loadedMapRef.current.skyColor);
 
     // Configure rasterizer (increased depth for larger map)
     renderer.getRasterizer().enableDepthShading = true;
     renderer.getRasterizer().enableLighting = true;
-    renderer.getRasterizer().ambientLight = loadedMap.ambientLight;
+    renderer.getRasterizer().ambientLight = loadedMapRef.current.ambientLight;
     renderer.getRasterizer().maxDepth = 120;
 
     // Pick a random spawn point
-    const spawn = loadedMap.spawns[Math.floor(Math.random() * loadedMap.spawns.length)];
+    const spawn = loadedMapRef.current.spawns[Math.floor(Math.random() * loadedMapRef.current.spawns.length)];
 
     // Position camera at spawn
     const camera = renderer.getCamera();
@@ -880,7 +1357,7 @@ function Game({ initialRenderMode = 'basic', initialMSAAMode = 'none' }: GamePro
       renderer.clearObjects();
       botManager.clear();
     };
-  }, [renderer, scene, loadedMap, botManager]);
+  }, [renderer, scene, botManager]);
 
   // Track if we should exit
   const exitingRef = useRef(false);
@@ -1044,60 +1521,82 @@ function Game({ initialRenderMode = 'basic', initialMSAAMode = 'none' }: GamePro
 
         const result = mainMenu.handleKey(key);
         if (result.action === 'start_game' && result.mode && result.map) {
-          // Start the game with selected mode
-          appModeRef.current = 'playing';
-          gameModeTypeRef.current = result.mode;
+          // Load the selected map (async)
+          const startGame = async () => {
+            // Only load if different map selected
+            if (result.map !== currentMapIdRef.current) {
+              consoleLog(`Loading map: ${result.map}...`);
+              const success = await loadMapAsync(result.map!);
+              if (!success) {
+                consoleError(`Failed to load map, staying on current map`);
+              }
+            }
 
-          // Configure game mode based on selection
-          const config = result.mode === 'competitive'
-            ? { ...DEFAULT_COMPETITIVE_CONFIG, warmupTime: 5 }
-            : { ...DEFAULT_DEATHMATCH_CONFIG, warmupTime: 3, freezeTime: 5 };  // Shorter times for DM
-          gameModeRef.current = new GameMode(config);
+            // Start the game with selected mode
+            appModeRef.current = 'playing';
+            gameModeTypeRef.current = result.mode!;
 
-          // Reset team manager
-          resetTeamManager();
-          resetDroppedWeaponManager();
+            // Configure game mode based on selection
+            let config;
+            if (result.mode === 'solo') {
+              config = { ...DEFAULT_SOLO_CONFIG };
+            } else if (result.mode === 'competitive') {
+              config = { ...DEFAULT_COMPETITIVE_CONFIG, warmupTime: 5 };
+            } else {
+              config = { ...DEFAULT_DEATHMATCH_CONFIG, warmupTime: 3, freezeTime: 5 };  // Shorter times for DM
+            }
+            gameModeRef.current = new GameMode(config);
 
-          // Spawn bots for the game
-          botManager.clear();  // Clear any existing bots first
-          botManager.spawnBots(6, 'medium');
+            // Reset team manager
+            resetTeamManager();
+            resetDroppedWeaponManager();
 
-          // Set up teams if competitive mode
-          const isTeamMode = result.mode === 'competitive';
-          if (isTeamMode) {
-            botManager.setTeamSpawnPoints(loadedMap.spawns);
-            botManager.assignBotsToTeams(playerRef.current.name);
-            const playerTeam = getTeamManager().getTeam(playerRef.current.name);
-            playerRef.current.team = playerTeam || 'T';
-          }
+            // Spawn bots for the game (not in solo mode)
+            botManager.clear();  // Clear any existing bots first
+            if (result.mode !== 'solo') {
+              botManager.spawnBots(6, 'medium');
+            }
 
-          // Respawn player at team spawn
-          const player = playerRef.current;
-          const spawns = isTeamMode
-            ? loadedMap.spawns.filter(s => s.team === player.team || s.team === 'DM')
-            : loadedMap.spawns;
-          const spawn = spawns[Math.floor(Math.random() * spawns.length)];
-          player.respawn(
-            new Vector3(spawn.position[0], spawn.position[1], spawn.position[2]),
-            degToRad(spawn.angle)
-          );
+            // Set up teams if competitive mode
+            const isTeamMode = result.mode === 'competitive';
+            const isSoloMode = result.mode === 'solo';
+            if (isTeamMode) {
+              botManager.setTeamSpawnPoints(loadedMapRef.current.spawns);
+              botManager.assignBotsToTeams(playerRef.current.name);
+              const playerTeam = getTeamManager().getTeam(playerRef.current.name);
+              playerRef.current.team = playerTeam || 'T';
+            }
 
-          // Update camera
-          const camera = renderer.getCamera();
-          camera.setPosition(spawn.position[0], spawn.position[1] + PLAYER_HEIGHT, spawn.position[2]);
-          camera.setYaw(degToRad(spawn.angle));
-          camera.setPitch(0);
+            // Respawn player at team spawn
+            const player = playerRef.current;
+            const spawns = isTeamMode
+              ? loadedMapRef.current.spawns.filter(s => s.team === player.team || s.team === 'DM')
+              : loadedMapRef.current.spawns;
+            const spawn = spawns[Math.floor(Math.random() * spawns.length)];
+            player.respawn(
+              new Vector3(spawn.position[0], spawn.position[1], spawn.position[2]),
+              degToRad(spawn.angle)
+            );
 
-          // Respawn bots at team spawns
-          if (isTeamMode) {
-            botManager.respawnAllBots(now);
-          }
+            // Update camera
+            const camera = renderer.getCamera();
+            camera.setPosition(spawn.position[0], spawn.position[1] + PLAYER_HEIGHT, spawn.position[2]);
+            camera.setYaw(degToRad(spawn.angle));
+            camera.setPitch(0);
 
-          // Disable respawns for round-based mode
-          botManager.setRespawnEnabled(!isTeamMode);
+            // Respawn bots at team spawns (pass player for spread spawning)
+            if (isTeamMode) {
+              botManager.respawnAllBots(now, player);
+            }
 
-          // Start game mode
-          gameModeRef.current.startMatch(now);
+            // Disable respawns for round-based mode
+            botManager.setRespawnEnabled(!isTeamMode);
+
+            // Start game mode
+            gameModeRef.current.startMatch(now);
+          };
+
+          startGame();
 
           // Hide main menu
           renderer.setMainMenu(mainMenu, false);
@@ -1158,7 +1657,7 @@ function Game({ initialRenderMode = 'basic', initialMSAAMode = 'none' }: GamePro
               consoleError(error);
             },
             onPlayerJoined: (playerId, playerName) => {
-              consoleLog(`${playerName} joined`);
+              consoleLog(`[Lobby] ${playerName} (${playerId}) joined`);
               lobbyScreen.addPlayer(playerId, playerName);
             },
             onPlayerLeft: (playerId, playerName) => {
@@ -1167,8 +1666,10 @@ function Game({ initialRenderMode = 'basic', initialMSAAMode = 'none' }: GamePro
             },
             onPlayerReady: (playerId, ready) => {
               lobbyScreen.setPlayerReady(playerId, ready);
-              const player = lobbyScreen.getState().players.find(p => p.id === playerId);
-              consoleLog(`${player?.name || playerId} is ${ready ? 'ready' : 'not ready'}`);
+            },
+            onPlayerTeamChanged: (playerId, team) => {
+              consoleLog(`[Team] Player ${playerId} changed to team ${team}`);
+              lobbyScreen.setPlayerTeam(playerId, team);
             },
             onAssignedTeam: (team) => {
               lobbyScreen.setLocalTeam(team);
@@ -1178,6 +1679,14 @@ function Game({ initialRenderMode = 'basic', initialMSAAMode = 'none' }: GamePro
             // Game state from server (multiplayer)
             onGameState: (state) => {
               mpState.applyServerState(state);
+              // Update local player's money and stats from server
+              const localId = mpState.getLocalPlayerId();
+              const localPlayerData = state.players.find(p => p.id === localId);
+              if (localPlayerData) {
+                playerRef.current.economy.setMoney(localPlayerData.money);
+                playerRef.current.health = localPlayerData.health;
+                playerRef.current.armor = localPlayerData.armor;
+              }
             },
             // Input acknowledgement for client-side prediction
             onInputAck: (sequence, position) => {
@@ -1207,22 +1716,45 @@ function Game({ initialRenderMode = 'basic', initialMSAAMode = 'none' }: GamePro
               if (event.attackerId === localId) {
                 renderer.triggerHitMarker();
                 playSound(event.headshot ? 'hit_headshot' : 'hit_enemy');
-              } else if (event.victimId === localId) {
-                // We got hit - play hurt sound
+              }
+              if (event.victimId === localId) {
+                // We got hit - update health and play hurt sound
+                playerRef.current.health -= event.damage;
+                if (playerRef.current.health < 0) playerRef.current.health = 0;
                 playSound('player_hurt');
               }
             },
             onKillEvent: (event) => {
               mpState.queueKillEvent(event);
               consoleLog(`${event.killerName} killed ${event.victimName} with ${event.weapon}${event.headshot ? ' (headshot)' : ''}`);
-              // Update local player stats if they got the kill
+              // Update local player stats
               const localId = mpState.getLocalPlayerId();
               if (event.killerId === localId) {
                 playerRef.current.kills++;
                 playSound('bot_death');
-              } else if (event.victimId === localId) {
+              }
+              if (event.victimId === localId) {
+                // We died! Set local player state
                 playerRef.current.deaths++;
+                playerRef.current.health = 0;
+                playerRef.current.isAlive = false;
                 playSound('player_death');
+              }
+            },
+            // Spawn event - handle respawn on new round
+            onSpawnEvent: (entityId, entityType, position, team) => {
+              const localId = mpState.getLocalPlayerId();
+              if (entityId === localId) {
+                // We respawned! Reset local player state
+                const player = playerRef.current;
+                player.isAlive = true;
+                player.health = 100;
+                player.armor = 0;
+                // Update camera position
+                const camera = renderer.getCamera();
+                camera.setPosition(position.x, position.y, position.z);
+                camera.setRoll(0);
+                consoleLog(`Respawned at position (${position.x.toFixed(1)}, ${position.y.toFixed(1)}, ${position.z.toFixed(1)})`);
               }
             },
             // Phase changes
@@ -1434,7 +1966,9 @@ function Game({ initialRenderMode = 'basic', initialMSAAMode = 'none' }: GamePro
       }
 
       // B for buy menu (freeze phase only)
-      if (key === 'b' && gameModeRef.current.canBuy()) {
+      const canBuyMP = isMultiplayerRef.current && getMultiplayerState().canBuy();
+      const canBuySP = !isMultiplayerRef.current && gameModeRef.current.canBuy();
+      if (key === 'b' && (canBuyMP || canBuySP)) {
         buyMenu.toggle(playerRef.current);
       }
 
@@ -1698,7 +2232,9 @@ function Game({ initialRenderMode = 'basic', initialMSAAMode = 'none' }: GamePro
       if (lookPitch !== 0) camera.rotate(TURN_SPEED * deltaTime * lookPitch, 0);
 
       // Check if player is frozen (freeze phase in competitive mode)
-      const playerFrozen = gameModeRef.current.isPlayerFrozen();
+      // Solo mode is never frozen
+      const isSoloModeMove = gameModeTypeRef.current === 'solo';
+      const playerFrozen = isSoloModeMove ? false : gameModeRef.current.isPlayerFrozen();
 
       // Calculate movement direction (blocked during freeze phase)
       let moveForward = 0;
@@ -1720,7 +2256,7 @@ function Game({ initialRenderMode = 'basic', initialMSAAMode = 'none' }: GamePro
       const gameConsole = getGameConsole();
       if (!gameConsole.getIsOpen() && appModeRef.current === 'playing') {
         const isFrozenMP = isMultiplayerRef.current && getMultiplayerState().isPlayerFrozen();
-        const isFrozenSP = !isMultiplayerRef.current && gameModeRef.current.isPlayerFrozen();
+        const isFrozenSP = !isMultiplayerRef.current && !isSoloModeMove && gameModeRef.current.isPlayerFrozen();
         const isFrozen = isFrozenMP || isFrozenSP;
 
         if (firePressed && !isFrozen) {
@@ -1856,13 +2392,17 @@ function Game({ initialRenderMode = 'basic', initialMSAAMode = 'none' }: GamePro
       // Only run game logic when actually playing (not in menu)
       const isPlaying = appModeRef.current === 'playing';
 
-      // Check if player is frozen (freeze phase)
+      // Check game mode types
       const gameMode = gameModeRef.current;
       const isTeamMode = gameModeTypeRef.current === 'competitive';
-      const isFrozen = gameMode.isPlayerFrozen();
+      const isSoloMode = gameModeTypeRef.current === 'solo';
+
+      // Check if player is frozen (freeze phase) - never frozen in solo mode
+      const isFrozen = isSoloMode ? false : gameMode.isPlayerFrozen();
 
       // Update bots only when playing (pass freeze and team mode info)
-      if (isPlaying) {
+      // Skip all bot/game logic in solo mode - just free exploration
+      if (isPlaying && !isSoloMode) {
         if (isMultiplayer && mpState.isActive()) {
           // Multiplayer mode: use server entities, skip local bot simulation
           // Game mode is handled by server, we just render what server tells us
@@ -1905,17 +2445,25 @@ function Game({ initialRenderMode = 'basic', initialMSAAMode = 'none' }: GamePro
         camera.setRoll(0);
       }
 
-      // Handle player respawn
-      if (gameMode.shouldPlayerRespawn(player, now)) {
-        const spawn = loadedMap.spawns[Math.floor(Math.random() * loadedMap.spawns.length)];
-        player.respawn(
-          new Vector3(spawn.position[0], spawn.position[1], spawn.position[2]),
-          degToRad(spawn.angle)
+      // Handle player respawn (not in solo mode - player is always alive)
+      if (!isSoloMode && gameMode.shouldPlayerRespawn(player, now)) {
+        // Use spread spawning - pick spawn far from bots
+        const mapSpawns = loadedMapRef.current.spawns;
+        const spawnPoints = mapSpawns.map(s => new Vector3(s.position[0], s.position[1], s.position[2]));
+        const botPositions = botManager.getAllEntityPositions();
+        const spawnPos = botManager.getSpreadSpawnPoint(spawnPoints, botPositions);
+
+        // Find the matching spawn point for angle
+        const spawnIndex = spawnPoints.findIndex(s =>
+          Math.abs(s.x - spawnPos.x) < 0.1 && Math.abs(s.z - spawnPos.z) < 0.1
         );
+        const spawnAngle = spawnIndex >= 0 ? mapSpawns[spawnIndex].angle : 0;
+
+        player.respawn(spawnPos, degToRad(spawnAngle));
 
         // Update camera position
-        camera.setPosition(spawn.position[0], spawn.position[1] + PLAYER_HEIGHT, spawn.position[2]);
-        camera.setYaw(degToRad(spawn.angle));
+        camera.setPosition(spawnPos.x, spawnPos.y + PLAYER_HEIGHT, spawnPos.z);
+        camera.setYaw(degToRad(spawnAngle));
         camera.setPitch(0);
         camera.setRoll(0); // Reset roll on respawn
 
@@ -1968,8 +2516,22 @@ function Game({ initialRenderMode = 'basic', initialMSAAMode = 'none' }: GamePro
         renderer.setTeamScores(scores.t, scores.ct, scores.round);
         renderer.setPlayerTeam(player.team);
         renderer.setPlayerMoney(player.economy.getMoney());
+      } else if (isSoloMode) {
+        // Solo mode: minimal UI, just exploration
+        renderer.setKillFeed([]);
+        renderer.setScoreboard([]);
+        renderer.setShowScoreboard(false);
+        renderer.setGameState(
+          'live',  // Always live in solo
+          '',      // No timer
+          0,       // No rounds
+          null,    // No winner
+          0,       // No respawn countdown
+          0        // No warmup
+        );
+        renderer.setFreezeTime(0);  // Never frozen
       } else {
-        // Single player: use local game mode
+        // Deathmatch/Competitive: use local game mode
         renderer.setKillFeed(gameMode.getKillFeed(now));
         renderer.setScoreboard(gameMode.getScoreboard(player, botManager.getBots()));
         renderer.setShowScoreboard(showScoreboardRef.current || gameMode.phase === 'match_end');
@@ -2055,6 +2617,27 @@ async function main() {
   if (options.debug) {
     console.log(`Debug mode: render=${options.renderMode}, msaa=${options.msaaMode}`);
     await runDebugMode(options.renderMode, options.msaaMode);
+    return;
+  }
+
+  // Handle --list-maps
+  if (options.listMaps) {
+    MapRegistry.initialize();
+    const maps = MapRegistry.getAvailableMaps();
+    console.log('\nAvailable maps:\n');
+    for (const map of maps) {
+      const modes = map.modes === 'both' ? 'DM/Comp' : map.modes === 'deathmatch' ? 'DM' : 'Comp';
+      console.log(`  ${map.id.padEnd(15)} ${map.name.padEnd(25)} [${modes.padEnd(7)}] ${map.type}`);
+    }
+    console.log(`\nTotal: ${maps.length} maps`);
+    console.log('\nUsage: cs-cli --map <id>');
+    process.exit(0);
+  }
+
+  // Handle --debug-map / --map
+  if (options.debugMap) {
+    console.log(`Map debug mode: ${options.debugMap}`);
+    await runMapDebugMode(options.debugMap, options.renderMode, options.msaaMode);
     return;
   }
 

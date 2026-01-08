@@ -292,7 +292,36 @@ export class GameRunner {
     if (vec3Length(moveDir) > 0) {
       const normalizedDir = vec3Normalize(moveDir);
       const speed = PLAYER_MOVE_SPEED * (this.tickDeltaMs / 1000);
-      player.position = vec3Add(player.position, vec3Scale(normalizedDir, speed));
+
+      // Use sub-stepping for collision detection to prevent tunneling
+      const moveLength = speed;
+      const stepSize = PLAYER_RADIUS * 0.5; // Max step size is half player radius
+      const numSteps = Math.max(1, Math.ceil(moveLength / stepSize));
+      const stepMove = speed / numSteps;
+
+      for (let i = 0; i < numSteps; i++) {
+        const stepDir = vec3Scale(normalizedDir, stepMove);
+        const newPos = vec3Add(player.position, stepDir);
+
+        // Check collision before applying
+        if (!this.checkCollision(newPos)) {
+          player.position = newPos;
+        } else {
+          // Try sliding along walls - try X only
+          const newPosX = { ...player.position, x: newPos.x };
+          if (!this.checkCollision(newPosX)) {
+            player.position = newPosX;
+          } else {
+            // Try Z only
+            const newPosZ = { ...player.position, z: newPos.z };
+            if (!this.checkCollision(newPosZ)) {
+              player.position = newPosZ;
+            }
+          }
+          // If we hit a wall, stop sub-stepping
+          break;
+        }
+      }
     }
 
     // Handle jumping
@@ -700,7 +729,10 @@ export class GameRunner {
       if (dist > 10) {
         const moveDir = vec3Normalize({ x: toTarget.x, y: 0, z: toTarget.z });
         const speed = PLAYER_MOVE_SPEED * 0.7 * deltaTime;
-        bot.position = vec3Add(bot.position, vec3Scale(moveDir, speed));
+        const newPos = vec3Add(bot.position, vec3Scale(moveDir, speed));
+        if (!this.checkCollision(newPos)) {
+          bot.position = newPos;
+        }
       }
 
       // Fire at target
@@ -716,7 +748,13 @@ export class GameRunner {
         z: -Math.cos(bot.wanderAngle),
       };
       const speed = PLAYER_MOVE_SPEED * 0.3 * deltaTime;
-      bot.position = vec3Add(bot.position, vec3Scale(wanderDir, speed));
+      const newPos = vec3Add(bot.position, vec3Scale(wanderDir, speed));
+      if (!this.checkCollision(newPos)) {
+        bot.position = newPos;
+      } else {
+        // Turn around if hitting a wall
+        bot.wanderAngle += Math.PI;
+      }
       bot.yaw = bot.wanderAngle;
     }
 
@@ -1146,5 +1184,38 @@ export class GameRunner {
 
   private getWeaponSlot(type: WeaponType): number {
     return WEAPON_DEFS[type].slot;
+  }
+
+  private checkCollision(pos: Vec3): boolean {
+    // Check map bounds first
+    if (
+      pos.x < this.mapData.bounds.min.x + PLAYER_RADIUS ||
+      pos.x > this.mapData.bounds.max.x - PLAYER_RADIUS ||
+      pos.z < this.mapData.bounds.min.z + PLAYER_RADIUS ||
+      pos.z > this.mapData.bounds.max.z - PLAYER_RADIUS
+    ) {
+      return true;
+    }
+
+    // Check against map colliders (AABB vs sphere)
+    for (const collider of this.mapData.colliders) {
+      // Expand AABB by player radius for sphere check
+      const minX = collider.min.x - PLAYER_RADIUS;
+      const maxX = collider.max.x + PLAYER_RADIUS;
+      const minZ = collider.min.z - PLAYER_RADIUS;
+      const maxZ = collider.max.z + PLAYER_RADIUS;
+      const maxY = collider.max.y;
+
+      // Check if position is inside expanded AABB (only if below top of collider)
+      if (
+        pos.x >= minX && pos.x <= maxX &&
+        pos.z >= minZ && pos.z <= maxZ &&
+        (pos.y - PLAYER_EYE_HEIGHT) < maxY
+      ) {
+        return true;
+      }
+    }
+
+    return false;
   }
 }

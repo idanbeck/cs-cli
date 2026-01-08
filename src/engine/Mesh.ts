@@ -1,5 +1,6 @@
 import { Vector3 } from './math/Vector3.js';
 import { Color } from '../utils/Colors.js';
+import { Texture } from './Texture.js';
 
 export interface Vertex {
   position: Vector3;
@@ -17,6 +18,8 @@ export interface Material {
   name: string;
   color: Color;
   emissive?: boolean; // If true, not affected by lighting
+  texture?: Texture;  // Optional texture
+  textureScale?: number; // Scale factor for texture UVs
 }
 
 export class Mesh {

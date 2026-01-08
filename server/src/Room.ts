@@ -112,16 +112,40 @@ export class Room {
   // ============ Player Management ============
 
   addPlayer(clientId: string, client: ConnectedClient): void {
+    console.log(`[Room] Adding player ${clientId} (${client.name}). Existing clients: ${this.clients.size}`);
+
+    // Helper to send directly to new joiner's socket (since they're not in this.clients yet)
+    const sendToNewJoiner = (message: ServerMessage): void => {
+      if (client.socket.readyState === WebSocket.OPEN) {
+        try {
+          client.socket.send(serializeServerMessage(message));
+        } catch (e) {
+          // Ignore send errors
+        }
+      }
+    };
+
     // Send existing players to new joiner BEFORE adding them
     for (const [existingId, existingClient] of this.clients) {
-      this.sendToClient(clientId, {
+      console.log(`[Room] Sending existing player ${existingId} to new joiner ${clientId}`);
+      sendToNewJoiner({
         type: 'player_joined',
         playerId: existingId,
         playerName: existingClient.name || 'Player',
       });
+      // Send their team assignment
+      const existingTeam = this.teamAssignments.get(existingId);
+      console.log(`[Room] Existing player ${existingId} team: ${existingTeam}`);
+      if (existingTeam) {
+        sendToNewJoiner({
+          type: 'player_team_changed',
+          playerId: existingId,
+          team: existingTeam,
+        });
+      }
       // Also send their ready state
       if (existingClient.isReady) {
-        this.sendToClient(clientId, {
+        sendToNewJoiner({
           type: 'player_ready',
           playerId: existingId,
           ready: true,
@@ -197,8 +221,15 @@ export class Room {
 
   startGame(): void {
     if (this.gameRunner) {
-      this.gameRunner.stop();
+      // Already running, don't restart
+      return;
     }
+
+    // Notify clients game is starting
+    this.broadcast({
+      type: 'game_starting',
+      countdown: 0,  // Start immediately
+    });
 
     // Create game state
     const gameState = this.createInitialGameState();
@@ -219,10 +250,30 @@ export class Room {
       this.gameRunner.addPlayer(clientId, client.name || 'Player', team);
     }
 
-    // Add bots
+    // Add bots - balance teams based on current player assignments
+    let tCount = 0;
+    let ctCount = 0;
+    for (const team of this.teamAssignments.values()) {
+      if (team === 'T') tCount++;
+      else if (team === 'CT') ctCount++;
+    }
+
     for (let i = 0; i < this.config.botCount; i++) {
       const botName = BOT_NAMES[i % BOT_NAMES.length];
-      const team = i % 2 === 0 ? 'T' : 'CT';
+      // Assign bot to smaller team
+      let team: TeamId;
+      if (tCount < ctCount) {
+        team = 'T';
+        tCount++;
+      } else if (ctCount < tCount) {
+        team = 'CT';
+        ctCount++;
+      } else {
+        // Equal - alternate
+        team = i % 2 === 0 ? 'T' : 'CT';
+        if (team === 'T') tCount++;
+        else ctCount++;
+      }
       this.gameRunner.addBot(botName, team, this.config.botDifficulty);
     }
 
@@ -340,7 +391,7 @@ export class Room {
 
     // Broadcast team change to all players
     this.broadcast({
-      type: 'player_team_changed' as any,
+      type: 'player_team_changed',
       playerId: clientId,
       team,
     });

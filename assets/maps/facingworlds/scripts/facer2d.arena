@@ -1,0 +1,7 @@
+{
+map	"facer2d"
+longname	"Facing Worlds"
+bots	"doom sarge klesk crash sorlag"
+timelimit 30
+type "ctf"
+}

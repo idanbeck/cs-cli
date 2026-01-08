@@ -46,6 +46,7 @@ export interface GameClientCallbacks {
   onPlayerJoined?: (playerId: string, playerName: string) => void;
   onPlayerLeft?: (playerId: string, playerName: string) => void;
   onPlayerReady?: (playerId: string, ready: boolean) => void;
+  onPlayerTeamChanged?: (playerId: string, team: TeamId) => void;
   onGameStarting?: (countdown: number) => void;
   onAssignedTeam?: (team: TeamId) => void;
 
@@ -334,6 +335,10 @@ export class GameClient {
 
       case 'player_ready':
         this.callbacks.onPlayerReady?.(message.playerId, message.ready);
+        break;
+
+      case 'player_team_changed':
+        this.callbacks.onPlayerTeamChanged?.(message.playerId, message.team);
         break;
 
       case 'game_starting':

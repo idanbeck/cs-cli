@@ -1,23 +1,25 @@
 import { Vector3 } from './math/Vector3.js';
 import { Matrix4 } from './math/Matrix4.js';
-import { Mesh, Triangle, Vertex } from './Mesh.js';
+import { Mesh, Triangle, Vertex, Material } from './Mesh.js';
 import { Framebuffer } from './Framebuffer.js';
 import { DepthBuffer } from './DepthBuffer.js';
 import { Color, getDepthShading, SHADE_CHARS } from '../utils/Colors.js';
 import { clamp, edgeFunction } from './math/MathUtils.js';
+import { Texture } from './Texture.js';
 
 export interface ClipVertex {
   position: [number, number, number, number]; // x, y, z, w in clip space
   worldPosition: Vector3;
   normal?: Vector3;
   color?: Color;
+  uv?: [number, number];  // Texture coordinates
 }
 
 export interface RasterTriangle {
   v0: ClipVertex;
   v1: ClipVertex;
   v2: ClipVertex;
-  material: { color: Color };
+  material: Material;
 }
 
 // MSAA sample patterns (offsets within pixel, in range [-0.5, 0.5])
@@ -61,11 +63,17 @@ export class Rasterizer {
   public enableLighting: boolean = true;
   public enableDepthShading: boolean = true;
   public maxDepth: number = 50;
-  public enableBackfaceCulling: boolean = true;
+  public enableBackfaceCulling: boolean = false;  // Off by default - BSP geometry needs this
+  public enableTextures: boolean = true;
+  public textureFilter: 'normal' | 'pixelated' | 'blockavg' = 'blockavg';  // blockavg looks best
+  public texturePixelSize: number = 4;  // Block size for pixelated/blockavg modes
+  public whiteTextureMode: boolean = false;  // Force white textures to see lighting/shading
+  public enableAmbientOcclusion: boolean = false;
+  public aoStrength: number = 0.8;  // How dark AO shadows get (0-1) - high for visibility
 
   // Near plane for clipping (in clip space, w = nearPlane)
   // Balance between allowing close objects and avoiding depth artifacts
-  private nearPlane: number = 0.05;
+  public nearPlane: number = 0.05;
 
   constructor(framebuffer: Framebuffer, depthBuffer: DepthBuffer) {
     this.framebuffer = framebuffer;
@@ -194,7 +202,10 @@ export class Rasterizer {
         : a.normal || b.normal,
       color: a.color && b.color
         ? Color.lerp(a.color, b.color, t)
-        : a.color || b.color
+        : a.color || b.color,
+      uv: a.uv && b.uv
+        ? [a.uv[0] + (b.uv[0] - a.uv[0]) * t, a.uv[1] + (b.uv[1] - a.uv[1]) * t]
+        : a.uv || b.uv
     };
   }
 
@@ -440,11 +451,51 @@ export class Rasterizer {
                   worldZ * worldZ
                 );
 
+                // White texture mode: use white as base to see lighting/shading clearly
+                let pixelColor = this.whiteTextureMode
+                  ? new Color(255, 255, 255).multiply(lightFactor)
+                  : baseColor.clone();
+
+                // Sample texture if available (with perspective-correct interpolation)
+                if (!this.whiteTextureMode && this.enableTextures && tri.material.texture && tv0.uv && tv1.uv && tv2.uv) {
+                  // Perspective-correct interpolation
+                  const invW0 = 1 / v0.w;
+                  const invW1 = 1 / v1.w;
+                  const invW2 = 1 / v2.w;
+
+                  // Interpolate 1/w
+                  const invW = sb0 * invW0 + sb1 * invW1 + sb2 * invW2;
+
+                  // Interpolate u/w and v/w
+                  const uOverW = sb0 * tv0.uv[0] * invW0 + sb1 * tv1.uv[0] * invW1 + sb2 * tv2.uv[0] * invW2;
+                  const vOverW = sb0 * tv0.uv[1] * invW0 + sb1 * tv1.uv[1] * invW1 + sb2 * tv2.uv[1] * invW2;
+
+                  // Recover perspective-correct UV
+                  const u = uOverW / invW;
+                  const v = vOverW / invW;
+
+                  // Apply texture scale if specified
+                  const scale = tri.material.textureScale || 1;
+
+                  // Sample texture with appropriate filter
+                  let texColor: Color;
+                  if (this.textureFilter === 'pixelated') {
+                    texColor = tri.material.texture.samplePixelated(u * scale, v * scale, this.texturePixelSize);
+                  } else if (this.textureFilter === 'blockavg') {
+                    texColor = tri.material.texture.sampleBlockAverage(u * scale, v * scale, this.texturePixelSize);
+                  } else {
+                    texColor = tri.material.texture.sample(u * scale, v * scale);
+                  }
+
+                  // Combine texture color with lighting
+                  pixelColor = texColor.multiply(lightFactor);
+                }
+
                 if (this.enableDepthShading) {
-                  const shading = getDepthShading(baseColor, distance, this.maxDepth);
+                  const shading = getDepthShading(pixelColor, distance, this.maxDepth);
                   sample.color.copy(shading.color);
                 } else {
-                  sample.color.copy(baseColor);
+                  sample.color.copy(pixelColor);
                 }
               }
             }
@@ -476,11 +527,50 @@ export class Rasterizer {
                 worldZ * worldZ
               );
 
-              let finalColor = baseColor;
+              // White texture mode: use white as base to see lighting/shading clearly
+              let finalColor = this.whiteTextureMode
+                ? new Color(255, 255, 255).multiply(lightFactor)
+                : baseColor.clone();
+
+              // Sample texture if available (with perspective-correct interpolation)
+              if (!this.whiteTextureMode && this.enableTextures && tri.material.texture && tv0.uv && tv1.uv && tv2.uv) {
+                // Perspective-correct interpolation
+                const invW0 = 1 / v0.w;
+                const invW1 = 1 / v1.w;
+                const invW2 = 1 / v2.w;
+
+                // Interpolate 1/w
+                const invW = b0 * invW0 + b1 * invW1 + b2 * invW2;
+
+                // Interpolate u/w and v/w
+                const uOverW = b0 * tv0.uv[0] * invW0 + b1 * tv1.uv[0] * invW1 + b2 * tv2.uv[0] * invW2;
+                const vOverW = b0 * tv0.uv[1] * invW0 + b1 * tv1.uv[1] * invW1 + b2 * tv2.uv[1] * invW2;
+
+                // Recover perspective-correct UV
+                const u = uOverW / invW;
+                const v = vOverW / invW;
+
+                // Apply texture scale if specified
+                const scale = tri.material.textureScale || 1;
+
+                // Sample texture with appropriate filter
+                let texColor: Color;
+                if (this.textureFilter === 'pixelated') {
+                  texColor = tri.material.texture.samplePixelated(u * scale, v * scale, this.texturePixelSize);
+                } else if (this.textureFilter === 'blockavg') {
+                  texColor = tri.material.texture.sampleBlockAverage(u * scale, v * scale, this.texturePixelSize);
+                } else {
+                  texColor = tri.material.texture.sample(u * scale, v * scale);
+                }
+
+                // Combine texture color with lighting
+                finalColor = texColor.multiply(lightFactor);
+              }
+
               let char = '█';
 
               if (this.enableDepthShading) {
-                const shading = getDepthShading(baseColor, distance, this.maxDepth);
+                const shading = getDepthShading(finalColor, distance, this.maxDepth);
                 finalColor = shading.color;
                 char = shading.char;
               }
@@ -526,7 +616,8 @@ export class Rasterizer {
         position: clipPos,
         worldPosition: worldPos,
         normal: worldNormal,
-        color: vertex.color
+        color: vertex.color,
+        uv: vertex.uv
       });
     }
 
@@ -551,5 +642,98 @@ export class Rasterizer {
   // Get the depth buffer for debugging
   getDepthBuffer(): DepthBuffer {
     return this.depthBuffer;
+  }
+
+  // Apply screen-space ambient occlusion post-process
+  // This darkens pixels near depth discontinuities (edges, corners, crevices)
+  applyAmbientOcclusion(): void {
+    if (!this.enableAmbientOcclusion) return;
+
+    // Use multiple radii for better coverage
+    const radii = [1, 2, 4];
+    const samplesPerRadius = 8;
+
+    // Store AO factors for each pixel first (avoid modifying while reading)
+    const aoFactors: number[][] = [];
+    for (let y = 0; y < this.height; y++) {
+      aoFactors[y] = [];
+      for (let x = 0; x < this.width; x++) {
+        aoFactors[y][x] = 1.0;
+      }
+    }
+
+    // Calculate AO for each pixel
+    for (let y = 0; y < this.height; y++) {
+      for (let x = 0; x < this.width; x++) {
+        const centerDepth = this.depthBuffer.get(x, y);
+        if (centerDepth >= 1.0) continue;  // Skip empty pixels (sky)
+
+        let totalOcclusion = 0;
+        let totalWeight = 0;
+
+        // Sample at multiple radii
+        for (const radius of radii) {
+          const weight = 1.0 / radius;  // Closer samples matter more
+
+          for (let i = 0; i < samplesPerRadius; i++) {
+            const angle = (i / samplesPerRadius) * Math.PI * 2;
+            const sampleX = Math.round(x + Math.cos(angle) * radius);
+            const sampleY = Math.round(y + Math.sin(angle) * radius);
+
+            if (sampleX < 0 || sampleX >= this.width || sampleY < 0 || sampleY >= this.height) {
+              continue;
+            }
+
+            const sampleDepth = this.depthBuffer.get(sampleX, sampleY);
+            totalWeight += weight;
+
+            // Detect depth discontinuities
+            // If sample is closer (smaller depth = closer to camera), it may occlude this pixel
+            const depthDiff = centerDepth - sampleDepth;
+
+            // Very low threshold to catch subtle depth changes
+            // Positive depthDiff = sample is closer (in front)
+            if (depthDiff > 0.0001) {
+              // The more pronounced the depth difference, the more occlusion
+              // Scale by 100 to make small depth differences visible
+              const occlusionContrib = Math.min(1.0, depthDiff * 100);
+              totalOcclusion += occlusionContrib * weight;
+            }
+
+            // Also detect when we're at an edge (sample is much farther/sky)
+            // This creates a subtle darkening at silhouette edges
+            if (sampleDepth >= 1.0 || (sampleDepth - centerDepth) > 0.1) {
+              // We're near an edge to the sky or a big depth jump
+              totalOcclusion += 0.3 * weight;
+            }
+          }
+        }
+
+        if (totalWeight > 0) {
+          // Normalize and apply strength
+          const normalizedOcclusion = totalOcclusion / totalWeight;
+          const aoFactor = 1.0 - normalizedOcclusion * this.aoStrength;
+          aoFactors[y][x] = Math.max(0.2, aoFactor);  // Don't go completely black
+        }
+      }
+    }
+
+    // Apply AO factors to framebuffer
+    for (let y = 0; y < this.height; y++) {
+      for (let x = 0; x < this.width; x++) {
+        const factor = aoFactors[y][x];
+        if (factor < 1.0) {
+          const pixel = this.framebuffer.getPixel(x, y);
+          if (pixel && pixel.bg) {
+            const darkened = new Color(
+              Math.round(pixel.bg.r * factor),
+              Math.round(pixel.bg.g * factor),
+              Math.round(pixel.bg.b * factor)
+            );
+            this.framebuffer.setPixel(x, y, pixel.char, darkened, darkened);
+          }
+        }
+      }
+    }
   }
 }

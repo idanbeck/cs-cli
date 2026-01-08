@@ -2,6 +2,7 @@
 // Displays available rooms and allows creating/joining games
 
 import { RoomInfo, RoomConfig, GameModeType, BotDifficulty } from '../shared/types/Protocol.js';
+import { MapRegistry } from '../maps/MapRegistry.js';
 
 export type ServerBrowserScreen = 'connecting' | 'room_list' | 'create_room' | 'joining' | 'error';
 
@@ -43,8 +44,11 @@ export class ServerBrowser {
     'Private',
   ];
 
-  // Available options
-  private maps = ['dm_arena'];
+  // Available options (maps loaded dynamically from registry)
+  private getMaps(): string[] {
+    MapRegistry.initialize();
+    return MapRegistry.getAvailableMaps().map(m => m.id);
+  }
   private modes: GameModeType[] = ['deathmatch', 'competitive'];
   private difficulties: BotDifficulty[] = ['easy', 'medium', 'hard'];
   private maxPlayerOptions = [2, 4, 6, 8, 10];
@@ -180,8 +184,10 @@ export class ServerBrowser {
 
     switch (field) {
       case 1: // Map
-        const mapIdx = this.maps.indexOf(config.map);
-        config.map = this.maps[(mapIdx + direction + this.maps.length) % this.maps.length];
+        const maps = this.getMaps();
+        const mapIdx = maps.indexOf(config.map);
+        const newMapIdx = (mapIdx + direction + maps.length) % maps.length;
+        config.map = maps[newMapIdx >= 0 && newMapIdx < maps.length ? newMapIdx : 0];
         break;
       case 2: // Mode
         const modeIdx = this.modes.indexOf(config.mode);
@@ -210,7 +216,10 @@ export class ServerBrowser {
     const config = this.state.createRoomConfig;
     switch (fieldIndex) {
       case 0: return config.name;
-      case 1: return config.map;
+      case 1:
+        // Show map name instead of id
+        const mapInfo = MapRegistry.getMap(config.map);
+        return mapInfo ? mapInfo.name : config.map;
       case 2: return config.mode === 'deathmatch' ? 'Deathmatch' : 'Competitive';
       case 3: return config.maxPlayers.toString();
       case 4: return config.botCount.toString();

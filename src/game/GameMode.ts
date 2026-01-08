@@ -6,7 +6,7 @@ import { Bot } from '../ai/Bot.js';
 import { TeamId, getTeamManager } from './Team.js';
 import { PlayerEconomy, DEFAULT_ECONOMY_CONFIG, EconomyConfig } from './Economy.js';
 
-export type GameModeType = 'deathmatch' | 'competitive';
+export type GameModeType = 'deathmatch' | 'competitive' | 'solo';
 export type GamePhase =
   | 'pre_match'     // Main menu/waiting
   | 'warmup'        // Pre-game warmup
@@ -76,6 +76,21 @@ export const DEFAULT_DEATHMATCH_CONFIG: GameModeConfig = {
   friendlyFire: true,
   economy: DEFAULT_ECONOMY_CONFIG,
   respawnDelay: 3000,         // 3 second respawn in DM warmup
+};
+
+// Solo mode - just walking around, no bots, no game mechanics
+export const DEFAULT_SOLO_CONFIG: GameModeConfig = {
+  type: 'solo',
+  roundsToWin: 0,             // No rounds
+  maxRounds: 0,
+  freezeTime: 0,              // No freeze
+  roundTime: 0,               // Unlimited
+  roundEndDelay: 0,
+  warmupTime: 0,              // No warmup
+  halftimeRound: 0,
+  friendlyFire: false,
+  economy: DEFAULT_ECONOMY_CONFIG,
+  respawnDelay: 0,
 };
 
 export interface RoundState {

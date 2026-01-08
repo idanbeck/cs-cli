@@ -40,6 +40,10 @@ export class PlayerEconomy {
     return this.money;
   }
 
+  setMoney(amount: number): void {
+    this.money = Math.max(0, Math.min(this.config.maxMoney, amount));
+  }
+
   getLossStreak(): number {
     return this.lossStreak;
   }

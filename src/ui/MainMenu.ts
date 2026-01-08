@@ -2,6 +2,7 @@
 // Handles main menu navigation, mode selection, map selection
 
 import { GameModeType } from '../game/GameMode.js';
+import { MapRegistry, MapInfo as RegistryMapInfo } from '../maps/MapRegistry.js';
 
 // Rendering mode types
 export type RenderMode = 'basic' | 'halfblock' | 'sixel';
@@ -23,15 +24,31 @@ export interface MainMenuState {
   selectedMap: string;
 }
 
-// Available maps
-export const AVAILABLE_MAPS: MapInfo[] = [
-  {
-    id: 'dm_arena',
-    name: 'Arena',
-    description: 'Classic arena for close-quarters combat',
-    supportedModes: ['deathmatch', 'competitive'],
-  },
-];
+// Get available maps from registry
+function getAvailableMapsFromRegistry(): MapInfo[] {
+  MapRegistry.initialize();
+  const registryMaps = MapRegistry.getAvailableMaps();
+
+  return registryMaps.map(m => {
+    // All maps support solo mode
+    const modes: GameModeType[] = ['solo'];
+    if (m.modes === 'both' || m.modes === 'deathmatch') {
+      modes.push('deathmatch');
+    }
+    if (m.modes === 'both' || m.modes === 'competitive') {
+      modes.push('competitive');
+    }
+    return {
+      id: m.id,
+      name: m.name,
+      description: m.description || `${m.name} (${m.type})`,
+      supportedModes: modes,
+    };
+  });
+}
+
+// Available maps (loaded from registry)
+export const AVAILABLE_MAPS: MapInfo[] = getAvailableMapsFromRegistry();
 
 export type InputStatus = {
   mode: 'native' | 'stdin';
@@ -50,6 +67,8 @@ export interface Settings {
 
 export class MainMenu {
   private state: MainMenuState;
+  private scrollOffset: number = 0;  // For scrolling long lists
+  private maxVisibleItems: number = 6;  // Updated by renderer based on screen size
   private inputStatus: InputStatus = {
     mode: 'stdin',
     working: false,
@@ -99,6 +118,7 @@ export class MainMenu {
     'Press any key to go back...',
   ];
   private modeMenuItems: { label: string; mode: GameModeType }[] = [
+    { label: 'Solo (Explore)', mode: 'solo' },
     { label: 'Deathmatch (FFA)', mode: 'deathmatch' },
     { label: 'Competitive (Team)', mode: 'competitive' },
   ];
@@ -116,8 +136,8 @@ export class MainMenu {
     this.state = {
       screen: 'main',
       selectedIndex: 0,
-      selectedMode: 'deathmatch',
-      selectedMap: 'dm_arena',
+      selectedMode: 'solo',  // Default to solo for easier testing
+      selectedMap: 'de_dust2',  // Default to dust2 if available
     };
   }
 
@@ -184,17 +204,75 @@ export class MainMenu {
     );
   }
 
+  // Set max visible items (called by renderer based on screen size)
+  setMaxVisibleItems(count: number): void {
+    this.maxVisibleItems = Math.max(3, count);
+    // Re-adjust scroll after changing visible count
+    this.adjustScrollForSelection();
+  }
+
   // Navigation
   moveUp(): void {
     const items = this.getCurrentItems();
     if (items.length === 0) return;
     this.state.selectedIndex = (this.state.selectedIndex - 1 + items.length) % items.length;
+    this.adjustScrollForSelection();
   }
 
   moveDown(): void {
     const items = this.getCurrentItems();
     if (items.length === 0) return;
     this.state.selectedIndex = (this.state.selectedIndex + 1) % items.length;
+    this.adjustScrollForSelection();
+  }
+
+  // Adjust scroll offset to keep selected item visible
+  private adjustScrollForSelection(): void {
+    const items = this.getCurrentItems();
+    const maxVisible = this.maxVisibleItems;
+
+    if (items.length <= maxVisible) {
+      this.scrollOffset = 0;
+      return;
+    }
+
+    // Keep selection visible within the window
+    if (this.state.selectedIndex < this.scrollOffset) {
+      this.scrollOffset = this.state.selectedIndex;
+    } else if (this.state.selectedIndex >= this.scrollOffset + maxVisible) {
+      this.scrollOffset = this.state.selectedIndex - maxVisible + 1;
+    }
+
+    // Clamp scroll offset
+    this.scrollOffset = Math.max(0, Math.min(this.scrollOffset, items.length - maxVisible));
+  }
+
+  // Get scroll info for rendering
+  getScrollInfo(): { offset: number; total: number; visible: number; hasMore: boolean; hasPrev: boolean } {
+    const items = this.getCurrentItems();
+    const maxVisible = this.maxVisibleItems;
+    const visible = Math.min(items.length, maxVisible);
+    return {
+      offset: this.scrollOffset,
+      total: items.length,
+      visible,
+      hasMore: this.scrollOffset + visible < items.length,
+      hasPrev: this.scrollOffset > 0,
+    };
+  }
+
+  // Get visible items for rendering (with scroll)
+  getVisibleItems(): { items: string[]; startIndex: number } {
+    const allItems = this.getCurrentItems();
+    const maxVisible = this.maxVisibleItems;
+    if (allItems.length <= maxVisible) {
+      return { items: allItems, startIndex: 0 };
+    }
+    const endIndex = Math.min(this.scrollOffset + maxVisible, allItems.length);
+    return {
+      items: allItems.slice(this.scrollOffset, endIndex),
+      startIndex: this.scrollOffset,
+    };
   }
 
   // Selection - returns true if game should start
@@ -219,16 +297,19 @@ export class MainMenu {
       case 'Play':
         this.state.screen = 'mode_select';
         this.state.selectedIndex = 0;
+        this.scrollOffset = 0;
         return { action: 'navigate' };
       case 'Multiplayer':
         return { action: 'multiplayer' };
       case 'Help':
         this.state.screen = 'help';
         this.state.selectedIndex = 0;
+        this.scrollOffset = 0;
         return { action: 'navigate' };
       case 'Settings':
         this.state.screen = 'settings';
         this.state.selectedIndex = 0;
+        this.scrollOffset = 0;
         return { action: 'navigate' };
       case 'Quit':
         return { action: 'quit' };
@@ -243,6 +324,7 @@ export class MainMenu {
       this.state.selectedMode = mode.mode;
       this.state.screen = 'map_select';
       this.state.selectedIndex = 0;
+      this.scrollOffset = 0;
     }
     return { action: 'navigate' };
   }
@@ -407,6 +489,7 @@ export class MainMenu {
 
   // Go back one screen
   back(): void {
+    this.scrollOffset = 0;  // Reset scroll when changing screens
     switch (this.state.screen) {
       case 'mode_select':
         this.state.screen = 'main';
@@ -431,6 +514,7 @@ export class MainMenu {
   reset(): void {
     this.state.screen = 'main';
     this.state.selectedIndex = 0;
+    this.scrollOffset = 0;
   }
 
   // Get title for current screen

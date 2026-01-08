@@ -1853,15 +1853,35 @@ export class Renderer {
       return;
     }
 
-    // Menu items
-    const items = this.mainMenu.getCurrentItems();
+    // Menu items with scroll support
     const selectedIndex = this.mainMenu.getSelectedIndex();
     const itemsStartY = titleY + 3;
     const isSettingsScreen = this.mainMenu.getCurrentScreen() === 'settings';
 
+    // Calculate max visible items based on available space and inform MainMenu
+    const availableHeight = this.height - itemsStartY - 10; // Leave room for description/hints
+    const maxVisible = Math.max(3, Math.floor(availableHeight / 2)); // Each item takes 2 lines
+    this.mainMenu.setMaxVisibleItems(maxVisible);
+
+    const { items, startIndex } = this.mainMenu.getVisibleItems();
+    const scrollInfo = this.mainMenu.getScrollInfo();
+
+    // Draw scroll indicator (up arrow) if there are items above
+    if (scrollInfo.hasPrev) {
+      const upArrow = '  ▲ more above';
+      this.framebuffer.drawText(
+        Math.floor((this.width - upArrow.length) / 2),
+        itemsStartY - 1,
+        upArrow,
+        descColor,
+        bgDark
+      );
+    }
+
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
-      const isSelected = i === selectedIndex;
+      const actualIndex = startIndex + i;
+      const isSelected = actualIndex === selectedIndex;
       const prefix = isSelected ? '> ' : '  ';
 
       // For settings screen, show value alongside item
@@ -1878,10 +1898,23 @@ export class Renderer {
       this.framebuffer.drawText(x, itemsStartY + i * 2, text, color, bgDark);
     }
 
+    // Draw scroll indicator (down arrow) if there are items below
+    const itemsEndY = itemsStartY + items.length * 2;
+    if (scrollInfo.hasMore) {
+      const downArrow = '  ▼ more below';
+      this.framebuffer.drawText(
+        Math.floor((this.width - downArrow.length) / 2),
+        itemsEndY,
+        downArrow,
+        descColor,
+        bgDark
+      );
+    }
+
     // Description for selected item
     const description = this.mainMenu.getSelectionDescription();
     if (description) {
-      const descY = itemsStartY + items.length * 2 + 2;
+      const descY = itemsEndY + (scrollInfo.hasMore ? 2 : 1);
       this.framebuffer.drawText(
         Math.floor((this.width - description.length) / 2),
         descY,
@@ -2159,6 +2192,17 @@ export class Renderer {
       const line = `${hostMark}${readyMark} ${p.name}`;
       const color = p.isReady ? readyColor : normalColor;
       this.framebuffer.drawText(specX, 7 + i, line, color, bgDark);
+    }
+
+    // Activity log (right side)
+    const activityLog = this.lobbyScreen.getActivityLog();
+    const logX = this.width - 40;
+    const logColor = new Color(180, 180, 220);
+    this.framebuffer.drawText(logX, 6, '[ ACTIVITY ]', descColor, bgDark);
+    for (let i = 0; i < activityLog.length && i < 8; i++) {
+      const msg = activityLog[activityLog.length - 1 - i];  // Most recent first
+      const truncated = msg.length > 35 ? msg.substring(0, 32) + '...' : msg;
+      this.framebuffer.drawText(logX, 7 + i, truncated, logColor, bgDark);
     }
 
     // Ready count
