@@ -7,6 +7,10 @@ import { MapRegistry, MapInfo as RegistryMapInfo } from '../maps/MapRegistry.js'
 // Rendering mode types
 export type RenderMode = 'basic' | 'halfblock' | 'sixel';
 export type MSAAMode = 'none' | '4x' | '16x';
+export type TextureFilterMode = 'normal' | 'pixelated' | 'blockavg';
+
+// Settings tab types
+export type SettingsTab = 'controls' | 'graphics' | 'audio';
 
 export type MenuScreen = 'main' | 'mode_select' | 'map_select' | 'settings' | 'help';
 
@@ -56,13 +60,91 @@ export type InputStatus = {
   message: string;
 };
 
+// Renderer backend types
+export type RendererBackend = 'native' | 'js';
+
 // Settings configuration
 export interface Settings {
+  // Controls
   mouseSensitivity: number;  // 0.001 to 0.01 (radians per pixel)
+
+  // Graphics
   renderMode: RenderMode;    // Basic, half-block, or sixel
   msaaMode: MSAAMode;        // None, 4x, or 16x anti-aliasing
+  textureFilter: TextureFilterMode; // Texture filtering mode
   sixelResolution: number;   // Sixel resolution divisor (1=full, 2=half, 4=quarter)
   targetFps: number;         // Frame rate cap (0 = uncapped, 30, 60)
+  fov: number;               // Field of view (70-120 degrees)
+  rendererBackend: RendererBackend; // Native SIMD or JavaScript renderer
+
+  // Audio/Voice
+  voiceEnabled: boolean;
+  voiceInputVolume: number;    // 0-100
+  voiceOutputVolume: number;   // 0-100
+  voiceInputDevice: string;    // Device ID or 'default'
+  voiceOutputDevice: string;   // Device ID or 'default'
+  voicePTTEnabled: boolean;    // true = push-to-talk, false = VAD
+  voicePTTKey: string;
+  voiceVADSensitivity: number; // 1-10
+  voiceMaxDistance: number;    // Game units
+  voiceSpatialEnabled: boolean;
+}
+
+// Settings persistence path
+import { homedir } from 'os';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { join } from 'path';
+
+const SETTINGS_DIR = join(homedir(), '.csterm');
+const SETTINGS_FILE = join(SETTINGS_DIR, 'settings.json');
+
+// Load settings from disk
+function loadSettingsFromDisk(): Partial<Settings> {
+  try {
+    if (existsSync(SETTINGS_FILE)) {
+      const data = readFileSync(SETTINGS_FILE, 'utf-8');
+      const parsed = JSON.parse(data);
+      // Validate and return only valid settings fields
+      const settings: Partial<Settings> = {};
+      // Controls
+      if (typeof parsed.mouseSensitivity === 'number') settings.mouseSensitivity = parsed.mouseSensitivity;
+      // Graphics
+      if (['basic', 'halfblock', 'sixel'].includes(parsed.renderMode)) settings.renderMode = parsed.renderMode;
+      if (['none', '4x', '16x'].includes(parsed.msaaMode)) settings.msaaMode = parsed.msaaMode;
+      if (['normal', 'pixelated', 'blockavg'].includes(parsed.textureFilter)) settings.textureFilter = parsed.textureFilter;
+      if (typeof parsed.sixelResolution === 'number') settings.sixelResolution = parsed.sixelResolution;
+      if (typeof parsed.targetFps === 'number') settings.targetFps = parsed.targetFps;
+      if (typeof parsed.fov === 'number') settings.fov = parsed.fov;
+      if (['native', 'js'].includes(parsed.rendererBackend)) settings.rendererBackend = parsed.rendererBackend;
+      // Audio/Voice
+      if (typeof parsed.voiceEnabled === 'boolean') settings.voiceEnabled = parsed.voiceEnabled;
+      if (typeof parsed.voiceInputVolume === 'number') settings.voiceInputVolume = parsed.voiceInputVolume;
+      if (typeof parsed.voiceOutputVolume === 'number') settings.voiceOutputVolume = parsed.voiceOutputVolume;
+      if (typeof parsed.voiceInputDevice === 'string') settings.voiceInputDevice = parsed.voiceInputDevice;
+      if (typeof parsed.voiceOutputDevice === 'string') settings.voiceOutputDevice = parsed.voiceOutputDevice;
+      if (typeof parsed.voicePTTEnabled === 'boolean') settings.voicePTTEnabled = parsed.voicePTTEnabled;
+      if (typeof parsed.voicePTTKey === 'string') settings.voicePTTKey = parsed.voicePTTKey;
+      if (typeof parsed.voiceVADSensitivity === 'number') settings.voiceVADSensitivity = parsed.voiceVADSensitivity;
+      if (typeof parsed.voiceMaxDistance === 'number') settings.voiceMaxDistance = parsed.voiceMaxDistance;
+      if (typeof parsed.voiceSpatialEnabled === 'boolean') settings.voiceSpatialEnabled = parsed.voiceSpatialEnabled;
+      return settings;
+    }
+  } catch {
+    // Ignore errors, use defaults
+  }
+  return {};
+}
+
+// Save settings to disk
+function saveSettingsToDisk(settings: Settings): void {
+  try {
+    if (!existsSync(SETTINGS_DIR)) {
+      mkdirSync(SETTINGS_DIR, { recursive: true });
+    }
+    writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2), 'utf-8');
+  } catch {
+    // Ignore errors silently
+  }
 }
 
 export class MainMenu {
@@ -75,19 +157,42 @@ export class MainMenu {
     message: 'Checking input...',
   };
 
-  // Settings
+  // Default settings (halfblock + 4x MSAA as per plan)
   private settings: Settings = {
+    // Controls
     mouseSensitivity: 0.004,  // Default sensitivity
-    renderMode: 'basic',      // Default render mode
-    msaaMode: 'none',         // Default MSAA
+    // Graphics
+    renderMode: 'halfblock',  // Default: half-block (2x res) - was 'basic'
+    msaaMode: '4x',           // Default: 4x MSAA - was 'none'
+    textureFilter: 'blockavg', // Default: block averaging for smooth retro look
     sixelResolution: 8,       // Default sixel resolution (eighth res for performance)
     targetFps: 60,            // Default frame rate cap
+    fov: 90,                  // Default field of view
+    rendererBackend: 'native', // Default: Native SIMD renderer
+    // Audio/Voice
+    voiceEnabled: true,
+    voiceInputVolume: 100,
+    voiceOutputVolume: 100,
+    voiceInputDevice: 'default',
+    voiceOutputDevice: 'default',
+    voicePTTEnabled: false,   // Default: VAD mode
+    voicePTTKey: 'v',
+    voiceVADSensitivity: 5,
+    voiceMaxDistance: 50,
+    voiceSpatialEnabled: true,
   };
   private onSettingsChange?: (settings: Settings) => void;
+
+  // Current settings tab
+  private currentSettingsTab: SettingsTab = 'controls';
 
   // Render mode options for cycling (sixel kept in type for debug mode but hidden from UI)
   private renderModes: RenderMode[] = ['basic', 'halfblock'];
   private msaaModes: MSAAMode[] = ['none', '4x', '16x'];
+  private textureFilterModes: TextureFilterMode[] = ['normal', 'pixelated', 'blockavg'];
+
+  // FOV options
+  private fovOptions = [70, 80, 90, 100, 110, 120];
 
   // Menu items for each screen
   private mainMenuItems = ['Play', 'Multiplayer', 'Help', 'Settings', 'Quit'];
@@ -123,8 +228,22 @@ export class MainMenu {
     { label: 'Competitive (Team)', mode: 'competitive' },
   ];
 
-  // Settings menu items (Sixel Quality hidden, available in debug mode)
-  private settingsItems = ['Mouse Sensitivity', 'Render Mode', 'Anti-Aliasing', 'Frame Rate Cap', 'Back'];
+  // Settings menu items organized by tab
+  private settingsTabs: SettingsTab[] = ['controls', 'graphics', 'audio'];
+  private settingsItemsByTab: Record<SettingsTab, string[]> = {
+    controls: ['Mouse Sensitivity', 'Back'],
+    graphics: ['Render Mode', 'Anti-Aliasing', 'Texture Filter', 'Renderer Backend', 'Frame Rate Cap', 'Field of View', 'Back'],
+    audio: ['Voice Enabled', 'Input Volume', 'Output Volume', 'Input Device', 'Output Device', 'Voice Mode', 'VAD Sensitivity', 'Max Distance', 'Spatial Audio', 'Back'],
+  };
+
+  // Available audio devices (populated dynamically)
+  private inputDevices: { id: string; name: string }[] = [{ id: 'default', name: 'Default' }];
+  private outputDevices: { id: string; name: string }[] = [{ id: 'default', name: 'Default' }];
+  // Flat list for backward compatibility (will be replaced by tab-specific items)
+  private settingsItems = ['Mouse Sensitivity', 'Render Mode', 'Anti-Aliasing', 'Texture Filter', 'Renderer Backend', 'Frame Rate Cap', 'Field of View', 'Back'];
+
+  // Renderer backend options
+  private rendererBackends: RendererBackend[] = ['js', 'native'];
 
   // Sixel resolution options (lower divisor = higher quality, slower)
   private sixelResolutions = [1, 2, 4, 8, 16];
@@ -139,6 +258,9 @@ export class MainMenu {
       selectedMode: 'solo',  // Default to solo for easier testing
       selectedMap: 'de_dust2',  // Default to dust2 if available
     };
+    // Load persisted settings from disk
+    const savedSettings = loadSettingsFromDisk();
+    this.settings = { ...this.settings, ...savedSettings };
   }
 
   getState(): MainMenuState {
@@ -179,12 +301,42 @@ export class MainMenu {
       case 'map_select':
         return this.getAvailableMaps().map(m => m.name);
       case 'settings':
-        return this.settingsItems;
+        return this.settingsItemsByTab[this.currentSettingsTab];
       case 'help':
         return []; // Help screen has no selectable items
       default:
         return [];
     }
+  }
+
+  // Get current settings tab
+  getCurrentSettingsTab(): SettingsTab {
+    return this.currentSettingsTab;
+  }
+
+  // Get all settings tabs for rendering
+  getSettingsTabs(): SettingsTab[] {
+    return this.settingsTabs;
+  }
+
+  // Get tab display name
+  getTabDisplayName(tab: SettingsTab): string {
+    const names: Record<SettingsTab, string> = {
+      controls: 'Controls',
+      graphics: 'Graphics',
+      audio: 'Audio',
+    };
+    return names[tab];
+  }
+
+  // Switch to next/prev settings tab
+  switchSettingsTab(direction: 'left' | 'right'): void {
+    const currentIndex = this.settingsTabs.indexOf(this.currentSettingsTab);
+    const delta = direction === 'right' ? 1 : -1;
+    const newIndex = (currentIndex + delta + this.settingsTabs.length) % this.settingsTabs.length;
+    this.currentSettingsTab = this.settingsTabs[newIndex];
+    this.state.selectedIndex = 0;
+    this.scrollOffset = 0;
   }
 
   // Get help text lines
@@ -344,10 +496,12 @@ export class MainMenu {
   }
 
   private handleSettingsSelect(): { action: 'start_game' | 'quit' | 'navigate' | 'back' } {
-    const item = this.settingsItems[this.state.selectedIndex];
+    const items = this.settingsItemsByTab[this.currentSettingsTab];
+    const item = items[this.state.selectedIndex];
     if (item === 'Back') {
       this.state.screen = 'main';
       this.state.selectedIndex = 3; // Settings index in main menu
+      this.currentSettingsTab = 'controls'; // Reset to first tab
       return { action: 'back' };
     }
     // Other settings items are adjusted with left/right, not selected
@@ -376,30 +530,71 @@ export class MainMenu {
   setMouseSensitivity(value: number): void {
     this.settings.mouseSensitivity = Math.max(0.001, Math.min(0.01, value));
     this.onSettingsChange?.(this.settings);
+    saveSettingsToDisk(this.settings);
   }
 
   // Adjust current setting (for left/right keys)
   adjustCurrentSetting(direction: 'left' | 'right'): void {
     if (this.state.screen !== 'settings') return;
 
-    const item = this.settingsItems[this.state.selectedIndex];
+    const items = this.settingsItemsByTab[this.currentSettingsTab];
+    const item = items[this.state.selectedIndex];
     const delta = direction === 'right' ? 1 : -1;
 
     switch (item) {
+      // Controls
       case 'Mouse Sensitivity':
         this.setMouseSensitivity(this.settings.mouseSensitivity + delta * 0.001);
         break;
+      // Graphics
       case 'Render Mode':
         this.cycleRenderMode(delta);
         break;
       case 'Anti-Aliasing':
         this.cycleMSAAMode(delta);
         break;
+      case 'Texture Filter':
+        this.cycleTextureFilter(delta);
+        break;
       case 'Sixel Quality':
         this.cycleSixelResolution(delta);
         break;
       case 'Frame Rate Cap':
         this.cycleFps(delta);
+        break;
+      case 'Field of View':
+        this.cycleFov(delta);
+        break;
+      case 'Renderer Backend':
+        this.cycleRendererBackend(delta);
+        break;
+      // Audio
+      case 'Voice Enabled':
+        this.cycleVoiceEnabled();
+        break;
+      case 'Input Volume':
+        this.adjustVoiceInputVolume(delta);
+        break;
+      case 'Output Volume':
+        this.adjustVoiceOutputVolume(delta);
+        break;
+      case 'Voice Mode':
+        this.cycleVoiceMode();
+        break;
+      case 'VAD Sensitivity':
+        this.adjustVADSensitivity(delta);
+        break;
+      case 'Max Distance':
+        this.adjustVoiceMaxDistance(delta);
+        break;
+      case 'Spatial Audio':
+        this.cycleVoiceSpatial();
+        break;
+      case 'Input Device':
+        this.cycleInputDevice(delta);
+        break;
+      case 'Output Device':
+        this.cycleOutputDevice(delta);
         break;
     }
   }
@@ -409,6 +604,7 @@ export class MainMenu {
     const newIndex = (currentIndex + delta + this.renderModes.length) % this.renderModes.length;
     this.settings.renderMode = this.renderModes[newIndex];
     this.onSettingsChange?.(this.settings);
+    saveSettingsToDisk(this.settings);
   }
 
   private cycleMSAAMode(delta: number): void {
@@ -416,6 +612,15 @@ export class MainMenu {
     const newIndex = (currentIndex + delta + this.msaaModes.length) % this.msaaModes.length;
     this.settings.msaaMode = this.msaaModes[newIndex];
     this.onSettingsChange?.(this.settings);
+    saveSettingsToDisk(this.settings);
+  }
+
+  private cycleTextureFilter(delta: number): void {
+    const currentIndex = this.textureFilterModes.indexOf(this.settings.textureFilter);
+    const newIndex = (currentIndex + delta + this.textureFilterModes.length) % this.textureFilterModes.length;
+    this.settings.textureFilter = this.textureFilterModes[newIndex];
+    this.onSettingsChange?.(this.settings);
+    saveSettingsToDisk(this.settings);
   }
 
   private cycleSixelResolution(delta: number): void {
@@ -424,6 +629,7 @@ export class MainMenu {
     const newIndex = (idx + delta + this.sixelResolutions.length) % this.sixelResolutions.length;
     this.settings.sixelResolution = this.sixelResolutions[newIndex];
     this.onSettingsChange?.(this.settings);
+    saveSettingsToDisk(this.settings);
   }
 
   getSixelResolution(): number {
@@ -436,6 +642,130 @@ export class MainMenu {
     const newIndex = (idx + delta + this.fpsOptions.length) % this.fpsOptions.length;
     this.settings.targetFps = this.fpsOptions[newIndex];
     this.onSettingsChange?.(this.settings);
+    saveSettingsToDisk(this.settings);
+  }
+
+  private cycleFov(delta: number): void {
+    const currentIndex = this.fovOptions.indexOf(this.settings.fov);
+    let idx = currentIndex >= 0 ? currentIndex : 2; // Default to 90 index
+    const newIndex = (idx + delta + this.fovOptions.length) % this.fovOptions.length;
+    this.settings.fov = this.fovOptions[newIndex];
+    this.onSettingsChange?.(this.settings);
+    saveSettingsToDisk(this.settings);
+  }
+
+  private cycleRendererBackend(delta: number): void {
+    const currentIndex = this.rendererBackends.indexOf(this.settings.rendererBackend);
+    const newIndex = (currentIndex + delta + this.rendererBackends.length) % this.rendererBackends.length;
+    this.settings.rendererBackend = this.rendererBackends[newIndex];
+    this.onSettingsChange?.(this.settings);
+    saveSettingsToDisk(this.settings);
+  }
+
+  // Voice/Audio settings methods
+  private cycleVoiceEnabled(): void {
+    this.settings.voiceEnabled = !this.settings.voiceEnabled;
+    this.onSettingsChange?.(this.settings);
+    saveSettingsToDisk(this.settings);
+  }
+
+  private adjustVoiceInputVolume(delta: number): void {
+    this.settings.voiceInputVolume = Math.max(0, Math.min(100, this.settings.voiceInputVolume + delta * 10));
+    this.onSettingsChange?.(this.settings);
+    saveSettingsToDisk(this.settings);
+  }
+
+  private adjustVoiceOutputVolume(delta: number): void {
+    this.settings.voiceOutputVolume = Math.max(0, Math.min(100, this.settings.voiceOutputVolume + delta * 10));
+    this.onSettingsChange?.(this.settings);
+    saveSettingsToDisk(this.settings);
+  }
+
+  private cycleVoiceMode(): void {
+    this.settings.voicePTTEnabled = !this.settings.voicePTTEnabled;
+    this.onSettingsChange?.(this.settings);
+    saveSettingsToDisk(this.settings);
+  }
+
+  private adjustVADSensitivity(delta: number): void {
+    this.settings.voiceVADSensitivity = Math.max(1, Math.min(10, this.settings.voiceVADSensitivity + delta));
+    this.onSettingsChange?.(this.settings);
+    saveSettingsToDisk(this.settings);
+  }
+
+  private adjustVoiceMaxDistance(delta: number): void {
+    this.settings.voiceMaxDistance = Math.max(10, Math.min(200, this.settings.voiceMaxDistance + delta * 10));
+    this.onSettingsChange?.(this.settings);
+    saveSettingsToDisk(this.settings);
+  }
+
+  private cycleVoiceSpatial(): void {
+    this.settings.voiceSpatialEnabled = !this.settings.voiceSpatialEnabled;
+    this.onSettingsChange?.(this.settings);
+    saveSettingsToDisk(this.settings);
+  }
+
+  private cycleInputDevice(delta: number): void {
+    if (this.inputDevices.length === 0) return;
+    const currentIndex = this.inputDevices.findIndex(d => d.id === this.settings.voiceInputDevice);
+    const idx = currentIndex >= 0 ? currentIndex : 0;
+    const newIndex = (idx + delta + this.inputDevices.length) % this.inputDevices.length;
+    this.settings.voiceInputDevice = this.inputDevices[newIndex].id;
+    this.onSettingsChange?.(this.settings);
+    saveSettingsToDisk(this.settings);
+  }
+
+  private cycleOutputDevice(delta: number): void {
+    if (this.outputDevices.length === 0) return;
+    const currentIndex = this.outputDevices.findIndex(d => d.id === this.settings.voiceOutputDevice);
+    const idx = currentIndex >= 0 ? currentIndex : 0;
+    const newIndex = (idx + delta + this.outputDevices.length) % this.outputDevices.length;
+    this.settings.voiceOutputDevice = this.outputDevices[newIndex].id;
+    this.onSettingsChange?.(this.settings);
+    saveSettingsToDisk(this.settings);
+  }
+
+  // Set available audio devices (called from VoiceManager)
+  setAudioDevices(input: { id: string; name: string }[], output: { id: string; name: string }[]): void {
+    this.inputDevices = input.length > 0 ? input : [{ id: 'default', name: 'Default' }];
+    this.outputDevices = output.length > 0 ? output : [{ id: 'default', name: 'Default' }];
+  }
+
+  // Voice settings getters
+  getVoiceEnabled(): boolean {
+    return this.settings.voiceEnabled;
+  }
+
+  getVoiceInputVolume(): number {
+    return this.settings.voiceInputVolume;
+  }
+
+  getVoiceOutputVolume(): number {
+    return this.settings.voiceOutputVolume;
+  }
+
+  getVoicePTTEnabled(): boolean {
+    return this.settings.voicePTTEnabled;
+  }
+
+  getVoicePTTKey(): string {
+    return this.settings.voicePTTKey;
+  }
+
+  getVoiceVADSensitivity(): number {
+    return this.settings.voiceVADSensitivity;
+  }
+
+  getVoiceMaxDistance(): number {
+    return this.settings.voiceMaxDistance;
+  }
+
+  getVoiceSpatialEnabled(): boolean {
+    return this.settings.voiceSpatialEnabled;
+  }
+
+  getFov(): number {
+    return this.settings.fov;
   }
 
   getTargetFps(): number {
@@ -471,6 +801,13 @@ export class MainMenu {
           '16x': '16x MSAA',
         };
         return `< ${msaaNames[this.settings.msaaMode]} >`;
+      case 'Texture Filter':
+        const filterNames: Record<TextureFilterMode, string> = {
+          'normal': 'Normal',
+          'pixelated': 'Pixelated',
+          'blockavg': 'Block Avg',
+        };
+        return `< ${filterNames[this.settings.textureFilter]} >`;
       case 'Sixel Quality':
         // Show resolution with quality indicator (lower divisor = higher quality)
         const res = this.settings.sixelResolution;
@@ -482,6 +819,46 @@ export class MainMenu {
       case 'Frame Rate Cap':
         const fps = this.settings.targetFps;
         return `< ${fps === 0 ? 'Uncapped' : fps + ' FPS'} >`;
+      case 'Field of View':
+        return `< ${this.settings.fov}° >`;
+      case 'Renderer Backend':
+        const backendNames: Record<RendererBackend, string> = {
+          'js': 'JavaScript',
+          'native': 'Native SIMD',
+        };
+        return `< ${backendNames[this.settings.rendererBackend]} >`;
+      // Audio settings
+      case 'Voice Enabled':
+        return `< ${this.settings.voiceEnabled ? 'On' : 'Off'} >`;
+      case 'Input Volume':
+        const inVol = Math.round(this.settings.voiceInputVolume / 10);
+        return `${'█'.repeat(inVol)}${'░'.repeat(10 - inVol)} ${this.settings.voiceInputVolume}%`;
+      case 'Output Volume':
+        const outVol = Math.round(this.settings.voiceOutputVolume / 10);
+        return `${'█'.repeat(outVol)}${'░'.repeat(10 - outVol)} ${this.settings.voiceOutputVolume}%`;
+      case 'Voice Mode':
+        return `< ${this.settings.voicePTTEnabled ? 'Push-to-Talk' : 'Voice Activity'} >`;
+      case 'VAD Sensitivity':
+        const vadSens = this.settings.voiceVADSensitivity;
+        return `${'█'.repeat(vadSens)}${'░'.repeat(10 - vadSens)} ${vadSens}`;
+      case 'Max Distance':
+        return `< ${this.settings.voiceMaxDistance} units >`;
+      case 'Spatial Audio':
+        return `< ${this.settings.voiceSpatialEnabled ? 'On' : 'Off'} >`;
+      case 'Input Device': {
+        const inputDevice = this.inputDevices.find(d => d.id === this.settings.voiceInputDevice);
+        const inputName = inputDevice?.name || this.settings.voiceInputDevice;
+        // Truncate long names
+        const truncatedIn = inputName.length > 20 ? inputName.slice(0, 18) + '..' : inputName;
+        return `< ${truncatedIn} >`;
+      }
+      case 'Output Device': {
+        const outputDevice = this.outputDevices.find(d => d.id === this.settings.voiceOutputDevice);
+        const outputName = outputDevice?.name || this.settings.voiceOutputDevice;
+        // Truncate long names
+        const truncatedOut = outputName.length > 20 ? outputName.slice(0, 18) + '..' : outputName;
+        return `< ${truncatedOut} >`;
+      }
       default:
         return '';
     }
@@ -501,11 +878,12 @@ export class MainMenu {
         break;
       case 'help':
         this.state.screen = 'main';
-        this.state.selectedIndex = 1; // Help item
+        this.state.selectedIndex = 2; // Help item
         break;
       case 'settings':
         this.state.screen = 'main';
-        this.state.selectedIndex = 2; // Settings item
+        this.state.selectedIndex = 3; // Settings item
+        this.currentSettingsTab = 'controls'; // Reset to first tab
         break;
     }
   }
@@ -604,6 +982,24 @@ export class MainMenu {
       case 'H':
         if (this.state.screen === 'main') {
           this.state.screen = 'help';
+          return { action: 'navigate' };
+        }
+        return { action: 'none' };
+      // Tab switching in settings (Q/E or Tab/Shift+Tab)
+      case 'q':
+      case 'Q':
+      case 'pageup':
+        if (this.state.screen === 'settings') {
+          this.switchSettingsTab('left');
+          return { action: 'navigate' };
+        }
+        return { action: 'none' };
+      case 'e':
+      case 'E':
+      case 'pagedown':
+      case 'tab':
+        if (this.state.screen === 'settings') {
+          this.switchSettingsTab('right');
           return { action: 'navigate' };
         }
         return { action: 'none' };

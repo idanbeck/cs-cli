@@ -3,6 +3,11 @@ node_modules/
 
 # Build output
 dist/
+build/
+
+# Native addon build artifacts
+native/build/
+*.node
 
 # IDE
 .idea/
@@ -32,3 +37,6 @@ temp/
 
 # Debug output
 debug_frame_*
+
+# Claude Code settings (user-specific)
+.claude/

@@ -15,7 +15,9 @@
     "play": "npx tsx src/index.tsx 2>/dev/null",
     "dev": "bun run src/index.tsx 2>/dev/null",
     "dev:tsx": "tsx src/index.tsx 2>/dev/null",
-    "build": "tsc",
+    "build": "swc src -d dist --strip-leading-paths",
+    "build:tsc": "tsc",
+    "typecheck": "tsc --noEmit",
     "build:native": "cd native && node-gyp rebuild",
     "postinstall": "node-gyp rebuild --directory=native || echo 'Native keyboard module build failed (optional)'",
     "start": "node dist/index.js 2>/dev/null"
@@ -38,12 +40,15 @@
   },
   "dependencies": {
     "ink": "^5.0.1",
+    "naudiodon2": "^2.5.0",
     "node-addon-api": "^8.5.0",
     "react": "^18.3.1",
     "robotjs": "^0.6.0",
     "speaker": "^0.5.5"
   },
   "devDependencies": {
+    "@swc/cli": "^0.7.9",
+    "@swc/core": "^1.15.8",
     "@types/bun": "latest",
     "@types/node": "^22.10.2",
     "@types/react": "^18.3.12",

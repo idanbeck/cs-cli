@@ -1,7 +1,8 @@
 // WebSocket client for CS-CLI multiplayer
 // Handles connection to game server, lobby operations, and in-game networking
 
-import WebSocket, { CloseEvent, ErrorEvent, MessageEvent } from 'ws';
+import WebSocket, { CloseEvent, ErrorEvent, MessageEvent, RawData } from 'ws';
+import { isVoiceFrame } from '../voice/types.js';
 import {
   ClientMessage,
   ServerMessage,
@@ -69,6 +70,9 @@ export interface GameClientCallbacks {
 
   // Input acknowledgement (for client-side prediction reconciliation)
   onInputAck?: (sequence: number, position: Vec3) => void;
+
+  // Voice (binary data)
+  onVoiceData?: (data: Uint8Array) => void;
 }
 
 export class GameClient {
@@ -129,7 +133,7 @@ export class GameClient {
         };
 
         this.socket.onmessage = (event: MessageEvent) => {
-          this.handleMessage(event.data.toString());
+          this.handleRawMessage(event.data);
         };
 
       } catch (error: any) {
@@ -296,6 +300,46 @@ export class GameClient {
     if (this.socket && this.socket.readyState === WebSocket.OPEN) {
       this.socket.send(JSON.stringify(message));
     }
+  }
+
+  /**
+   * Send binary data (for voice frames)
+   */
+  sendBinary(data: Uint8Array): void {
+    if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+      this.socket.send(data);
+    }
+  }
+
+  /**
+   * Handle raw message data (binary or text)
+   */
+  private handleRawMessage(data: RawData): void {
+    // Check if it's binary data
+    if (data instanceof ArrayBuffer) {
+      const uint8 = new Uint8Array(data);
+      if (isVoiceFrame(uint8)) {
+        this.callbacks.onVoiceData?.(uint8);
+        return;
+      }
+    } else if (Buffer.isBuffer(data)) {
+      if (data.length > 0 && data[0] === 0x01) {
+        const uint8 = new Uint8Array(data.buffer, data.byteOffset, data.length);
+        this.callbacks.onVoiceData?.(uint8);
+        return;
+      }
+    } else if (Array.isArray(data)) {
+      // ws sometimes sends array of buffers
+      const combined = Buffer.concat(data);
+      if (combined.length > 0 && combined[0] === 0x01) {
+        const uint8 = new Uint8Array(combined.buffer, combined.byteOffset, combined.length);
+        this.callbacks.onVoiceData?.(uint8);
+        return;
+      }
+    }
+
+    // Handle as text JSON message
+    this.handleMessage(data.toString());
   }
 
   private handleMessage(data: string): void {

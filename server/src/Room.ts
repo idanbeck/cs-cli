@@ -23,6 +23,7 @@ import {
   DEFAULT_ECONOMY_CONFIG,
 } from './types.js';
 import { GameRunner } from './GameRunner.js';
+import { VoiceRelay, getVoiceRelay, removeVoiceRelay, isVoiceFrame } from './VoiceRelay.js';
 
 // Default map data for dm_arena
 const DEFAULT_MAP: MapData = {
@@ -95,6 +96,9 @@ export class Room {
   // Team assignments
   private teamAssignments: Map<string, TeamId> = new Map();
 
+  // Voice relay
+  private voiceRelay: VoiceRelay;
+
   constructor(
     id: string,
     config: RoomConfig,
@@ -107,6 +111,7 @@ export class Room {
     this.serverConfig = serverConfig;
     this.lastActivity = Date.now();
     this.mapData = DEFAULT_MAP;
+    this.voiceRelay = getVoiceRelay(id);
   }
 
   // ============ Player Management ============
@@ -313,6 +318,16 @@ export class Room {
       this.gameRunner.stop();
       this.gameRunner = null;
     }
+    // Clear voice relay
+    this.voiceRelay.clear();
+  }
+
+  /**
+   * Full cleanup when room is destroyed
+   */
+  destroy(): void {
+    this.stop();
+    removeVoiceRelay(this.id);
   }
 
   // ============ Message Handling ============
@@ -426,6 +441,31 @@ export class Room {
     } else {
       this.broadcast(chatMessage);
     }
+  }
+
+  // ============ Voice Relay ============
+
+  /**
+   * Handle binary data (voice frames)
+   * Returns true if it was a voice frame
+   */
+  handleBinaryData(clientId: string, data: Buffer | ArrayBuffer | Uint8Array): boolean {
+    let uint8Data: Uint8Array;
+    if (data instanceof ArrayBuffer) {
+      uint8Data = new Uint8Array(data);
+    } else if (Buffer.isBuffer(data)) {
+      uint8Data = new Uint8Array(data.buffer, data.byteOffset, data.length);
+    } else {
+      uint8Data = data;
+    }
+
+    if (!isVoiceFrame(uint8Data)) {
+      return false;
+    }
+
+    this.lastActivity = Date.now();
+    this.voiceRelay.relayVoiceFrame(uint8Data, clientId, this.clients, this.teamAssignments);
+    return true;
   }
 
   // ============ Communication ============

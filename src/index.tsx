@@ -48,6 +48,9 @@ import { getSoundEngine, playSound, playSoundAt, SoundType } from './audio/Sound
 import { getGameConsole, consoleLog, consoleWarn, consoleError, consoleDebug } from './ui/Console.js';
 import { getMainMenu, MainMenu, RenderMode, MSAAMode } from './ui/MainMenu.js';
 import { getBuyMenu, BuyMenu } from './ui/BuyMenu.js';
+import { VoiceManager } from './voice/VoiceManager.js';
+import { VoiceSettings } from './voice/types.js';
+import { initializeMicCapture, getMicCapture } from './voice/MicCapture.js';
 
 // CLI options interface
 interface CLIOptions {
@@ -446,6 +449,12 @@ async function runDebugMode(initialRenderMode: RenderMode, initialMsaaMode: MSAA
       const preset = presets[currentIdx];
       renderer.setCellPixelSize(preset.w, preset.h);
       debugLog(`CELL SIZE: ${preset.name} -> target ${renderer.getSixelInfo().targetPixels}`);
+    } else if (key === 'n' || key === 'N') { // Toggle native SIMD renderer
+      const wasEnabled = renderer.isUsingNativeRenderer();
+      renderer.setUseNativeRenderer(!wasEnabled);
+      const nowEnabled = renderer.isUsingNativeRenderer();
+      const simdStatus = renderer.hasNativeSIMD() ? 'SIMD' : 'scalar';
+      debugLog(`NATIVE RENDERER: ${nowEnabled ? 'ON' : 'OFF'} (${simdStatus})`);
     }
   });
 
@@ -504,25 +513,26 @@ async function runDebugMode(initialRenderMode: RenderMode, initialMsaaMode: MSAA
     }
 
     // Draw controls overlay (after render, directly to stdout)
+    // Skip text overlay in sixel mode - ANSI cursor positioning conflicts with sixel graphics
     const currentRenderMode = renderModes[renderModeIndex];
-    const currentMsaaMode = msaaModes[msaaModeIndex];
-    const fbW = renderer.getWidth();
-    const fbH = renderer.getHeight();
-    const camAspect = camera.aspect.toFixed(2);
+    if (currentRenderMode !== 'sixel') {
+      const currentMsaaMode = msaaModes[msaaModeIndex];
+      const fbW = renderer.getWidth();
+      const fbH = renderer.getHeight();
+      const camAspect = camera.aspect.toFixed(2);
 
-    // Sixel-specific info
-    let sixelInfo = '';
-    if (currentRenderMode === 'sixel') {
-      const si = renderer.getSixelInfo();
-      sixelInfo = ` | Res:1/${si.resolution} Cell:${si.cellSize} Target:${si.targetPixels}`;
+      // Native renderer status
+      const nativeStatus = renderer.isUsingNativeRenderer()
+        ? (renderer.hasNativeSIMD() ? '\x1b[92mSIMD\x1b[97m' : '\x1b[93mNATIVE\x1b[97m')
+        : '\x1b[90mJS\x1b[97m';
+
+      const info = [
+        `\x1b[1;1H\x1b[97m\x1b[40m ${currentRenderMode} ${currentMsaaMode} [${nativeStatus}] | FB:${fbW}×${fbH} | A:${camAspect} | Z:${cameraDistance.toFixed(1)} | ${currentFps.toFixed(0)} FPS \x1b[K`,
+        `\x1b[2;1H ↑↓←→:Rot  []:Roll  +/-:Zoom  0:Stop  Space:Reset  R:Render  M:MSAA  N:Native \x1b[K`,
+        `\x1b[3;1H </>:SixelRes  C:CellSize  D:DetectSize  Q:Quit \x1b[0m\x1b[K`,
+      ];
+      process.stdout.write(info.join(''));
     }
-
-    const info = [
-      `\x1b[1;1H\x1b[97m\x1b[40m ${currentRenderMode} ${currentMsaaMode} | FB:${fbW}×${fbH} | A:${camAspect} | Z:${cameraDistance.toFixed(1)} | ${currentFps.toFixed(0)} FPS${sixelInfo} \x1b[K`,
-      `\x1b[2;1H ↑↓←→:Rot  []:Roll  +/-:Zoom  0:Stop  Space:Reset  R:Render  M:MSAA \x1b[K`,
-      `\x1b[3;1H </>:SixelRes  C:CellSize  D:DetectSize  Q:Quit \x1b[0m\x1b[K`,
-    ];
-    process.stdout.write(info.join(''));
 
     // Schedule next frame
     setTimeout(loop, 16); // ~60 FPS
@@ -722,6 +732,7 @@ async function runMapDebugMode(mapId: string, initialRenderMode: RenderMode, ini
   log(`\n=== Debug Session Started ===`);
   log(`Initial position: (${spawn.position[0].toFixed(1)}, ${spawn.position[1].toFixed(1)}, ${spawn.position[2].toFixed(1)})`);
   log(`Render mode: ${initialRenderMode}, MSAA: ${initialMsaaMode}`);
+  log(`Native renderer: available=${renderer.hasNativeRenderer()} simd=${renderer.hasNativeSIMD()} enabled=${renderer.isNativeRendererEnabled()} textures=${renderer.getRasterizer().enableTextures}`);
 
   // Noclip flying state
   let yaw = degToRad(spawn.angle);
@@ -911,14 +922,34 @@ async function runMapDebugMode(mapId: string, initialRenderMode: RenderMode, ini
         log(`Lighting: ${rast.enableLighting ? 'ON' : 'OFF'}`);
       }
 
+      // Native/JS renderer toggle (V)
+      if (char === 'v' || char === 'V') {
+        const rast = renderer.getRasterizer();
+        const wasEnabled = renderer.isNativeRendererEnabled();
+        renderer.setUseNativeRenderer(!wasEnabled);
+        const nowEnabled = renderer.isNativeRendererEnabled();
+        const actuallyUsing = renderer.isUsingNativeRenderer();
+        const simdStatus = renderer.hasNativeSIMD() ? 'SIMD' : 'scalar';
+        const hasNative = renderer.hasNativeRenderer();
+        log(`Native toggle: hasNative=${hasNative} enabled=${nowEnabled} actuallyUsing=${actuallyUsing} textures=${rast.enableTextures} simd=${simdStatus}`);
+        if (nowEnabled && !actuallyUsing) {
+          log(`Native renderer: ENABLED (${simdStatus}) but using JS (textures on)`);
+        } else {
+          log(`Native renderer: ${nowEnabled ? `ON (${simdStatus})` : 'OFF (JS)'}`);
+        }
+      }
+
       camera.setYaw(yaw);
       camera.setPitch(pitch);
     }
   });
 
   // Render loop
-  const frameTime = 1000 / 30; // 30 FPS
+  const frameTime = 1000 / 30; // 30 FPS target
   let frameCount = 0;
+  let lastFpsTime = Date.now();
+  let currentFps = 0;
+  let fpsFrameCount = 0;
 
   while (running) {
     // Update native input if available
@@ -963,6 +994,15 @@ async function runMapDebugMode(mapId: string, initialRenderMode: RenderMode, ini
     // Apply AO post-process
     renderer.getRasterizer().applyAmbientOcclusion();
 
+    // Update FPS counter
+    fpsFrameCount++;
+    const now = Date.now();
+    if (now - lastFpsTime >= 500) {
+      currentFps = fpsFrameCount / ((now - lastFpsTime) / 1000);
+      fpsFrameCount = 0;
+      lastFpsTime = now;
+    }
+
     // Get current settings for display
     const rast = renderer.getRasterizer();
     const renderMode = renderer.getRenderMode();
@@ -974,18 +1014,30 @@ async function runMapDebugMode(mapId: string, initialRenderMode: RenderMode, ini
     const whiteMode = rast.whiteTextureMode;
     const lightOn = rast.enableLighting;
 
+    // Native renderer status - show both enabled state and actual state
+    const nativeEnabled = renderer.isNativeRendererEnabled();
+    const nativeActual = renderer.isUsingNativeRenderer();
+    let nativeStatus: string;
+    if (nativeActual) {
+      nativeStatus = renderer.hasNativeSIMD() ? 'SIMD' : 'NATIVE';
+    } else if (nativeEnabled) {
+      nativeStatus = 'ON→JS';  // Enabled but falling back to JS (textures)
+    } else {
+      nativeStatus = 'JS';
+    }
+
     // Overlay
     const inputMode = useNativeInput ? 'NATIVE' : 'STDIN';
     const infoLines = [
-      `MAP: ${loadedMap.name} | SPAWN[N/P]: ${spawnIndex + 1}/${loadedMap.spawns.length} | Input: ${inputMode}`,
+      `MAP: ${loadedMap.name} | SPAWN[N/P]: ${spawnIndex + 1}/${loadedMap.spawns.length} | ${currentFps.toFixed(0)} FPS`,
       `POS: ${camera.position.x.toFixed(1)}, ${camera.position.y.toFixed(1)}, ${camera.position.z.toFixed(1)} | YAW: ${(yaw * 180 / Math.PI).toFixed(0)}° PITCH: ${(pitch * 180 / Math.PI).toFixed(0)}° | TRIS: ${totalTris}`,
-      `[R]ender:${renderMode} [M]SAA:${msaaMode} [T]ex:${texOn ? 'ON' : 'OFF'} [F]ilter:${texFilter}`,
+      `[R]ender:${renderMode} [M]SAA:${msaaMode} [T]ex:${texOn ? 'ON' : 'OFF'} [F]ilter:${texFilter} [V]backend:${nativeStatus}`,
       `[O]AO:${aoOn ? 'ON' : 'OFF'} [B]FC:${bfcOn ? 'ON' : 'OFF'} [G]host:${whiteMode ? 'ON' : 'OFF'} Lig[H]t:${lightOn ? 'ON' : 'OFF'}`,
-      `WASD=move SPACE/C=up/down IJKL/Mouse=look [Q]uit`,
+      `WASD=move SPACE/C=up/down IJKL/Mouse=look [Q]uit | Input:${inputMode}`,
     ];
 
     for (let i = 0; i < infoLines.length; i++) {
-      process.stdout.write(`\x1b[${i + 1};1H\x1b[43;30m ${infoLines[i].padEnd(70)} \x1b[0m`);
+      process.stdout.write(`\x1b[${i + 1};1H\x1b[43;30m ${infoLines[i].padEnd(78)} \x1b[0m`);
     }
 
     frameCount++;
@@ -1075,6 +1127,21 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
 
   // Game client (network)
   const [gameClient] = useState(() => getGameClient());
+
+  // Early device enumeration for audio settings
+  useEffect(() => {
+    // Initialize mic capture just for device enumeration
+    initializeMicCapture().then((mic) => {
+      const inputDevices = mic.getInputDevices();
+      const outputDevices = mic.getOutputDevices();
+      mainMenu.setAudioDevices(
+        inputDevices.map(d => ({ id: d.id, name: d.name })),
+        outputDevices.map(d => ({ id: d.id, name: d.name }))
+      );
+    }).catch(() => {
+      // Device enumeration failed - use defaults
+    });
+  }, [mainMenu]);
 
   // Player ref
   const playerRef = useRef<Player>(new Player());
@@ -1182,6 +1249,10 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
 
   // Track if we're in multiplayer mode
   const isMultiplayerRef = useRef(false);
+
+  // Voice chat manager
+  const voiceManagerRef = useRef<VoiceManager | null>(null);
+  const speakingPlayersRef = useRef<Set<string>>(new Set());
 
   const [scene] = useState(() => {
     // Just use map objects (no ground plane - BSP maps have their own floors)
@@ -1649,6 +1720,12 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
               // Deactivate multiplayer state on disconnect
               mpState.deactivate();
               isMultiplayerRef.current = false;
+              // Clean up voice chat
+              if (voiceManagerRef.current) {
+                voiceManagerRef.current.destroy();
+                voiceManagerRef.current = null;
+                speakingPlayersRef.current.clear();
+              }
             },
             onError: (error) => {
               serverBrowser.setError(error);
@@ -1670,18 +1747,62 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
               // Add ourselves to the player list
               const isHost = room.playerCount === 1; // First player is host
               lobbyScreen.addPlayer(playerId, serverBrowser.getPlayerName(), isHost);
+
+              // Initialize voice chat
+              const voiceSettings = mainMenu.getSettings();
+              if (voiceSettings.voiceEnabled) {
+                const vm = new VoiceManager({
+                  voiceEnabled: voiceSettings.voiceEnabled,
+                  voiceInputVolume: voiceSettings.voiceInputVolume,
+                  voiceOutputVolume: voiceSettings.voiceOutputVolume,
+                  voiceInputDevice: voiceSettings.voiceInputDevice,
+                  voicePTTEnabled: voiceSettings.voicePTTEnabled,
+                  voicePTTKey: voiceSettings.voicePTTKey,
+                  voiceVADSensitivity: voiceSettings.voiceVADSensitivity,
+                  voiceMaxDistance: voiceSettings.voiceMaxDistance,
+                  voiceSpatialEnabled: voiceSettings.voiceSpatialEnabled,
+                });
+                voiceManagerRef.current = vm;
+
+                // Set up voice event handling
+                vm.onEvent((event) => {
+                  if (event.type === 'speaking-start' && event.playerId) {
+                    speakingPlayersRef.current.add(event.playerId);
+                  } else if (event.type === 'speaking-stop' && event.playerId) {
+                    speakingPlayersRef.current.delete(event.playerId);
+                  }
+                });
+
+                // Connect voice to network
+                vm.setSendCallback((data) => gameClient.sendBinary(data));
+                vm.setLocalPlayer(playerId);
+
+                // Initialize and start
+                vm.initialize().then(() => {
+                  vm.start();
+                  // Populate audio devices in settings menu
+                  mainMenu.setAudioDevices(
+                    vm.getInputDevices(),
+                    vm.getOutputDevices()
+                  );
+                }).catch(() => {
+                  // Voice init failed - ignore
+                });
+              }
             },
             onRoomError: (error) => {
               serverBrowser.setError(error);
               consoleError(error);
             },
             onPlayerJoined: (playerId, playerName) => {
-              consoleLog(`[Lobby] ${playerName} (${playerId}) joined`);
               lobbyScreen.addPlayer(playerId, playerName);
             },
-            onPlayerLeft: (playerId, playerName) => {
-              consoleLog(`${playerName} left`);
+            onPlayerLeft: (playerId, _playerName) => {
               lobbyScreen.removePlayer(playerId);
+              // Remove from voice chat
+              if (voiceManagerRef.current) {
+                voiceManagerRef.current.removePlayer(playerId);
+              }
             },
             onPlayerReady: (playerId, ready) => {
               lobbyScreen.setPlayerReady(playerId, ready);
@@ -1705,6 +1826,17 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
                 playerRef.current.economy.setMoney(localPlayerData.money);
                 playerRef.current.health = localPlayerData.health;
                 playerRef.current.armor = localPlayerData.armor;
+              }
+              // Update voice spatial positions
+              if (voiceManagerRef.current) {
+                for (const player of state.players) {
+                  if (player.id !== localId) {
+                    voiceManagerRef.current.updatePlayerPosition(
+                      player.id,
+                      new Vector3(player.position.x, player.position.y, player.position.z)
+                    );
+                  }
+                }
               }
             },
             // Input acknowledgement for client-side prediction
@@ -1781,9 +1913,20 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
               consoleLog(`Phase: ${phase}, Round ${roundNumber} (T: ${tScore}, CT: ${ctScore})`);
             },
             // Game starting from lobby
-            onGameStarting: (countdown) => {
+            onGameStarting: async (countdown) => {
               consoleLog(`Game starting in ${countdown}...`);
               if (countdown <= 0) {
+                // Load the map from room info
+                const roomInfo = lobbyScreen.getRoomInfo();
+                if (roomInfo && roomInfo.map !== currentMapIdRef.current) {
+                  consoleLog(`Loading map: ${roomInfo.map}`);
+                  const success = await loadMapAsync(roomInfo.map);
+                  if (!success) {
+                    consoleError(`Failed to load map: ${roomInfo.map}`);
+                    return;
+                  }
+                }
+
                 // Transition to gameplay
                 appModeRef.current = 'playing';
                 isMultiplayerRef.current = true;
@@ -1800,6 +1943,12 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
                 botManager.clear();
 
                 consoleLog('Game started! You are now in multiplayer mode.');
+              }
+            },
+            // Voice chat data (binary)
+            onVoiceData: (data) => {
+              if (voiceManagerRef.current) {
+                voiceManagerRef.current.handleBinaryData(data);
               }
             },
           });
@@ -2068,9 +2217,30 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
       mouseSensitivityRef.current = settings.mouseSensitivity;
       renderer.setRenderMode(settings.renderMode);
       renderer.setMSAAMode(settings.msaaMode);
+      renderer.setTextureFilter(settings.textureFilter);
       renderer.setSixelResolution(settings.sixelResolution);
       renderer.setTargetFps(settings.targetFps);
+      // Apply renderer backend setting (native SIMD or JavaScript)
+      renderer.setUseNativeRenderer(settings.rendererBackend === 'native');
+      // Update voice settings if voice manager exists
+      if (voiceManagerRef.current) {
+        voiceManagerRef.current.updateSettings({
+          voiceEnabled: settings.voiceEnabled,
+          voiceInputVolume: settings.voiceInputVolume,
+          voiceOutputVolume: settings.voiceOutputVolume,
+          voiceInputDevice: settings.voiceInputDevice,
+          voiceVADSensitivity: settings.voiceVADSensitivity,
+          voiceMaxDistance: settings.voiceMaxDistance,
+          voiceSpatialEnabled: settings.voiceSpatialEnabled,
+        });
+      }
     });
+
+    // Apply initial settings (loaded from disk) including renderer backend
+    const initialSettings = mainMenu.getSettings();
+    mouseSensitivityRef.current = initialSettings.mouseSensitivity;
+    renderer.setTextureFilter(initialSettings.textureFilter);
+    renderer.setUseNativeRenderer(initialSettings.rendererBackend === 'native');
 
     if (inputMode === 'native') {
       // Enable native mouse mode - skip robotjs recentering, use CGEventTap delta
@@ -2213,6 +2383,12 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
               }
             }
           }
+        }
+
+        // Push-to-talk voice chat (V key)
+        if (voiceManagerRef.current) {
+          const pttActive = isGameKeyDown('V');
+          voiceManagerRef.current.setPTTActive(pttActive);
         }
 
         // Clear just pressed/released flags for next frame
@@ -2394,6 +2570,11 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
       // Update sound engine listener position for spatial audio
       getSoundEngine().setListenerPosition(player.position, player.yaw);
 
+      // Update voice chat listener position for spatial audio
+      if (voiceManagerRef.current) {
+        voiceManagerRef.current.updateLocalPosition(player.position, player.yaw);
+      }
+
       // Multiplayer: send input to server and record for prediction
       const isMultiplayer = isMultiplayerRef.current;
       const mpState = getMultiplayerState();
@@ -2548,6 +2729,19 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
         weapon?.def.name ?? 'None',
         weapon?.isReloading ?? false
       );
+
+      // Update voice chat speaking indicators
+      if (voiceManagerRef.current) {
+        const vm = voiceManagerRef.current;
+        renderer.setMicStatus(
+          vm.getMicLevel(),
+          vm.isMicActive(),
+          vm.getIsTransmitting()
+        );
+        // Use VoiceManager's speaking players directly (includes fallback names)
+        const speakingPlayers = new Set(vm.getSpeakingPlayers());
+        renderer.setSpeakingPlayers(speakingPlayers, vm.getIsTransmitting());
+      }
 
       // Set game mode UI data (use multiplayer state when in multiplayer)
       if (isMultiplayer && mpState.isActive()) {

@@ -2,6 +2,14 @@
 // Supports ground detection, wall collision, and ramps/slopes
 
 import { Vector3 } from '../engine/math/Vector3.js';
+import {
+  CollisionBVHNode,
+  buildCollisionBVH,
+  queryCollisionBVH,
+  queryCollisionBVHSphere,
+  createRay,
+  getCollisionBVHStats,
+} from './BVH.js';
 
 // A collision triangle
 export interface CollisionTriangle {
@@ -14,6 +22,8 @@ export interface CollisionTriangle {
 // Collision mesh - collection of triangles for collision detection
 export class CollisionMesh {
   triangles: CollisionTriangle[] = [];
+  bvh: CollisionBVHNode | null = null;
+  private bvhDirty: boolean = true;
 
   // Add a triangle to the collision mesh
   addTriangle(v0: Vector3, v1: Vector3, v2: Vector3): void {
@@ -28,11 +38,35 @@ export class CollisionMesh {
     }
 
     this.triangles.push({ v0: v0.clone(), v1: v1.clone(), v2: v2.clone(), normal });
+    this.bvhDirty = true;
+  }
+
+  // Build or rebuild the BVH acceleration structure
+  buildBVH(): void {
+    if (!this.bvhDirty && this.bvh) return;
+
+    this.bvh = buildCollisionBVH(this.triangles);
+    this.bvhDirty = false;
+
+    // Log BVH stats for debugging
+    if (this.bvh) {
+      const stats = getCollisionBVHStats(this.bvh);
+      console.log(`[BVH] Built: ${stats.nodeCount} nodes, ${stats.leafCount} leaves, depth ${stats.maxDepth}, avg ${stats.avgTrianglesPerLeaf.toFixed(1)} tris/leaf`);
+    }
+  }
+
+  // Ensure BVH is built (call this before collision queries)
+  ensureBVH(): void {
+    if (this.bvhDirty || !this.bvh) {
+      this.buildBVH();
+    }
   }
 
   // Clear all triangles
   clear(): void {
     this.triangles = [];
+    this.bvh = null;
+    this.bvhDirty = true;
   }
 }
 
@@ -80,7 +114,7 @@ export function rayTriangleIntersection(
   return { hit: false, distance: Infinity, point: Vector3.zero() };
 }
 
-// Raycast against a collision mesh
+// Raycast against a collision mesh (uses BVH acceleration)
 export function raycastMesh(
   rayOrigin: Vector3,
   rayDirection: Vector3,
@@ -95,16 +129,39 @@ export function raycastMesh(
     triangle: null as CollisionTriangle | null,
   };
 
-  for (const tri of mesh.triangles) {
-    const result = rayTriangleIntersection(rayOrigin, rayDirection, tri);
-    if (result.hit && result.distance < closestHit.distance && result.distance <= maxDistance) {
-      closestHit = {
-        hit: true,
-        distance: result.distance,
-        point: result.point,
-        normal: tri.normal.clone(),
-        triangle: tri,
-      };
+  // Ensure BVH is built
+  mesh.ensureBVH();
+
+  // Use BVH to get candidate triangles
+  if (mesh.bvh) {
+    const ray = createRay(rayOrigin, rayDirection);
+    const candidates = queryCollisionBVH(mesh.bvh, ray, maxDistance);
+
+    for (const tri of candidates) {
+      const result = rayTriangleIntersection(rayOrigin, rayDirection, tri);
+      if (result.hit && result.distance < closestHit.distance && result.distance <= maxDistance) {
+        closestHit = {
+          hit: true,
+          distance: result.distance,
+          point: result.point,
+          normal: tri.normal.clone(),
+          triangle: tri,
+        };
+      }
+    }
+  } else {
+    // Fallback to linear search if no BVH
+    for (const tri of mesh.triangles) {
+      const result = rayTriangleIntersection(rayOrigin, rayDirection, tri);
+      if (result.hit && result.distance < closestHit.distance && result.distance <= maxDistance) {
+        closestHit = {
+          hit: true,
+          distance: result.distance,
+          point: result.point,
+          normal: tri.normal.clone(),
+          triangle: tri,
+        };
+      }
     }
   }
 
@@ -196,7 +253,7 @@ export function capsuleTriangleCollision(
   // Use more samples for better coverage on complex geometry
   let bestCollision = { collided: false, penetration: 0, pushOut: Vector3.zero() };
 
-  const numSamples = 5;  // Balanced coverage without catching archways
+  const numSamples = 8;  // Increased: better coverage for stair risers (was 5)
   const capsuleDir = Vector3.sub(capsuleTop, capsuleBottom);
 
   for (let i = 0; i <= numSamples; i++) {
@@ -284,10 +341,10 @@ const STEP_HEIGHT = 0.5;      // Max height player can step up
 const SLOPE_LIMIT = 0.6;      // Dot product with up vector - lower = more forgiving on slopes
 const PLAYER_RADIUS = 0.4;    // Collision radius
 const PLAYER_HEIGHT = 1.8;    // Full height
-const MIN_PENETRATION = 0.02; // Ignore tiny penetrations (stair edges, etc)
+const MIN_PENETRATION = 0.005; // Lowered: catch thin stair risers (was 0.02)
 const MAX_SUBSTEPS = 3;       // Maximum sub-steps for large movements
 
-// Check if a position is blocked by walls at a given height
+// Check if a position is blocked by walls at a given height (uses BVH acceleration)
 function checkPositionBlocked(
   pos: Vector3,
   feetHeight: number,
@@ -300,7 +357,13 @@ function checkPositionBlocked(
   let maxPenetration = 0;
   let bestPushOut = Vector3.zero();
 
-  for (const tri of mesh.triangles) {
+  // Ensure BVH is built and query candidates
+  mesh.ensureBVH();
+  const candidates = mesh.bvh
+    ? queryCollisionBVHSphere(mesh.bvh, checkPos, radius + 0.1)  // Slight margin for safety
+    : mesh.triangles;
+
+  for (const tri of candidates) {
     const collision = sphereTriangleCollision(checkPos, radius, tri);
     // Only react to significant penetrations
     if (collision.collided && collision.penetration > MIN_PENETRATION) {
@@ -318,7 +381,7 @@ function checkPositionBlocked(
   return { blocked, pushOut: bestPushOut };
 }
 
-// Iteratively resolve wall collisions using capsule collision (handles corners)
+// Iteratively resolve wall collisions using capsule collision (handles corners) - uses BVH
 function resolveWallCollisions(
   pos: Vector3,
   feetHeight: number,
@@ -333,6 +396,9 @@ function resolveWallCollisions(
   const capsuleBottomOffset = STEP_HEIGHT + 0.1;  // Above stairs
   const capsuleTopOffset = playerHeight - 0.6;    // Chest height
 
+  // Ensure BVH is built
+  mesh.ensureBVH();
+
   for (let iter = 0; iter < MAX_ITERATIONS; iter++) {
     let totalPush = Vector3.zero();
     let collisionCount = 0;
@@ -340,7 +406,20 @@ function resolveWallCollisions(
     const capsuleBottom = new Vector3(currentPos.x, feetHeight + capsuleBottomOffset, currentPos.z);
     const capsuleTop = new Vector3(currentPos.x, feetHeight + capsuleTopOffset, currentPos.z);
 
-    for (const tri of mesh.triangles) {
+    // Query BVH with a sphere that encompasses the capsule
+    const capsuleCenter = new Vector3(
+      currentPos.x,
+      (capsuleBottom.y + capsuleTop.y) / 2,
+      currentPos.z
+    );
+    const capsuleHalfHeight = (capsuleTop.y - capsuleBottom.y) / 2;
+    const queryRadius = radius + capsuleHalfHeight + 0.1;  // Enclosing sphere + margin
+
+    const candidates = mesh.bvh
+      ? queryCollisionBVHSphere(mesh.bvh, capsuleCenter, queryRadius)
+      : mesh.triangles;
+
+    for (const tri of candidates) {
       const collision = capsuleTriangleCollision(capsuleBottom, capsuleTop, radius, tri);
       // Only react to significant penetrations
       if (collision.collided && collision.penetration > MIN_PENETRATION) {
@@ -414,10 +493,12 @@ export function moveWithMeshCollision(
         const stepUpMidBlocked = checkPositionBlocked(stepUpPos, newPos.y + STEP_HEIGHT + PLAYER_HEIGHT / 2, mesh, PLAYER_RADIUS);
 
         if (!stepUpFeetBlocked.blocked && !stepUpMidBlocked.blocked) {
-          const stepGroundCheck = findGroundBelow(stepUpPos, mesh);
+          // Use multi-ray ground detection for better step surface detection
+          const stepGroundCheck = findGroundBelowForStep(stepUpPos, mesh);
           if (stepGroundCheck.found) {
             const stepGroundDist = (newPos.y + STEP_HEIGHT) - stepGroundCheck.groundY;
-            if (stepGroundDist >= 0 && stepGroundDist <= STEP_HEIGHT + 0.1) {
+            // Relaxed step validation range: -0.1 to STEP_HEIGHT + 0.3 (was 0 to STEP_HEIGHT + 0.1)
+            if (stepGroundDist >= -0.1 && stepGroundDist <= STEP_HEIGHT + 0.3) {
               testPos = stepUpPos;
               finalY = stepGroundCheck.groundY;
             } else {
@@ -568,6 +649,38 @@ export function findGroundBelow(
     groundY: -Infinity,
     groundNormal: new Vector3(0, 1, 0),
   };
+}
+
+// Multi-ray ground detection for steps - casts multiple rays to find the best ground
+// This helps catch step surfaces that a single center ray might miss
+export function findGroundBelowForStep(
+  position: Vector3,
+  mesh: CollisionMesh
+): { found: boolean; groundY: number; groundNormal: Vector3 } {
+  // Cast 5 rays in a small pattern (center + 4 cardinal directions)
+  const offsets: [number, number][] = [
+    [0, 0],       // Center
+    [0.1, 0],     // +X
+    [-0.1, 0],    // -X
+    [0, 0.1],     // +Z
+    [0, -0.1],    // -Z
+  ];
+
+  let bestY = -Infinity;
+  let bestNormal = new Vector3(0, 1, 0);
+  let found = false;
+
+  for (const [dx, dz] of offsets) {
+    const checkPos = new Vector3(position.x + dx, position.y, position.z + dz);
+    const result = findGroundBelow(checkPos, mesh);
+    if (result.found && result.groundY > bestY) {
+      bestY = result.groundY;
+      bestNormal = result.groundNormal;
+      found = true;
+    }
+  }
+
+  return { found, groundY: bestY, groundNormal: bestNormal };
 }
 
 // Global collision mesh for the current map

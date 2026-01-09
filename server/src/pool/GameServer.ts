@@ -103,8 +103,15 @@ export class GameServer {
 
     console.log(`[GameServer] New connection from ${clientIp} (${clientId})`);
 
-    socket.on('message', (data: Buffer) => {
+    socket.on('message', (data: Buffer, isBinary: boolean) => {
       try {
+        // Check for binary voice frames (first byte 0x01)
+        if (isBinary || (data.length > 0 && data[0] === 0x01)) {
+          // Route to room's binary handler
+          this.roomManager.handleBinaryData(clientId, data);
+          return;
+        }
+
         const message = parseClientMessage(data.toString());
         if (message) {
           this.roomManager.handleMessage(clientId, message);

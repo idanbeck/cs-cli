@@ -7,18 +7,20 @@ import { Framebuffer } from './Framebuffer.js';
 import { DepthBuffer } from './DepthBuffer.js';
 import { Rasterizer } from './Rasterizer.js';
 import { Color, CURSOR_HIDE, CURSOR_SHOW, ALT_SCREEN_ON, ALT_SCREEN_OFF, RESET } from '../utils/Colors.js';
-import { RenderMode, MSAAMode } from '../ui/MainMenu.js';
+import { RenderMode, MSAAMode, TextureFilterMode } from '../ui/MainMenu.js';
 import { DecalPool, Decal } from '../game/Decal.js';
 import { TracerPool, getTracerChar } from '../game/Tracer.js';
 import { Bot } from '../ai/Bot.js';
 import { KillEvent, ScoreEntry, GamePhase } from '../game/GameMode.js';
 import { getGameConsole, ConsoleMessage } from '../ui/Console.js';
-import { MainMenu, MainMenuState, InputStatus } from '../ui/MainMenu.js';
+import { MainMenu, MainMenuState, InputStatus, SettingsTab } from '../ui/MainMenu.js';
 import { BuyMenu, BuyMenuItem } from '../ui/BuyMenu.js';
 import { ServerBrowser, ServerBrowserState } from '../ui/ServerBrowser.js';
 import { LobbyScreen, LobbyState } from '../ui/LobbyScreen.js';
 import { TeamId, TEAMS } from '../game/Team.js';
 import { DroppedWeapon } from '../game/DroppedWeapon.js';
+import { getNativeRenderer, NativeRenderer } from './NativeRenderer.js';
+import * as fs from 'fs';
 
 export interface RenderObject {
   mesh: Mesh;
@@ -125,6 +127,12 @@ export class Renderer {
   private deathVelocityY: number = 0;
   private deathPhase: 'falling' | 'impact' | 'settling' | 'resting' = 'falling';
   private deathTime: number = 0;
+
+  // Voice chat - speaking players
+  private speakingPlayers: Set<string> = new Set();
+  private localPlayerSpeaking: boolean = false;
+  private micLevel: number = 0;  // 0-1 mic input level
+  private micActive: boolean = false;  // Whether mic is capturing
   private deathImpactTime: number = 0;
   private deathRollDirection: number = 1; // 1 or -1
   private deathFadeToRed: number = 0; // 0-1 fade amount
@@ -156,6 +164,11 @@ export class Renderer {
   // Dropped weapons to render
   private droppedWeapons: DroppedWeapon[] = [];
 
+  // Native SIMD renderer (optional, for performance)
+  private nativeRenderer: NativeRenderer | null = null;
+  private useNativeRenderer: boolean = false;
+  private nativeRendererInitialized: boolean = false;
+
   constructor(width?: number, height?: number) {
     // Get terminal size if not specified
     this.terminalWidth = width || process.stdout.columns || 80;
@@ -175,6 +188,57 @@ export class Renderer {
     // So if we have 100 columns x 50 rows, the visual aspect is roughly 100 / (50 * 2) = 1.0
     const aspect = this.width / (this.height * 2);
     this.camera = new Camera(75, aspect, 0.01, 100); // Near plane very close to avoid floor clipping
+
+    // Initialize native SIMD renderer if available
+    this.initNativeRenderer();
+  }
+
+  // Initialize native renderer (called from constructor and on resize)
+  private initNativeRenderer(): void {
+    try {
+      this.nativeRenderer = getNativeRenderer();
+      if (this.nativeRenderer.isAvailable) {
+        // Initialize with current framebuffer dimensions
+        const msaaSamples = this.msaaMode === '16x' ? 16 : this.msaaMode === '4x' ? 4 : 1;
+        this.nativeRendererInitialized = this.nativeRenderer.init(this.width, this.height, msaaSamples);
+        // Native rendering disabled by default until fully tested - enable with settings
+        this.useNativeRenderer = false;
+      }
+    } catch {
+      this.nativeRenderer = null;
+      this.nativeRendererInitialized = false;
+      this.useNativeRenderer = false;
+    }
+  }
+
+  // Enable/disable native SIMD renderer
+  setUseNativeRenderer(enabled: boolean): void {
+    if (enabled && this.nativeRenderer?.isAvailable) {
+      if (!this.nativeRendererInitialized) {
+        this.initNativeRenderer();
+      }
+      this.useNativeRenderer = this.nativeRendererInitialized;
+    } else {
+      this.useNativeRenderer = false;
+    }
+  }
+
+  // Returns true if native renderer is actually being used this frame
+  isUsingNativeRenderer(): boolean {
+    return this.useNativeRenderer && this.nativeRendererInitialized;
+  }
+
+  // Returns true if user has enabled native renderer (even if not currently in use due to textures)
+  isNativeRendererEnabled(): boolean {
+    return this.useNativeRenderer && this.nativeRendererInitialized;
+  }
+
+  hasNativeRenderer(): boolean {
+    return this.nativeRenderer?.isAvailable ?? false;
+  }
+
+  hasNativeSIMD(): boolean {
+    return this.nativeRenderer?.hasSIMD ?? false;
   }
 
   getWidth(): number {
@@ -308,6 +372,15 @@ export class Renderer {
     this.depthBuffer.resize(this.width, this.height);
     this.rasterizer.resize(this.framebuffer, this.depthBuffer);
 
+    // Reinitialize native renderer with new dimensions (if it was enabled)
+    if (this.nativeRenderer?.isAvailable) {
+      const wasEnabled = this.useNativeRenderer;
+      const msaaSamples = this.msaaMode === '16x' ? 16 : this.msaaMode === '4x' ? 4 : 1;
+      this.nativeRendererInitialized = this.nativeRenderer.init(this.width, this.height, msaaSamples);
+      // Restore enabled state only if reinit succeeded
+      this.useNativeRenderer = wasEnabled && this.nativeRendererInitialized;
+    }
+
     // Force clear with current clear color
     this.framebuffer.clear('█', this.clearColor, this.clearColor);
     this.prevFramebuffer.clear('█', this.clearColor, this.clearColor);
@@ -427,10 +500,26 @@ export class Renderer {
     // Update rasterizer MSAA setting
     const rasterizerMsaa = mode === 'none' ? 'none' : mode === '4x' ? '4x' : '16x';
     this.rasterizer.setMSAAMode(rasterizerMsaa as any);
+
+    // Re-initialize native renderer with new MSAA samples
+    if (this.nativeRenderer?.isAvailable) {
+      const wasEnabled = this.useNativeRenderer;
+      const msaaSamples = mode === '16x' ? 16 : mode === '4x' ? 4 : 1;
+      this.nativeRendererInitialized = this.nativeRenderer.init(this.width, this.height, msaaSamples);
+      this.useNativeRenderer = wasEnabled && this.nativeRendererInitialized;
+    }
   }
 
   getMSAAMode(): MSAAMode {
     return this.msaaMode;
+  }
+
+  setTextureFilter(mode: TextureFilterMode): void {
+    this.rasterizer.textureFilter = mode;
+  }
+
+  getTextureFilter(): TextureFilterMode {
+    return this.rasterizer.textureFilter as TextureFilterMode;
   }
 
   getCamera(): Camera {
@@ -528,26 +617,82 @@ export class Renderer {
       // Get camera matrices
       const viewProjection = this.camera.viewProjectionMatrix;
 
-      // Render all objects
-      for (const obj of this.objects) {
-        if (obj.visible === false) continue;
+      // Use native SIMD renderer if available and enabled
+      const canUseNative = this.useNativeRenderer &&
+                           this.nativeRenderer &&
+                           this.nativeRendererInitialized;
+      if (canUseNative) {
+        // Native rendering path - batch all meshes
+        this.nativeRenderer.clear(
+          this.clearColor.r,
+          this.clearColor.g,
+          this.clearColor.b
+        );
 
-        visibleObjects++;
-        totalTriangles += obj.mesh.triangles.length;
-        totalVertices += obj.mesh.vertices.length;
+        // Set rendering options (backface culling, textures)
+        this.nativeRenderer.setOptions(
+          this.rasterizer.enableBackfaceCulling,
+          this.rasterizer.enableTextures
+        );
 
-        // Compute MVP matrix
-        const modelMatrix = obj.transform.matrix;
-        const mvpMatrix = Matrix4.multiply(viewProjection, modelMatrix);
+        for (const obj of this.objects) {
+          if (obj.visible === false) continue;
 
-        // Rasterize the mesh
-        this.rasterizer.rasterizeMesh(obj.mesh, mvpMatrix, modelMatrix);
-      }
+          visibleObjects++;
+          totalTriangles += obj.mesh.triangles.length;
+          totalVertices += obj.mesh.vertices.length;
 
-      // Resolve MSAA immediately after mesh rasterization, before overlays
-      // This ensures the 3D scene is in the framebuffer before we draw bots/decals/HUD on top
-      if (this.msaaMode !== 'none') {
-        this.rasterizer.resolveMSAA();
+          // Compute MVP matrix
+          const modelMatrix = obj.transform.matrix;
+          const mvpMatrix = Matrix4.multiply(viewProjection, modelMatrix);
+
+          // Extract mesh data for native renderer (including UVs)
+          const { vertices, indices, colors, normals, uvs } = this.extractMeshData(obj.mesh);
+
+          // Set texture for this mesh if available
+          const texture = obj.mesh.material?.texture;
+          if (texture && this.rasterizer.enableTextures) {
+            this.nativeRenderer.setTexture(texture.getRawRGB(), texture.width, texture.height);
+          } else {
+            this.nativeRenderer.setTexture(null, 0, 0);
+          }
+
+          // Convert MVP matrix to column-major Float32Array
+          const mvpArray = new Float32Array(mvpMatrix.elements);
+
+          // Render via native SIMD
+          this.nativeRenderer.renderTrianglesBatch(vertices, indices, mvpArray, colors, normals, uvs);
+        }
+
+        // Resolve MSAA in native renderer
+        if (this.msaaMode !== 'none') {
+          this.nativeRenderer.resolveMSAA();
+        }
+
+        // Copy native framebuffer to JS framebuffer for overlays and output
+        this.copyNativeFramebufferToJS();
+      } else {
+        // JavaScript rendering path (fallback)
+        for (const obj of this.objects) {
+          if (obj.visible === false) continue;
+
+          visibleObjects++;
+          totalTriangles += obj.mesh.triangles.length;
+          totalVertices += obj.mesh.vertices.length;
+
+          // Compute MVP matrix
+          const modelMatrix = obj.transform.matrix;
+          const mvpMatrix = Matrix4.multiply(viewProjection, modelMatrix);
+
+          // Rasterize the mesh
+          this.rasterizer.rasterizeMesh(obj.mesh, mvpMatrix, modelMatrix);
+        }
+
+        // Resolve MSAA immediately after mesh rasterization, before overlays
+        // This ensures the 3D scene is in the framebuffer before we draw bots/decals/HUD on top
+        if (this.msaaMode !== 'none') {
+          this.rasterizer.resolveMSAA();
+        }
       }
 
       // Render decals (bullet holes, etc.) - drawn on top of resolved 3D scene
@@ -615,6 +760,10 @@ export class Renderer {
     this.drawServerBrowserOverlay();
     this.drawLobbyScreenOverlay();
     this.drawConsoleOverlay();
+
+    // Draw voice indicator in ALL modes (including lobby)
+    // Show indicator whenever voice system is active (even if mic not capturing yet)
+    this.drawVoiceIndicator();
 
     // Determine effective render mode
     // Only force basic for full-screen UI (menu/browser/lobby) where framebuffer is resized to terminal dims
@@ -726,6 +875,19 @@ export class Renderer {
   // Toggle scoreboard visibility
   setShowScoreboard(show: boolean): void {
     this.showScoreboard = show;
+  }
+
+  // Set speaking players for voice chat indicator
+  setSpeakingPlayers(players: Set<string>, localSpeaking: boolean = false): void {
+    this.speakingPlayers = players;
+    this.localPlayerSpeaking = localSpeaking;
+  }
+
+  // Set mic level and status for voice indicator
+  setMicStatus(level: number, active: boolean, transmitting: boolean): void {
+    this.micLevel = level;
+    this.micActive = active;
+    this.localPlayerSpeaking = transmitting;
   }
 
   // Set game phase and related data
@@ -1343,6 +1505,65 @@ export class Renderer {
     // Team scores (top center) if in team mode
     if (this.tScore > 0 || this.ctScore > 0 || this.roundNumber > 0) {
       this.drawTeamScores();
+    }
+
+    // Note: Voice indicator is now drawn in render() outside of drawHUD()
+    // to ensure it appears in lobby mode when HUD data isn't set
+  }
+
+  // Draw voice chat speaking indicator
+  private drawVoiceIndicator(): void {
+    const bgDark = new Color(0, 0, 0, 0.8);
+    const speakingColor = new Color(100, 255, 100);  // Green for speaking
+    const micColor = new Color(255, 200, 100);  // Orange for local mic
+    const errorColor = new Color(255, 100, 100);  // Red for errors
+    const grayColor = new Color(128, 128, 128);  // Gray for inactive
+
+    // Draw mic volume meter (top left)
+    if (this.micActive) {
+      // Volume bar: green -> yellow -> red based on level
+      const meterWidth = 10;
+      const filledBars = Math.round(this.micLevel * meterWidth);
+
+      let meterStr = '';
+      for (let i = 0; i < meterWidth; i++) {
+        if (i < filledBars) {
+          meterStr += '█';
+        } else {
+          meterStr += '░';
+        }
+      }
+
+      // Color based on level: green (low) -> yellow (mid) -> red (high)
+      let meterColor: Color;
+      if (this.micLevel < 0.5) {
+        meterColor = new Color(100, 255, 100);  // Green
+      } else if (this.micLevel < 0.8) {
+        meterColor = new Color(255, 255, 100);  // Yellow
+      } else {
+        meterColor = new Color(255, 100, 100);  // Red
+      }
+
+      // Show [TX] when transmitting, [MIC] otherwise
+      const statusText = this.localPlayerSpeaking ? '[TX]' : '[MIC]';
+      const statusColor = this.localPlayerSpeaking ? new Color(100, 255, 100) : micColor;
+
+      this.framebuffer.drawText(2, 2, statusText, statusColor, bgDark);
+      this.framebuffer.drawText(7, 2, meterStr, meterColor, bgDark);
+    } else {
+      // Show [NO MIC] when mic is not active
+      this.framebuffer.drawText(2, 2, '[NO MIC]', grayColor, bgDark);
+    }
+
+    // Other players speaking (left side, below mic indicator)
+    let y = (this.micActive || this.localPlayerSpeaking) ? 4 : 4;
+    for (const playerId of this.speakingPlayers) {
+      // Truncate player name for display
+      const displayName = playerId.length > 12 ? playerId.substring(0, 12) + '...' : playerId;
+      const text = `[*] ${displayName}`;
+      this.framebuffer.drawText(2, y, text, speakingColor, bgDark);
+      y++;
+      if (y > 8) break; // Limit to avoid cluttering screen
     }
   }
 
@@ -1977,8 +2198,62 @@ export class Renderer {
 
     // Menu items with scroll support
     const selectedIndex = this.mainMenu.getSelectedIndex();
-    const itemsStartY = titleY + 3;
+    let itemsStartY = titleY + 3;
     const isSettingsScreen = this.mainMenu.getCurrentScreen() === 'settings';
+
+    // Draw settings tabs if on settings screen
+    if (isSettingsScreen) {
+      const tabs = this.mainMenu.getSettingsTabs();
+      const currentTab = this.mainMenu.getCurrentSettingsTab();
+      const tabColor = new Color(150, 150, 150);
+      const activeTabColor = new Color(100, 255, 100);
+      const tabBgColor = new Color(40, 40, 60);
+
+      // Build tab header string
+      let tabHeader = '';
+      for (let i = 0; i < tabs.length; i++) {
+        const tab = tabs[i];
+        const tabName = this.mainMenu.getTabDisplayName(tab);
+        const isActive = tab === currentTab;
+        if (i > 0) tabHeader += '  |  ';
+        if (isActive) {
+          tabHeader += `[${tabName}]`;
+        } else {
+          tabHeader += ` ${tabName} `;
+        }
+      }
+
+      const tabX = Math.floor((this.width - tabHeader.length) / 2);
+      // Draw tab header with highlighting
+      let currentX = tabX;
+      for (let i = 0; i < tabs.length; i++) {
+        const tab = tabs[i];
+        const tabName = this.mainMenu.getTabDisplayName(tab);
+        const isActive = tab === currentTab;
+
+        if (i > 0) {
+          this.framebuffer.drawText(currentX, titleY + 2, '  |  ', tabColor, bgDark);
+          currentX += 5;
+        }
+
+        const displayName = isActive ? `[${tabName}]` : ` ${tabName} `;
+        const color = isActive ? activeTabColor : tabColor;
+        this.framebuffer.drawText(currentX, titleY + 2, displayName, color, bgDark);
+        currentX += displayName.length;
+      }
+
+      // Tab navigation hint
+      const tabHint = 'Q/E: switch tabs';
+      this.framebuffer.drawText(
+        Math.floor((this.width - tabHint.length) / 2),
+        titleY + 3,
+        tabHint,
+        descColor,
+        bgDark
+      );
+
+      itemsStartY = titleY + 5;
+    }
 
     // Calculate max visible items based on available space and inform MainMenu
     const availableHeight = this.height - itemsStartY - 10; // Leave room for description/hints
@@ -2074,7 +2349,7 @@ export class Renderer {
     // Controls hint (different for settings screen)
     let hint: string;
     if (isSettingsScreen) {
-      hint = 'W/S: navigate | A/D or Left/Right: adjust | Enter: select | Esc: back';
+      hint = 'W/S: navigate | A/D: adjust | Q/E: tabs | Enter: select | Esc: back';
     } else {
       hint = 'W/S or Arrow keys: navigate | Enter: select | H: help | Esc: back';
     }
@@ -2566,5 +2841,115 @@ export class Renderer {
       `FOV: ${this.camera.fov}°`,
       `Near: ${this.camera.near}, Far: ${this.camera.far}`
     ].join('\n');
+  }
+
+  // Extract mesh data for native renderer (vertices, indices, colors, normals, uvs as typed arrays)
+  private extractMeshData(mesh: Mesh): {
+    vertices: Float32Array;
+    indices: Uint32Array;
+    colors: Uint8Array;
+    normals: Float32Array;
+    uvs: Float32Array;
+  } {
+    const vertCount = mesh.vertices.length;
+    const triCount = mesh.triangles.length;
+
+    // Vertices: x, y, z per vertex
+    const vertices = new Float32Array(vertCount * 3);
+    for (let i = 0; i < vertCount; i++) {
+      const v = mesh.vertices[i];
+      vertices[i * 3] = v.position.x;
+      vertices[i * 3 + 1] = v.position.y;
+      vertices[i * 3 + 2] = v.position.z;
+    }
+
+    // Normals: x, y, z per vertex
+    const normals = new Float32Array(vertCount * 3);
+    for (let i = 0; i < vertCount; i++) {
+      const v = mesh.vertices[i];
+      normals[i * 3] = v.normal.x;
+      normals[i * 3 + 1] = v.normal.y;
+      normals[i * 3 + 2] = v.normal.z;
+    }
+
+    // UVs: u, v per vertex (uv is a tuple [u, v])
+    const uvs = new Float32Array(vertCount * 2);
+    for (let i = 0; i < vertCount; i++) {
+      const v = mesh.vertices[i];
+      if (v.uv) {
+        uvs[i * 2] = v.uv[0];      // u
+        uvs[i * 2 + 1] = v.uv[1];  // v
+      } else {
+        uvs[i * 2] = 0;
+        uvs[i * 2 + 1] = 0;
+      }
+    }
+
+    // Indices: 3 per triangle
+    const indices = new Uint32Array(triCount * 3);
+    for (let i = 0; i < triCount; i++) {
+      const t = mesh.triangles[i];
+      indices[i * 3] = t.indices[0];
+      indices[i * 3 + 1] = t.indices[1];
+      indices[i * 3 + 2] = t.indices[2];
+    }
+
+    // Colors: r, g, b per vertex (use material color for all vertices)
+    const colors = new Uint8Array(vertCount * 3);
+    const meshColor = mesh.material?.color || new Color(200, 200, 200);
+    for (let i = 0; i < vertCount; i++) {
+      colors[i * 3] = meshColor.r;
+      colors[i * 3 + 1] = meshColor.g;
+      colors[i * 3 + 2] = meshColor.b;
+    }
+
+    return { vertices, indices, colors, normals, uvs };
+  }
+
+  // Copy native framebuffer RGB data to JS Framebuffer for overlays and output
+  private copyNativeFramebufferToJS(): void {
+    if (!this.nativeRenderer) return;
+
+    const fb = this.nativeRenderer.getFramebuffer();
+    if (!fb) return;
+
+    const w = this.width;
+    const h = this.height;
+
+    // Copy RGB data to framebuffer
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const idx = (y * w + x) * 3;
+        const r = fb[idx];
+        const g = fb[idx + 1];
+        const b = fb[idx + 2];
+        // Set pixel with full block char and the color
+        this.framebuffer.setPixel(x, y, '█', new Color(r, g, b), new Color(r, g, b));
+      }
+    }
+
+    // Copy depth buffer for proper occlusion of bots/decals/tracers
+    this.copyNativeDepthBufferToJS();
+  }
+
+  // Copy native depth buffer to JS DepthBuffer for sprite occlusion
+  private copyNativeDepthBufferToJS(): void {
+    if (!this.nativeRenderer) return;
+
+    const nativeDepth = this.nativeRenderer.getDepthBuffer();
+    if (!nativeDepth) return;
+
+    // Use TypedArray.set for efficient bulk copy
+    // Ensure we don't overflow if sizes differ
+    const jsDepth = this.depthBuffer.data;
+    if (nativeDepth.length === jsDepth.length) {
+      jsDepth.set(nativeDepth);
+    } else {
+      // Fallback for mismatched sizes
+      const len = Math.min(nativeDepth.length, jsDepth.length);
+      for (let i = 0; i < len; i++) {
+        jsDepth[i] = nativeDepth[i];
+      }
+    }
   }
 }

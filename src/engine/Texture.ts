@@ -205,6 +205,18 @@ export class Texture {
     return new Texture(name, size, size, pixels);
   }
 
+  // Get raw RGB data as Uint8Array (for native renderer)
+  getRawRGB(): Uint8Array {
+    const data = new Uint8Array(this.width * this.height * 3);
+    for (let i = 0; i < this.pixels.length; i++) {
+      const pixel = this.pixels[i];
+      data[i * 3] = pixel.r;
+      data[i * 3 + 1] = pixel.g;
+      data[i * 3 + 2] = pixel.b;
+    }
+    return data;
+  }
+
   // Get average color of texture (useful for distance rendering)
   getAverageColor(): Color {
     let r = 0, g = 0, b = 0;

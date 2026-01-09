@@ -267,6 +267,18 @@ export class RoomManager {
     }
   }
 
+  // ============ Binary Data (Voice) ============
+
+  handleBinaryData(clientId: string, data: Buffer): void {
+    const client = this.clients.get(clientId);
+    if (!client || !client.roomId) return;
+
+    const room = this.rooms.get(client.roomId);
+    if (room) {
+      room.handleBinaryData(clientId, data);
+    }
+  }
+
   // ============ Utility ============
 
   sendToClient(clientId: string, message: ServerMessage): void {

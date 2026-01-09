@@ -1,1 +1,0 @@
-cmd_Release/keyboard.node := c++ -bundle -undefined dynamic_lookup -Wl,-search_paths_first -mmacosx-version-min=10.15 -arch arm64 -L./Release -stdlib=libc++  -o Release/keyboard.node Release/obj.target/keyboard/keyboard_mac.o -framework CoreGraphics -framework CoreFoundation -framework ApplicationServices
