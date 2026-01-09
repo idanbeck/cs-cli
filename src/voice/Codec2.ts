@@ -190,16 +190,16 @@ export class Codec2 {
   private lpState2 = 0;
 
   /**
-   * Apply bandpass filter (60Hz - 2000Hz) to focus on speech frequencies
+   * Apply bandpass filter (120Hz - 2500Hz) to focus on speech frequencies
    * Uses cascaded biquad filters for stability
    */
   private applyBandpassFilter(samples: Int16Array): Float32Array {
     const N = samples.length;
     const output = new Float32Array(N);
 
-    // High-pass filter coefficients (60Hz cutoff at 8kHz sample rate)
-    // 2nd order Butterworth
-    const hpCutoff = 60 / (VOICE_SAMPLE_RATE / 2);
+    // High-pass filter coefficients (120Hz cutoff at 8kHz sample rate)
+    // 2nd order Butterworth - removes rumble and DC
+    const hpCutoff = 120 / (VOICE_SAMPLE_RATE / 2);
     const hpQ = 0.707;
     const hpW0 = Math.PI * hpCutoff;
     const hpAlpha = Math.sin(hpW0) / (2 * hpQ);
@@ -211,9 +211,9 @@ export class Codec2 {
     const hpA1 = (-2 * hpCosW0) / hpA0;
     const hpA2 = (1 - hpAlpha) / hpA0;
 
-    // Low-pass filter coefficients (2000Hz cutoff at 8kHz sample rate)
-    // 2nd order Butterworth
-    const lpCutoff = 2000 / (VOICE_SAMPLE_RATE / 2);
+    // Low-pass filter coefficients (2500Hz cutoff at 8kHz sample rate)
+    // 2nd order Butterworth - allows more high frequency for transients
+    const lpCutoff = 2500 / (VOICE_SAMPLE_RATE / 2);
     const lpQ = 0.707;
     const lpW0 = Math.PI * lpCutoff;
     const lpAlpha = Math.sin(lpW0) / (2 * lpQ);
@@ -257,24 +257,25 @@ export class Codec2 {
    * Fallback encoder using enhanced LPC (Linear Predictive Coding)
    * This provides intelligible vocoded speech when WASM is not available.
    *
-   * Encodes 160 samples into 6 bytes:
-   * - Byte 0: 4 bits log energy + 4 bits voicing strength
-   * - Byte 1: Pitch period (0 = unvoiced, 1-255 = voiced pitch in samples)
-   * - Bytes 2-5: 8 quantized LPC reflection coefficients (4 bits each)
+   * Encodes 160 samples into 16 bytes:
+   * - Bytes 0-1: Energy (16-bit for better dynamic range)
+   * - Byte 2: Pitch period (0 = unvoiced, 1-255 = voiced pitch in samples)
+   * - Byte 3: Voicing strength (0-255)
+   * - Bytes 4-15: 12 LPC reflection coefficients (8 bits each)
    *
-   * Uses 8 LPC coefficients for better spectral resolution (captures ~4 formants)
-   * Includes bandpass filtering (60Hz-2kHz) and pre-emphasis
+   * Uses 12 LPC coefficients for detailed formant modeling
+   * Includes bandpass filtering (120Hz-2.5kHz) and pre-emphasis
    */
   private fallbackEncode(samples: Int16Array): Uint8Array {
     const result = new Uint8Array(CODEC2_PAYLOAD_SIZE);
     const N = samples.length;
 
-    // Apply bandpass filter (60Hz - 2kHz) to focus on speech frequencies
+    // Apply bandpass filter (120Hz - 2.5kHz) to focus on speech frequencies
     const bandpassed = this.applyBandpassFilter(samples);
 
     // Pre-emphasis filter (boost high frequencies for better LPC analysis)
-    // H(z) = 1 - 0.95*z^-1
-    const preEmphasis = 0.95;
+    // H(z) = 1 - 0.97*z^-1
+    const preEmphasis = 0.97;
     const emphasized = new Float32Array(N);
     emphasized[0] = bandpassed[0];
     for (let i = 1; i < N; i++) {
@@ -288,16 +289,18 @@ export class Codec2 {
     }
     const rms = Math.sqrt(sumSquares / N);
 
-    // Log energy quantization (4 bits = 16 levels)
+    // Energy quantization (16-bit for better dynamic range)
+    // Map log energy to 0-65535 range
     const logEnergy = rms > 1 ? Math.log(rms) / Math.log(32768) : 0;
-    const energyQuant = Math.max(0, Math.min(15, Math.floor(logEnergy * 15)));
+    const energyQuant = Math.max(0, Math.min(65535, Math.floor(logEnergy * 65535)));
+    result[0] = energyQuant & 0xFF;         // Low byte
+    result[1] = (energyQuant >> 8) & 0xFF;  // High byte
 
-    // Pitch detection using autocorrelation with parabolic interpolation
-    const minPitch = 16;  // ~500 Hz max (higher for 8kHz)
+    // Pitch detection using autocorrelation
+    const minPitch = 16;  // ~500 Hz max
     const maxPitch = 100; // ~80 Hz min
     let bestPitch = 0;
     let bestCorr = 0;
-    let voicingStrength = 0;
 
     // Calculate autocorrelation at lag 0 for normalization
     let r0 = 0;
@@ -319,29 +322,26 @@ export class Codec2 {
         }
       }
 
-      // Voicing decision threshold
-      if (bestCorr > 0.25) {
-        voicingStrength = Math.min(15, Math.floor(bestCorr * 20));
-      } else {
+      // Voicing decision - require strong correlation
+      if (bestCorr < 0.25) {
         bestPitch = 0; // Unvoiced
-        voicingStrength = 0;
       }
     }
+    result[2] = bestPitch;
 
-    // Pack energy (4 bits) + voicing strength (4 bits) into byte 0
-    result[0] = (energyQuant << 4) | voicingStrength;
-    result[1] = bestPitch;
+    // Voicing strength (0-255) - used for mixed excitation
+    const voicingStrength = Math.max(0, Math.min(255, Math.floor(bestCorr * 255)));
+    result[3] = voicingStrength;
 
     // LPC analysis using autocorrelation method (Levinson-Durbin)
-    // Use 8 coefficients for better spectral resolution
-    const order = 8;
+    // Use 12 coefficients for detailed formant modeling
+    const order = 12;
     const r = new Float32Array(order + 1);
 
-    // Calculate autocorrelation with windowing
+    // Calculate autocorrelation with Hamming window
     for (let k = 0; k <= order; k++) {
       let sum = 0;
       for (let i = 0; i < N - k; i++) {
-        // Apply Hamming window implicitly through weighted sum
         const w = 0.54 - 0.46 * Math.cos(2 * Math.PI * i / (N - 1));
         sum += emphasized[i] * emphasized[i + k] * w;
       }
@@ -358,7 +358,7 @@ export class Codec2 {
     const reflectionCoeffs = new Float32Array(order);
     const a = new Float32Array(order + 1);
     a[0] = 1;
-    let e = r[0] + 1e-10; // Add small value to prevent division by zero
+    let e = r[0] + 1e-10;
 
     for (let i = 0; i < order; i++) {
       let lambda = r[i + 1];
@@ -367,10 +367,8 @@ export class Codec2 {
       }
 
       reflectionCoeffs[i] = -lambda / e;
-      // Clamp to ensure stability
-      reflectionCoeffs[i] = Math.max(-0.98, Math.min(0.98, reflectionCoeffs[i]));
+      reflectionCoeffs[i] = Math.max(-0.99, Math.min(0.99, reflectionCoeffs[i]));
 
-      // Update predictor coefficients
       const aNew = new Float32Array(order + 1);
       aNew[0] = 1;
       for (let j = 1; j <= i; j++) {
@@ -383,57 +381,50 @@ export class Codec2 {
       if (e < 1e-10) e = 1e-10;
     }
 
-    // Quantize 8 reflection coefficients to 4 bits each (packed into 4 bytes)
-    // Use arcsine quantization for better distribution
-    for (let i = 0; i < 8; i++) {
+    // Quantize 12 reflection coefficients to 8 bits each
+    // Use arcsine quantization for better distribution near ±1
+    for (let i = 0; i < 12; i++) {
       const k = reflectionCoeffs[i];
-      // Arcsine transform maps [-1,1] to [-pi/2, pi/2], then normalize to [0,15]
-      const arcsin = Math.asin(Math.max(-0.98, Math.min(0.98, k)));
-      const normalized = (arcsin / (Math.PI / 2) + 1) * 7.5; // Map to 0-15
-      const quantized = Math.max(0, Math.min(15, Math.round(normalized)));
-
-      // Pack two 4-bit values per byte
-      if (i % 2 === 0) {
-        result[2 + Math.floor(i / 2)] = quantized << 4;
-      } else {
-        result[2 + Math.floor(i / 2)] |= quantized;
-      }
+      // Arcsine transform for better quantization of values near ±1
+      const arcsin = Math.asin(Math.max(-0.99, Math.min(0.99, k)));
+      const normalized = (arcsin / (Math.PI / 2) + 1) * 127.5; // Map to 0-255
+      result[4 + i] = Math.max(0, Math.min(255, Math.round(normalized)));
     }
 
     return result;
   }
 
   /**
-   * Fallback decoder using enhanced LPC synthesis
+   * Fallback decoder using enhanced LPC synthesis with sawtooth excitation
+   *
+   * Decodes 16 bytes:
+   * - Bytes 0-1: Energy (16-bit)
+   * - Byte 2: Pitch period
+   * - Byte 3: Voicing strength
+   * - Bytes 4-15: 12 LPC reflection coefficients (8-bit each)
    */
   private fallbackDecode(bits: Uint8Array): Int16Array {
     const result = new Int16Array(VOICE_FRAME_SAMPLES);
-    const order = 8;
+    const order = 12;
 
-    // Decode energy and voicing strength from byte 0
-    const energyQuant = (bits[0] >> 4) & 0x0F;
-    const voicingStrength = bits[0] & 0x0F;
-    const logEnergy = energyQuant / 15;
+    // Decode 16-bit energy
+    const energyQuant = bits[0] | (bits[1] << 8);
+    const logEnergy = energyQuant / 65535;
     const energy = Math.pow(32768, logEnergy);
-    const gain = energy / 4; // Adjusted scale factor
+    const gain = energy / 3; // Scale factor
 
-    // Decode pitch
-    const pitch = bits[1];
-    const voiced = pitch > 0 && voicingStrength > 2;
-    const voicingMix = voicingStrength / 15; // 0 = all noise, 1 = all voiced
+    // Decode pitch and voicing
+    const pitch = bits[2];
+    const voicingStrength = bits[3];
+    const voiced = pitch > 0 && voicingStrength > 30;
+    const voicingMix = voicingStrength / 255; // 0 = all noise, 1 = all voiced
 
-    // Decode 8 LPC reflection coefficients (4 bits each, packed)
+    // Decode 12 LPC reflection coefficients (8 bits each)
     const reflectionCoeffs = new Float32Array(order);
-    for (let i = 0; i < 8; i++) {
-      const byteIdx = 2 + Math.floor(i / 2);
-      let quantized: number;
-      if (i % 2 === 0) {
-        quantized = (bits[byteIdx] >> 4) & 0x0F;
-      } else {
-        quantized = bits[byteIdx] & 0x0F;
-      }
+    for (let i = 0; i < 12; i++) {
+      const quantized = bits[4 + i];
       // Inverse arcsine transform
-      const normalized = (quantized / 7.5) - 1; // Map back to [-1, 1]
+      const normalized = (quantized / 127.5) - 1; // Map back to [-1, 1]
       reflectionCoeffs[i] = Math.sin(normalized * (Math.PI / 2));
       // Clamp to ensure stability
       reflectionCoeffs[i] = Math.max(-0.98, Math.min(0.98, reflectionCoeffs[i]));
@@ -452,35 +443,30 @@ export class Codec2 {
       a.set(aNew);
     }
 
-    // Generate mixed excitation signal (voiced + noise for more natural sound)
+    // Generate mixed excitation signal using SAWTOOTH for better transients
     const excitation = new Float32Array(VOICE_FRAME_SAMPLES);
     if (voiced && pitch > 0) {
-      // Mixed excitation: pulse train + noise
+      // Mixed excitation: sawtooth train + noise
       let pulsePhase = 0;
       for (let i = 0; i < VOICE_FRAME_SAMPLES; i++) {
-        // Glottal pulse approximation (smoother than simple impulse)
+        // Sawtooth wave - rich in harmonics for better formant excitation
+        // Phase goes from 0 to 1 over pitch period, sawtooth goes from 1 to -1
         const phaseInPitch = pulsePhase / pitch;
-        let pulse = 0;
-        if (phaseInPitch < 0.1) {
-          // Rising edge
-          pulse = Math.sin(phaseInPitch * 5 * Math.PI) * gain;
-        } else if (phaseInPitch < 0.4) {
-          // Falling edge
-          pulse = Math.sin((0.5 - phaseInPitch) * 2.5 * Math.PI) * gain * 0.7;
-        }
+        const sawtooth = (1 - 2 * phaseInPitch) * gain;
 
         // Add aspiration noise (more for weaker voicing)
-        const noise = (Math.random() * 2 - 1) * gain * 0.15 * (1 - voicingMix * 0.7);
+        const aspirationAmount = 0.15 * (1 - voicingMix * 0.7);
+        const noise = (Math.random() * 2 - 1) * gain * aspirationAmount;
 
-        excitation[i] = pulse * voicingMix + noise;
+        excitation[i] = sawtooth * voicingMix + noise;
 
         pulsePhase++;
         if (pulsePhase >= pitch) pulsePhase = 0;
       }
     } else {
-      // Unvoiced: filtered noise
+      // Unvoiced: filtered noise (fricatives, sibilants)
       for (let i = 0; i < VOICE_FRAME_SAMPLES; i++) {
-        excitation[i] = (Math.random() * 2 - 1) * gain * 0.4;
+        excitation[i] = (Math.random() * 2 - 1) * gain * 0.5;
       }
     }
 

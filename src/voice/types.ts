@@ -6,8 +6,8 @@
 
 // Binary protocol constants
 export const VOICE_FRAME_TYPE = 0x01;
-export const VOICE_FRAME_SIZE = 18;  // Total frame size in bytes
-export const CODEC2_PAYLOAD_SIZE = 6; // 2400bps mode: 6 bytes per 20ms
+export const VOICE_FRAME_SIZE = 28;  // Total frame size in bytes (12 header + 16 payload)
+export const CODEC2_PAYLOAD_SIZE = 16; // Enhanced LPC: 16 bytes per 20ms (~6.4kbps)
 export const VOICE_SAMPLE_RATE = 8000;
 export const VOICE_FRAME_SAMPLES = 160; // 20ms at 8kHz
 export const VOICE_FRAME_MS = 20;
@@ -17,14 +17,20 @@ export const VOICE_FLAG_VAD = 0x01;      // Bit 0: Voice activity detected
 export const VOICE_FLAG_TEAM_ONLY = 0x02; // Bit 1: Team-only broadcast
 
 /**
- * Binary voice frame structure (18 bytes)
+ * Binary voice frame structure (28 bytes)
  * Offset  Size  Field
  * 0       1     frameType (0x01)
  * 1       1     flags (bit0: VAD, bit1: teamOnly)
  * 2       4     senderId (truncated player ID)
  * 6       4     sequence number
  * 10      2     timestamp offset (ms)
- * 12      6     Codec2 payload (2400bps)
+ * 12      16    Enhanced LPC payload
+ *
+ * Payload structure (16 bytes):
+ * - Bytes 0-1: Energy (16-bit)
+ * - Byte 2: Pitch period
+ * - Byte 3: Voicing strength
+ * - Bytes 4-15: 12 LPC reflection coefficients (8-bit each)
  */
 export interface VoiceFrame {
   frameType: number;
@@ -183,7 +189,7 @@ export function deserializeVoiceFrame(data: Uint8Array): VoiceFrame | null {
     senderId: view.getUint32(2, true),
     sequence: view.getUint32(6, true),
     timestampOffset: view.getUint16(10, true),
-    payload: data.slice(12, 18),
+    payload: data.slice(12, 28),
   };
 }
 
