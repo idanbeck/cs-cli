@@ -96,8 +96,8 @@ export class VoiceRelay {
     return this.senderIdToPlayerId.get(senderId);
   }
 
-  // Track relay stats
-  private relayCount = 0;
+  // Debug counter
+  private debugRelayCount = 0;
 
   /**
    * Relay a voice frame to room members
@@ -118,14 +118,14 @@ export class VoiceRelay {
     const senderTeam = teamAssignments.get(senderClientId);
     const senderId = getSenderIdFromFrame(data);
 
-    // Log relay periodically
-    this.relayCount++;
-    if (this.relayCount % 50 === 0) {
-      console.log(`[VoiceRelay] Relaying frame from ${senderId.toString(16)} to ${clients.size - 1} clients`);
+    this.debugRelayCount++;
+    if (this.debugRelayCount % 50 === 1) {
+      console.log(`[VoiceRelay] Relaying frame #${this.debugRelayCount} from ${senderClientId.slice(0, 8)} (sender ${senderId.toString(16)}), ${clients.size} clients in room`);
     }
 
-    // Relay to all other clients (optionally filtered by team)
     let relayedTo = 0;
+
+    // Relay to all other clients (optionally filtered by team)
     for (const [clientId, client] of clients) {
       // Don't send back to sender
       if (clientId === senderClientId) continue;
@@ -145,6 +145,10 @@ export class VoiceRelay {
           // Ignore send errors
         }
       }
+    }
+
+    if (this.debugRelayCount % 50 === 1) {
+      console.log(`[VoiceRelay] Relayed to ${relayedTo} clients`);
     }
   }
 

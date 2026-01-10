@@ -1,13 +1,21 @@
 /**
  * VoicePlayback - Audio output for voice chat
  *
- * Streams decoded voice audio to the speaker using the existing speaker package.
- * Handles stereo output at 8kHz 16-bit.
+ * Uses afplay (macOS) for reliable audio output.
+ * Upsamples from 8kHz to 22050Hz stereo 16-bit.
  */
 
-import Speaker from 'speaker';
-import { Readable } from 'stream';
+import { spawn, ChildProcess } from 'child_process';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
 import { VOICE_SAMPLE_RATE, VOICE_FRAME_SAMPLES, VOICE_FRAME_MS } from './types.js';
+import { voiceLog } from './voiceLog.js';
+
+// Output format
+const OUTPUT_SAMPLE_RATE = 22050;
+const OUTPUT_CHANNELS = 2;
+const OUTPUT_BIT_DEPTH = 16;
 
 /**
  * Voice playback configuration
@@ -15,30 +23,70 @@ import { VOICE_SAMPLE_RATE, VOICE_FRAME_SAMPLES, VOICE_FRAME_MS } from './types.
 export interface VoicePlaybackConfig {
   sampleRate: number;
   channels: number;
-  bitDepth: number;
   bufferMs: number;
 }
 
 const DEFAULT_PLAYBACK_CONFIG: VoicePlaybackConfig = {
-  sampleRate: VOICE_SAMPLE_RATE,
-  channels: 2,  // Stereo
-  bitDepth: 16,
-  bufferMs: 40, // ~2 frames
+  sampleRate: OUTPUT_SAMPLE_RATE,
+  channels: OUTPUT_CHANNELS,
+  bufferMs: 80,  // Buffer 80ms before playing
 };
 
 /**
- * Voice audio playback handler
+ * Create a WAV file header
+ */
+function createWavHeader(dataLength: number): Buffer {
+  const header = Buffer.alloc(44);
+
+  // RIFF header
+  header.write('RIFF', 0);
+  header.writeUInt32LE(36 + dataLength, 4);  // File size - 8
+  header.write('WAVE', 8);
+
+  // fmt chunk
+  header.write('fmt ', 12);
+  header.writeUInt32LE(16, 16);  // Chunk size
+  header.writeUInt16LE(1, 20);   // Audio format (PCM)
+  header.writeUInt16LE(OUTPUT_CHANNELS, 22);
+  header.writeUInt32LE(OUTPUT_SAMPLE_RATE, 24);
+  header.writeUInt32LE(OUTPUT_SAMPLE_RATE * OUTPUT_CHANNELS * (OUTPUT_BIT_DEPTH / 8), 28);  // Byte rate
+  header.writeUInt16LE(OUTPUT_CHANNELS * (OUTPUT_BIT_DEPTH / 8), 32);  // Block align
+  header.writeUInt16LE(OUTPUT_BIT_DEPTH, 34);
+
+  // data chunk
+  header.write('data', 36);
+  header.writeUInt32LE(dataLength, 40);
+
+  return header;
+}
+
+/**
+ * Voice audio playback handler using afplay
  */
 export class VoicePlayback {
   private config: VoicePlaybackConfig;
-  private speaker: Speaker | null = null;
-  private readable: Readable | null = null;
   private isPlaying = false;
-  private pendingFrames: Int16Array[] = [];
-  private isPushing = false;
+  private pendingFrames: Buffer[] = [];  // Stores resampled 16-bit stereo buffers
+  private frameCount = 0;
+  private lastPlayTime = 0;
+  private fileCounter = 0;
+
+  // Temp directory and active processes
+  private tempDir: string;
+  private activeProcesses: Set<ChildProcess> = new Set();
 
   constructor(config: Partial<VoicePlaybackConfig> = {}) {
     this.config = { ...DEFAULT_PLAYBACK_CONFIG, ...config };
+
+    // Create temp directory for audio files
+    this.tempDir = path.join(os.tmpdir(), 'csterm-voice');
+    try {
+      if (!fs.existsSync(this.tempDir)) {
+        fs.mkdirSync(this.tempDir, { recursive: true });
+      }
+    } catch {
+      this.tempDir = os.tmpdir();
+    }
   }
 
   /**
@@ -46,82 +94,97 @@ export class VoicePlayback {
    */
   start(): void {
     if (this.isPlaying) return;
+    this.isPlaying = true;
+  }
 
+  /**
+   * Play audio buffer using afplay
+   */
+  private playBuffer(samples: Buffer): void {
     try {
-      console.log('[VoicePlayback] Starting speaker...');
+      // Create WAV file
+      const header = createWavHeader(samples.length);
+      const wavData = Buffer.concat([header, samples]);
 
-      // Create speaker
-      this.speaker = new Speaker({
-        channels: this.config.channels,
-        bitDepth: this.config.bitDepth,
-        sampleRate: this.config.sampleRate,
-        signed: true,
+      // Write to temp file
+      const filename = path.join(this.tempDir, `voice_${this.fileCounter++}.wav`);
+      fs.writeFileSync(filename, wavData);
+
+      // Debug: log file creation
+      voiceLog(`[VoicePlayback] Created WAV: ${filename} (${wavData.length} bytes)`);
+
+      // Play with afplay
+      const proc = spawn('afplay', [filename], {
+        stdio: 'ignore',
+        detached: true
       });
 
-      // Create readable stream that pulls from our buffer
-      this.readable = new Readable({
-        read: () => {
-          this.pushAudio();
-        },
-        highWaterMark: this.config.bufferMs * this.config.sampleRate * this.config.channels * 2 / 1000,
+      this.activeProcesses.add(proc);
+
+      proc.on('exit', (code) => {
+        this.activeProcesses.delete(proc);
+        voiceLog(`[VoicePlayback] afplay exited with code ${code}`);
+        // Clean up temp file
+        try {
+          fs.unlinkSync(filename);
+        } catch {}
       });
 
-      // Handle speaker events silently
-      this.speaker.on('error', (err) => {
-        console.error('[VoicePlayback] Speaker error:', err);
+      proc.on('error', (err) => {
+        voiceLog(`[VoicePlayback] afplay error: ${err.message}`);
+        this.activeProcesses.delete(proc);
       });
 
-      this.speaker.on('close', () => {
-        console.log('[VoicePlayback] Speaker closed');
-        this.isPlaying = false;
-      });
-
-      // Pipe readable to speaker
-      this.readable.pipe(this.speaker);
-      this.isPlaying = true;
-      console.log('[VoicePlayback] Speaker started successfully');
-
-    } catch (error) {
-      // Log error for debugging voice playback issues
-      console.error('[VoicePlayback] Failed to start speaker:', error);
-      this.isPlaying = false;
+      // Unref so it doesn't keep process alive
+      proc.unref();
+    } catch (err) {
+      voiceLog(`[VoicePlayback] playBuffer error: ${err}`);
     }
   }
 
   /**
-   * Push audio data to the stream
+   * Upsample and convert stereo 16-bit 8kHz to 16-bit 22050Hz
+   *
+   * @param samples Stereo interleaved 16-bit samples at 8kHz
+   * @returns Buffer of 16-bit stereo samples at 22050Hz
    */
-  private pushAudio(): void {
-    if (this.isPushing || !this.readable) return;
-    this.isPushing = true;
+  private resampleAndConvert(samples: Int16Array): Buffer {
+    const ratio = OUTPUT_SAMPLE_RATE / VOICE_SAMPLE_RATE; // 22050/8000 = ~2.756
+    const inputStereoSamples = samples.length / 2; // Number of stereo pairs
+    const outputStereoSamples = Math.floor(inputStereoSamples * ratio);
+    // 4 bytes per stereo sample (2 bytes left + 2 bytes right at 16-bit)
+    const output = Buffer.alloc(outputStereoSamples * 4);
 
-    try {
-      // Push all pending frames
-      while (this.pendingFrames.length > 0) {
-        const frame = this.pendingFrames.shift()!;
-        const buffer = Buffer.from(frame.buffer, frame.byteOffset, frame.byteLength);
-        const shouldContinue = this.readable.push(buffer);
+    for (let i = 0; i < outputStereoSamples; i++) {
+      // Calculate source position
+      const srcPos = i / ratio;
+      const srcIdx = Math.floor(srcPos);
+      const frac = srcPos - srcIdx;
 
-        if (!shouldContinue) {
-          break;
-        }
-      }
+      // Linear interpolation for left and right channels
+      const srcIdxClamped = Math.min(srcIdx, inputStereoSamples - 1);
+      const srcIdxNext = Math.min(srcIdx + 1, inputStereoSamples - 1);
 
-      // If no frames available, push silence to keep stream alive
-      if (this.pendingFrames.length === 0 && this.isPlaying) {
-        const silenceSize = VOICE_FRAME_SAMPLES * this.config.channels * 2;
-        const silence = Buffer.alloc(silenceSize, 0);
-        this.readable.push(silence);
-      }
-    } catch {
-      // Ignore push errors
+      // Get 16-bit stereo samples
+      const leftSrc = samples[srcIdxClamped * 2];
+      const rightSrc = samples[srcIdxClamped * 2 + 1];
+      const leftNext = samples[srcIdxNext * 2];
+      const rightNext = samples[srcIdxNext * 2 + 1];
+
+      // Interpolate
+      const leftInterp = leftSrc * (1 - frac) + leftNext * frac;
+      const rightInterp = rightSrc * (1 - frac) + rightNext * frac;
+
+      // Write as 16-bit little-endian
+      const leftOut = Math.max(-32768, Math.min(32767, Math.round(leftInterp)));
+      const rightOut = Math.max(-32768, Math.min(32767, Math.round(rightInterp)));
+
+      output.writeInt16LE(leftOut, i * 4);
+      output.writeInt16LE(rightOut, i * 4 + 2);
     }
 
-    this.isPushing = false;
+    return output;
   }
-
-  // Track frame count for logging
-  private frameCount = 0;
 
   /**
    * Queue a stereo audio frame for playback
@@ -129,23 +192,45 @@ export class VoicePlayback {
    * @param samples Stereo interleaved 16-bit samples (320 samples = 160 stereo pairs)
    */
   queueFrame(samples: Int16Array): void {
+    voiceLog(`[VoicePlayback] queueFrame called with ${samples.length} samples`);
+
     if (!this.isPlaying) {
+      voiceLog(`[VoicePlayback] Starting playback`);
       this.start();
     }
 
-    // Add to pending frames
-    this.pendingFrames.push(samples);
-
-    // Log periodically
     this.frameCount++;
-    if (this.frameCount % 50 === 0) {
-      console.log(`[VoicePlayback] Queued ${this.frameCount} frames, buffer depth: ${this.pendingFrames.length}`);
-    }
 
-    // Prevent buffer overflow
-    const maxFrames = Math.ceil(200 / VOICE_FRAME_MS); // Max 200ms buffer
-    while (this.pendingFrames.length > maxFrames) {
-      this.pendingFrames.shift();
+    // Debug logging - every frame for now
+    let maxAmp = 0;
+    for (let i = 0; i < samples.length; i++) maxAmp = Math.max(maxAmp, Math.abs(samples[i]));
+    voiceLog(`[VoicePlayback] queueFrame #${this.frameCount}: ${samples.length} samples, max amp: ${maxAmp}`);
+
+    // Resample and convert
+    const converted = this.resampleAndConvert(samples);
+    this.pendingFrames.push(converted);
+
+    const now = Date.now();
+    const timeSinceLastPlay = now - this.lastPlayTime;
+
+    // Calculate buffered duration
+    // 4 bytes per stereo sample at 22050Hz
+    const totalBytes = this.pendingFrames.reduce((sum, b) => sum + b.length, 0);
+    const bufferedMs = (totalBytes / 4) / OUTPUT_SAMPLE_RATE * 1000;
+
+    // Play when we have enough buffered or timeout reached
+    if (bufferedMs >= this.config.bufferMs || timeSinceLastPlay > 120) {
+      // Combine all pending frames
+      const combined = Buffer.concat(this.pendingFrames);
+      this.pendingFrames = [];
+      this.lastPlayTime = now;
+
+      if (this.frameCount % 50 < 5) {
+        voiceLog(`[VoicePlayback] Playing ${combined.length} bytes (${bufferedMs.toFixed(0)}ms buffered)`);
+      }
+
+      // Play using afplay
+      this.playBuffer(combined);
     }
   }
 
@@ -155,19 +240,13 @@ export class VoicePlayback {
   stop(): void {
     if (!this.isPlaying) return;
 
-    try {
-      if (this.readable) {
-        this.readable.push(null); // Signal end
-        this.readable = null;
-      }
-
-      if (this.speaker) {
-        this.speaker.end();
-        this.speaker = null;
-      }
-    } catch {
-      // Ignore stop errors
+    // Kill active processes
+    for (const proc of this.activeProcesses) {
+      try {
+        proc.kill();
+      } catch {}
     }
+    this.activeProcesses.clear();
 
     this.isPlaying = false;
     this.pendingFrames = [];
@@ -188,10 +267,44 @@ export class VoicePlayback {
   }
 
   /**
+   * Play a test tone (440Hz for 0.5s)
+   */
+  playTestTone(): void {
+    const duration = 0.5;
+    const sampleCount = Math.floor(OUTPUT_SAMPLE_RATE * duration);
+    // 16-bit stereo = 4 bytes per sample
+    const samples = Buffer.alloc(sampleCount * 4);
+
+    for (let i = 0; i < sampleCount; i++) {
+      const t = i / OUTPUT_SAMPLE_RATE;
+      // 440Hz sine wave with envelope
+      const envelope = Math.min(1, Math.min(t * 10, (duration - t) * 10));
+      const sample = Math.sin(2 * Math.PI * 440 * t) * 16000 * envelope;
+      const value = Math.max(-32768, Math.min(32767, Math.round(sample)));
+      samples.writeInt16LE(value, i * 4);      // Left
+      samples.writeInt16LE(value, i * 4 + 2);  // Right
+    }
+
+    this.playBuffer(samples);
+  }
+
+  /**
    * Cleanup
    */
   destroy(): void {
     this.stop();
+
+    // Clean up temp directory
+    try {
+      const files = fs.readdirSync(this.tempDir);
+      for (const file of files) {
+        if (file.startsWith('voice_')) {
+          try {
+            fs.unlinkSync(path.join(this.tempDir, file));
+          } catch {}
+        }
+      }
+    } catch {}
   }
 }
 

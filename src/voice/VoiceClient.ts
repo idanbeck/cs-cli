@@ -18,6 +18,7 @@ import {
   truncatePlayerId,
   isVoiceFrame,
 } from './types.js';
+import { voiceLog } from './voiceLog.js';
 import { Codec2, getCodec2Encoder } from './Codec2.js';
 import { JitterBuffer, JitterBufferManager } from './JitterBuffer.js';
 
@@ -137,6 +138,9 @@ export class VoiceClient {
     this.sendBinary(data);
   }
 
+  // Debug counter for received frames
+  private debugRecvCount = 0;
+
   /**
    * Handle received binary data
    * Returns true if it was a voice frame
@@ -157,20 +161,22 @@ export class VoiceClient {
       return true;
     }
 
+    this.debugRecvCount++;
+    if (this.debugRecvCount % 50 === 1) {
+      voiceLog(`[VoiceClient] Received frame #${this.debugRecvCount} from sender ${frame.senderId.toString(16)}, seq=${frame.sequence}`);
+    }
+
     // Decode audio - wrap in try-catch to prevent crashes
     let samples: Int16Array;
     try {
       if (!this.codec || !this.codec.isInitialized) {
-        console.warn('[VoiceClient] Codec not ready, dropping frame');
         return true;  // Codec not ready
       }
       samples = this.codec.decode(frame.payload);
       if (!samples || samples.length === 0) {
-        console.warn('[VoiceClient] Decode returned empty samples');
         return true;  // Decoding failed
       }
     } catch (error) {
-      console.error('[VoiceClient] Decode error:', error);
       return true;
     }
 
@@ -186,11 +192,6 @@ export class VoiceClient {
 
     // Push to jitter buffer
     this.jitterManager.pushFrame(decoded);
-
-    // Log receipt (every 50 frames to avoid spam)
-    if (frame.sequence % 50 === 0) {
-      console.log(`[VoiceClient] Received voice frame from ${frame.senderId.toString(16)}, seq=${frame.sequence}, buffers=${this.jitterManager.count}`);
-    }
 
     return true;
   }

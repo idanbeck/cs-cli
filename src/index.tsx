@@ -50,6 +50,7 @@ import { getMainMenu, MainMenu, RenderMode, MSAAMode } from './ui/MainMenu.js';
 import { getBuyMenu, BuyMenu } from './ui/BuyMenu.js';
 import { VoiceManager } from './voice/VoiceManager.js';
 import { VoiceSettings } from './voice/types.js';
+import { getVoicePlayback } from './voice/VoicePlayback.js';
 import { initializeMicCapture, getMicCapture } from './voice/MicCapture.js';
 import { VocoderDebugUI } from './voice/VocoderDebugUI.js';
 
@@ -1743,7 +1744,7 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
               lobbyScreen.setRoomInfo(room);
               lobbyScreen.setLocalPlayerId(playerId);
               // Add ourselves to the player list
-              const isHost = room.playerCount === 1; // First player is host
+              const isHost = room.hostId === playerId; // Check actual host from server
               lobbyScreen.addPlayer(playerId, serverBrowser.getPlayerName(), isHost);
 
               // Initialize voice chat
@@ -2244,6 +2245,34 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
           voiceSpatialEnabled: settings.voiceSpatialEnabled,
         });
       }
+    });
+
+    // Set up test audio callback
+    mainMenu.setOnTestAudio(() => {
+      // Play a test tone using NativeAudioPlayer (via VoicePlayback)
+      const voicePlayback = getVoicePlayback();
+      voicePlayback.playTestTone();
+      // Reset test state after a short delay
+      setTimeout(() => {
+        mainMenu.setTestAudioActive(false);
+      }, 600);
+    });
+
+    // Early device enumeration for audio settings
+    // Initialize MicCapture to enumerate devices before joining a room
+    initializeMicCapture().then((mic) => {
+      const inputDevices = mic.getInputDevices();
+      const outputDevices = mic.getOutputDevices();
+      mainMenu.setAudioDevices(
+        inputDevices.map(d => ({ id: d.id, name: d.name })),
+        outputDevices.map(d => ({ id: d.id, name: d.name }))
+      );
+    }).catch(() => {
+      // Device enumeration failed - use defaults
+      mainMenu.setAudioDevices(
+        [{ id: 'default', name: 'Default Input' }],
+        [{ id: 'default', name: 'Default Output' }]
+      );
     });
 
     // Apply initial settings (loaded from disk) including renderer backend

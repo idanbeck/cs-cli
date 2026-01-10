@@ -26,6 +26,7 @@ import { VoiceClient, getVoiceClient, destroyVoiceClient } from './VoiceClient.j
 import { SpatialMixer, getSpatialMixer, destroySpatialMixer } from './SpatialMixer.js';
 import { VoicePlayback, getVoicePlayback, destroyVoicePlayback } from './VoicePlayback.js';
 import { VoicePostProcessor, getVoicePostProcessor, destroyVoicePostProcessor } from './VoicePostProcessor.js';
+import { voiceLog } from './voiceLog.js';
 
 // Playback tick interval (process received audio)
 const PLAYBACK_TICK_MS = 20;  // Match codec frame rate
@@ -201,6 +202,9 @@ export class VoiceManager {
     }
   }
 
+  // Debug counter for logging
+  private debugCounter = 0;
+
   /**
    * Process received audio for playback
    */
@@ -210,23 +214,50 @@ export class VoiceManager {
       const activeSenders = this.client.getActiveSenders();
       const stereoStreams: Int16Array[] = [];
 
-      // Log active senders periodically
-      if (activeSenders.length > 0 && now % 1000 < 25) {
-        console.log(`[VoiceManager] Active senders: ${activeSenders.length}, ready: ${activeSenders.filter(s => this.client.isBufferReady(s)).length}`);
+      // Debug: Log active senders periodically
+      this.debugCounter++;
+      const shouldLog = this.debugCounter % 50 === 1;
+
+      if (shouldLog && activeSenders.length > 0) {
+        voiceLog(`[VoiceManager] Active senders: ${activeSenders.length}`);
       }
 
       for (const senderId of activeSenders) {
         // Get next frame from jitter buffer
         const samples = this.client.getNextFrame(senderId);
-        if (!samples) continue;
+        if (!samples) {
+          if (shouldLog) {
+            voiceLog(`[VoiceManager] No frame from jitter buffer for sender ${senderId.toString(16)}`);
+          }
+          continue;
+        }
+
+        if (shouldLog) {
+          let maxAmp = 0;
+          for (let i = 0; i < samples.length; i++) maxAmp = Math.max(maxAmp, Math.abs(samples[i]));
+          voiceLog(`[VoiceManager] Got frame: ${samples.length} samples, max amp: ${maxAmp}`);
+        }
 
         // Apply CSterm radio post-processing effects
         const processed = this.postProcessor.process(samples);
+
+        if (shouldLog) {
+          let maxAmp = 0;
+          for (let i = 0; i < processed.length; i++) maxAmp = Math.max(maxAmp, Math.abs(processed[i]));
+          voiceLog(`[VoiceManager] After postprocess: ${processed.length} samples, max amp: ${maxAmp}`);
+        }
 
         // Apply spatial processing
         const stereo = this.mixer.processVoice(senderId, processed);
         if (stereo) {
           stereoStreams.push(stereo);
+          if (shouldLog) {
+            voiceLog(`[VoiceManager] Spatial OK: ${stereo.length} stereo samples`);
+          }
+        } else {
+          if (shouldLog) {
+            voiceLog(`[VoiceManager] Spatial returned null for sender ${senderId.toString(16)}`);
+          }
         }
 
         // Track speaking player
@@ -239,15 +270,23 @@ export class VoiceManager {
           };
           this.speakingPlayers.set(senderId, speaker);
           this.emitEvent({ type: 'speaking-start', playerId: speaker.playerId });
-          console.log(`[VoiceManager] Speaking started from ${senderId.toString(16)}`);
         }
         speaker.lastActivity = now;
       }
 
       // Mix and play
       if (stereoStreams.length > 0) {
+        voiceLog(`[VoiceManager] About to mix ${stereoStreams.length} streams, sizes: ${stereoStreams.map(s => s.length).join(',')}`);
         const mixed = this.mixer.mixStreams(stereoStreams);
+        voiceLog(`[VoiceManager] Mixed result: ${mixed.length} samples`);
+        if (shouldLog) {
+          let maxAmp = 0;
+          for (let i = 0; i < mixed.length; i++) maxAmp = Math.max(maxAmp, Math.abs(mixed[i]));
+          voiceLog(`[VoiceManager] Mixing ${stereoStreams.length} streams, output max amp: ${maxAmp}`);
+        }
+        voiceLog(`[VoiceManager] Calling playback.queueFrame`);
         this.playback.queueFrame(mixed);
+        voiceLog(`[VoiceManager] queueFrame returned`);
       }
 
       // Cleanup inactive speakers
@@ -258,8 +297,8 @@ export class VoiceManager {
         }
       }
     } catch (error) {
-      // Swallow errors to prevent playback crashes
-      console.error('[VoiceManager] Playback error:', error);
+      // Log errors instead of silently swallowing
+      voiceLog(`[VoiceManager] processPlayback ERROR: ${error}`);
     }
   }
 

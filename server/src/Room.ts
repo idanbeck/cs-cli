@@ -520,6 +520,7 @@ export class Room {
       botCount: this.config.botCount,
       isPrivate: this.config.isPrivate,
       phase: this.gameRunner?.getPhase() || 'pre_match',
+      hostId: this.hostId,
     };
   }
 }

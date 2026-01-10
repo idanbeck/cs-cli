@@ -7,6 +7,7 @@
 
 import { Vector3 } from '../engine/math/Vector3.js';
 import { SpatialParams, VOICE_FRAME_SAMPLES, VOICE_SAMPLE_RATE } from './types.js';
+import { voiceLog } from './voiceLog.js';
 
 // Spatial audio constants (matching SoundEngine)
 const DEFAULT_MAX_DISTANCE = 50;  // Beyond this, voice is silent
@@ -178,11 +179,13 @@ export class SpatialMixer {
    * @returns Mixed stereo frame
    */
   mixStreams(streams: Int16Array[]): Int16Array {
-    const output = new Int16Array(VOICE_FRAME_SAMPLES * 2);
-
     if (streams.length === 0) {
-      return output;
+      return new Int16Array(VOICE_FRAME_SAMPLES * 2);
     }
+
+    // Use the actual size of the first stream
+    const frameSize = streams[0].length;
+    const output = new Int16Array(frameSize);
 
     if (streams.length === 1) {
       output.set(streams[0]);
@@ -190,10 +193,12 @@ export class SpatialMixer {
     }
 
     // Mix with saturation
-    for (let i = 0; i < output.length; i++) {
+    for (let i = 0; i < frameSize; i++) {
       let sum = 0;
       for (const stream of streams) {
-        sum += stream[i];
+        if (i < stream.length) {
+          sum += stream[i];
+        }
       }
 
       // Soft clipping
@@ -206,6 +211,9 @@ export class SpatialMixer {
     return output;
   }
 
+  // Debug counter
+  private debugProcessCount = 0;
+
   /**
    * Process a voice frame for a sender
    *
@@ -214,8 +222,17 @@ export class SpatialMixer {
    * @returns Spatialized stereo samples, or null if too quiet
    */
   processVoice(senderId: number, samples: Int16Array): Int16Array | null {
+    this.debugProcessCount++;
     const spatial = this.getStreamSpatial(senderId);
+
+    if (this.debugProcessCount % 50 === 1) {
+      voiceLog(`[SpatialMixer] processVoice: sender=${senderId.toString(16)}, volume=${spatial.volume.toFixed(3)}, pan=${spatial.pan.toFixed(2)}, outputVol=${this.outputVolume}, spatialEnabled=${this.spatialEnabled}`);
+    }
+
     if (spatial.volume < 0.01) {
+      if (this.debugProcessCount % 50 === 1) {
+        voiceLog(`[SpatialMixer] Volume too low (${spatial.volume}), returning null`);
+      }
       return null; // Too quiet (far away)
     }
 

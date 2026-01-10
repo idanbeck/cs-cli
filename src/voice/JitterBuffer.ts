@@ -11,6 +11,7 @@ import {
   VOICE_FRAME_SAMPLES,
   VOICE_FRAME_MS,
 } from './types.js';
+import { voiceLog } from './voiceLog.js';
 
 /**
  * Jitter buffer configuration
@@ -22,9 +23,9 @@ export interface JitterBufferConfig {
 }
 
 const DEFAULT_JITTER_CONFIG: JitterBufferConfig = {
-  minLatencyMs: 20,   // Reduced to 1 frame for immediate playback
-  maxLatencyMs: 60,   // Reduced from 100
-  adaptiveDepth: true,
+  minLatencyMs: 20,   // 1 frame for immediate playback
+  maxLatencyMs: 40,   // 2 frames max
+  adaptiveDepth: false, // Disable adaptive for now to debug
 };
 
 /**
@@ -107,13 +108,21 @@ export class JitterBuffer {
     this.targetDepth = Math.min(maxFrames, Math.max(minFrames, minFrames + jitterFrames));
   }
 
+  // Debug counter
+  private debugPopCount = 0;
+
   /**
    * Pop the next frame for playback
    * Returns null if buffer not ready, or generates silence frame on packet loss
    */
   pop(): Int16Array | null {
+    this.debugPopCount++;
+
     // Check if buffer has enough depth
     if (!this.isReady()) {
+      if (this.debugPopCount % 50 === 1 && this.isActive) {
+        voiceLog(`[JitterBuffer] Not ready: depth=${this.buffer.size}, target=${this.targetDepth}, nextSeq=${this.nextSequence}`);
+      }
       return null;
     }
 

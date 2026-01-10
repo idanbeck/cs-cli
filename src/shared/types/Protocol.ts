@@ -40,6 +40,7 @@ export interface RoomInfo {
   botCount: number;
   isPrivate: boolean;
   phase: GamePhase;
+  hostId: string;  // ID of the host player
 }
 
 // ============ Player Input ============
