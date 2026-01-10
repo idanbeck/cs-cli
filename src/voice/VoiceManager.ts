@@ -238,8 +238,9 @@ export class VoiceManager {
           voiceLog(`[VoiceManager] Got frame: ${samples.length} samples, max amp: ${maxAmp}`);
         }
 
-        // Apply CSterm radio post-processing effects
-        const processed = this.postProcessor.process(samples);
+        // TEMPORARILY BYPASS post-processing to debug codec
+        // const processed = this.postProcessor.process(samples);
+        const processed = samples; // Direct passthrough for debugging
 
         if (shouldLog) {
           let maxAmp = 0;

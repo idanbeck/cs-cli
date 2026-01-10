@@ -23,6 +23,7 @@ import {
   VOICE_SAMPLE_RATE,
   VOICE_FRAME_SAMPLES,
 } from "./types.js";
+import { voiceLog } from "./voiceLog.js";
 
 // Re-export the enum for backwards compatibility
 export { Codec2Mode as Codec2ModeEnum } from "./types.js";
@@ -135,6 +136,7 @@ export class Codec2 {
 
     if (nativeCodec2) {
       this.modeInfo = nativeCodec2.getModeInfo(this.modeString);
+      voiceLog(`[Codec2] Using NATIVE codec2, mode=${this.modeString}, info=${JSON.stringify(this.modeInfo)}`);
     } else {
       // Fallback mode info
       this.modeInfo = {
@@ -144,6 +146,7 @@ export class Codec2 {
         bitrate: 6400, // 16 bytes * 8 bits / 0.02s = 6400 bps
         frameDurationMs: 20,
       };
+      voiceLog(`[Codec2] Using FALLBACK LPC codec, mode=${this.modeString}`);
     }
 
     this._isInitialized = true;
@@ -247,6 +250,9 @@ export class Codec2 {
     return this.fallbackEncode(samples);
   }
 
+  // Debug counter for decode logging
+  private decodeCount = 0;
+
   /**
    * Decode Codec2 bitstream to audio samples
    *
@@ -258,12 +264,23 @@ export class Codec2 {
       throw new Error("Codec2 not initialized");
     }
 
+    this.decodeCount++;
+    let result: Int16Array;
+
     if (nativeCodec2) {
-      return nativeCodec2.decode(this.modeString, bits);
+      result = nativeCodec2.decode(this.modeString, bits);
+    } else {
+      result = this.fallbackDecode(bits);
     }
 
-    // Fallback to LPC
-    return this.fallbackDecode(bits);
+    // Log every 50th decode
+    if (this.decodeCount % 50 === 1) {
+      let maxAmp = 0;
+      for (let i = 0; i < result.length; i++) maxAmp = Math.max(maxAmp, Math.abs(result[i]));
+      voiceLog(`[Codec2] decode #${this.decodeCount}: input=${bits.length} bytes, output=${result.length} samples, maxAmp=${maxAmp}, native=${!!nativeCodec2}`);
+    }
+
+    return result;
   }
 
   /**
