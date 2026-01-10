@@ -88,6 +88,9 @@ export interface Settings {
   voiceVADSensitivity: number; // 1-10
   voiceMaxDistance: number;    // Game units
   voiceSpatialEnabled: boolean;
+  voiceCodec: 'codec2' | 'lpc'; // Codec type
+  voiceCodec2Mode: string;     // Codec2 mode (e.g., '2400', '3200')
+  voicePreset: string;         // Post-processing preset name
 }
 
 // Settings persistence path
@@ -127,6 +130,9 @@ function loadSettingsFromDisk(): Partial<Settings> {
       if (typeof parsed.voiceVADSensitivity === 'number') settings.voiceVADSensitivity = parsed.voiceVADSensitivity;
       if (typeof parsed.voiceMaxDistance === 'number') settings.voiceMaxDistance = parsed.voiceMaxDistance;
       if (typeof parsed.voiceSpatialEnabled === 'boolean') settings.voiceSpatialEnabled = parsed.voiceSpatialEnabled;
+      if (parsed.voiceCodec === 'codec2' || parsed.voiceCodec === 'lpc') settings.voiceCodec = parsed.voiceCodec;
+      if (typeof parsed.voiceCodec2Mode === 'string') settings.voiceCodec2Mode = parsed.voiceCodec2Mode;
+      if (typeof parsed.voicePreset === 'string') settings.voicePreset = parsed.voicePreset;
       return settings;
     }
   } catch {
@@ -180,6 +186,9 @@ export class MainMenu {
     voiceVADSensitivity: 5,
     voiceMaxDistance: 50,
     voiceSpatialEnabled: true,
+    voiceCodec: 'codec2',      // Default: Codec2 for best compression
+    voiceCodec2Mode: '2400',   // Default: 2400bps mode
+    voicePreset: 'CSterm',     // Default: CSterm radio effect preset
   };
   private onSettingsChange?: (settings: Settings) => void;
 
@@ -233,12 +242,21 @@ export class MainMenu {
   private settingsItemsByTab: Record<SettingsTab, string[]> = {
     controls: ['Mouse Sensitivity', 'Back'],
     graphics: ['Render Mode', 'Anti-Aliasing', 'Texture Filter', 'Renderer Backend', 'Frame Rate Cap', 'Field of View', 'Back'],
-    audio: ['Voice Enabled', 'Input Volume', 'Output Volume', 'Input Device', 'Output Device', 'Voice Mode', 'VAD Sensitivity', 'Max Distance', 'Spatial Audio', 'Back'],
+    audio: ['Voice Enabled', 'Voice Codec', 'Voice Preset', 'Input Volume', 'Output Volume', 'Input Device', 'Output Device', 'Voice Mode', 'VAD Sensitivity', 'Max Distance', 'Spatial Audio', 'Test Audio', 'Back'],
   };
 
   // Available audio devices (populated dynamically)
   private inputDevices: { id: string; name: string }[] = [{ id: 'default', name: 'Default' }];
   private outputDevices: { id: string; name: string }[] = [{ id: 'default', name: 'Default' }];
+
+  // Voice codec options
+  private voiceCodecs: ('codec2' | 'lpc')[] = ['codec2', 'lpc'];
+  private codec2Modes: string[] = ['3200', '2400', '1600', '1400', '1300', '1200', '700C'];
+  private voicePresets: string[] = ['CSterm', 'Clean', 'Lo-Fi Radio', 'Walkie-Talkie', 'Robot'];
+
+  // Test audio state
+  private testAudioActive = false;
+  private onTestAudio?: () => void;
   // Flat list for backward compatibility (will be replaced by tab-specific items)
   private settingsItems = ['Mouse Sensitivity', 'Render Mode', 'Anti-Aliasing', 'Texture Filter', 'Renderer Backend', 'Frame Rate Cap', 'Field of View', 'Back'];
 
@@ -596,6 +614,15 @@ export class MainMenu {
       case 'Output Device':
         this.cycleOutputDevice(delta);
         break;
+      case 'Voice Codec':
+        this.cycleVoiceCodec(delta);
+        break;
+      case 'Voice Preset':
+        this.cycleVoicePreset(delta);
+        break;
+      case 'Test Audio':
+        this.triggerTestAudio();
+        break;
     }
   }
 
@@ -725,6 +752,44 @@ export class MainMenu {
     saveSettingsToDisk(this.settings);
   }
 
+  private cycleVoiceCodec(delta: number): void {
+    const currentIndex = this.voiceCodecs.indexOf(this.settings.voiceCodec);
+    const idx = currentIndex >= 0 ? currentIndex : 0;
+    const newIndex = (idx + delta + this.voiceCodecs.length) % this.voiceCodecs.length;
+    this.settings.voiceCodec = this.voiceCodecs[newIndex];
+    this.onSettingsChange?.(this.settings);
+    saveSettingsToDisk(this.settings);
+  }
+
+  private cycleVoicePreset(delta: number): void {
+    const currentIndex = this.voicePresets.indexOf(this.settings.voicePreset);
+    const idx = currentIndex >= 0 ? currentIndex : 0;
+    const newIndex = (idx + delta + this.voicePresets.length) % this.voicePresets.length;
+    this.settings.voicePreset = this.voicePresets[newIndex];
+    this.onSettingsChange?.(this.settings);
+    saveSettingsToDisk(this.settings);
+  }
+
+  private triggerTestAudio(): void {
+    this.testAudioActive = true;
+    this.onTestAudio?.();
+  }
+
+  // Set test audio callback (called from index.tsx)
+  setOnTestAudio(callback: () => void): void {
+    this.onTestAudio = callback;
+  }
+
+  // Get test audio state
+  isTestAudioActive(): boolean {
+    return this.testAudioActive;
+  }
+
+  // Set test audio state (called when test completes)
+  setTestAudioActive(active: boolean): void {
+    this.testAudioActive = active;
+  }
+
   // Set available audio devices (called from VoiceManager)
   setAudioDevices(input: { id: string; name: string }[], output: { id: string; name: string }[]): void {
     this.inputDevices = input.length > 0 ? input : [{ id: 'default', name: 'Default' }];
@@ -762,6 +827,18 @@ export class MainMenu {
 
   getVoiceSpatialEnabled(): boolean {
     return this.settings.voiceSpatialEnabled;
+  }
+
+  getVoiceCodec(): 'codec2' | 'lpc' {
+    return this.settings.voiceCodec;
+  }
+
+  getVoiceCodec2Mode(): string {
+    return this.settings.voiceCodec2Mode;
+  }
+
+  getVoicePreset(): string {
+    return this.settings.voicePreset;
   }
 
   getFov(): number {
@@ -859,6 +936,17 @@ export class MainMenu {
         const truncatedOut = outputName.length > 20 ? outputName.slice(0, 18) + '..' : outputName;
         return `< ${truncatedOut} >`;
       }
+      case 'Voice Codec': {
+        const codecNames: Record<string, string> = {
+          'codec2': `Codec2 ${this.settings.voiceCodec2Mode}bps`,
+          'lpc': 'LPC (Fallback)',
+        };
+        return `< ${codecNames[this.settings.voiceCodec] || this.settings.voiceCodec} >`;
+      }
+      case 'Voice Preset':
+        return `< ${this.settings.voicePreset} >`;
+      case 'Test Audio':
+        return this.testAudioActive ? '[ Testing... ]' : '[ Press Enter ]';
       default:
         return '';
     }

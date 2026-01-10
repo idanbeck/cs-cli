@@ -51,6 +51,7 @@ import { getBuyMenu, BuyMenu } from './ui/BuyMenu.js';
 import { VoiceManager } from './voice/VoiceManager.js';
 import { VoiceSettings } from './voice/types.js';
 import { initializeMicCapture, getMicCapture } from './voice/MicCapture.js';
+import { VocoderDebugUI } from './voice/VocoderDebugUI.js';
 
 // CLI options interface
 interface CLIOptions {
@@ -60,6 +61,7 @@ interface CLIOptions {
   debug: boolean;
   debugMap?: string;  // Map ID for debug map mode
   listMaps: boolean;  // List available maps
+  vocoderDebug: boolean;  // Vocoder loopback debug mode
 }
 
 // Graphics quality presets
@@ -81,6 +83,7 @@ function parseArgs(): CLIOptions {
     help: false,
     debug: false,
     listMaps: false,
+    vocoderDebug: false,
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -150,6 +153,8 @@ function parseArgs(): CLIOptions {
       options.debugMap = arg.split('=')[1];
     } else if (arg === '--list-maps' || arg === '--maps') {
       options.listMaps = true;
+    } else if (arg === '--vocoder' || arg === '--voice-debug' || arg === '--vocoder-debug') {
+      options.vocoderDebug = true;
     }
   }
 
@@ -183,6 +188,10 @@ Map Debug:
   --map <id>              Load map in debug mode (noclip, no bots)
   --debug-map <id>        Same as --map
   --list-maps, --maps     List all available maps
+
+Voice Debug:
+  --vocoder               Launch vocoder debug loopback mode
+  --voice-debug           Same as --vocoder
 
 Other:
   -h, --help              Show this help message
@@ -1128,20 +1137,9 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
   // Game client (network)
   const [gameClient] = useState(() => getGameClient());
 
-  // Early device enumeration for audio settings
-  useEffect(() => {
-    // Initialize mic capture just for device enumeration
-    initializeMicCapture().then((mic) => {
-      const inputDevices = mic.getInputDevices();
-      const outputDevices = mic.getOutputDevices();
-      mainMenu.setAudioDevices(
-        inputDevices.map(d => ({ id: d.id, name: d.name })),
-        outputDevices.map(d => ({ id: d.id, name: d.name }))
-      );
-    }).catch(() => {
-      // Device enumeration failed - use defaults
-    });
-  }, [mainMenu]);
+  // NOTE: Device enumeration removed from early init
+  // naudiodon.getDevices() can crash with segfault in some contexts
+  // Devices will be enumerated lazily when settings menu is opened
 
   // Player ref
   const playerRef = useRef<Player>(new Player());
@@ -1781,10 +1779,22 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
                 vm.initialize().then(() => {
                   vm.start();
                   // Populate audio devices in settings menu
-                  mainMenu.setAudioDevices(
-                    vm.getInputDevices(),
-                    vm.getOutputDevices()
-                  );
+                  // NOTE: Device enumeration can crash in some contexts (naudiodon/portaudio)
+                  // We defer it and wrap in try-catch - MicCapture now returns safe fallbacks
+                  setTimeout(() => {
+                    try {
+                      mainMenu.setAudioDevices(
+                        vm.getInputDevices(),
+                        vm.getOutputDevices()
+                      );
+                    } catch (e) {
+                      // Device enumeration failed - use defaults
+                      mainMenu.setAudioDevices(
+                        [{ id: 'default', name: 'Default Input' }],
+                        [{ id: 'default', name: 'Default Output' }]
+                      );
+                    }
+                  }, 100);  // Defer to avoid early crash
                 }).catch(() => {
                   // Voice init failed - ignore
                 });
@@ -2890,6 +2900,17 @@ async function main() {
   if (options.debugMap) {
     console.log(`Map debug mode: ${options.debugMap}`);
     await runMapDebugMode(options.debugMap, options.renderMode, options.msaaMode);
+    return;
+  }
+
+  // Handle --vocoder / --voice-debug
+  if (options.vocoderDebug) {
+    console.log('Vocoder debug loopback mode');
+    console.log('Press SPACE to record, ESC to exit');
+    const { waitUntilExit } = render(
+      <VocoderDebugUI onExit={() => process.exit(0)} />
+    );
+    await waitUntilExit();
     return;
   }
 

@@ -25,6 +25,7 @@ import { VADProcessor } from './VADProcessor.js';
 import { VoiceClient, getVoiceClient, destroyVoiceClient } from './VoiceClient.js';
 import { SpatialMixer, getSpatialMixer, destroySpatialMixer } from './SpatialMixer.js';
 import { VoicePlayback, getVoicePlayback, destroyVoicePlayback } from './VoicePlayback.js';
+import { VoicePostProcessor, getVoicePostProcessor, destroyVoicePostProcessor } from './VoicePostProcessor.js';
 
 // Playback tick interval (process received audio)
 const PLAYBACK_TICK_MS = 20;  // Match codec frame rate
@@ -58,6 +59,7 @@ export class VoiceManager {
   private client: VoiceClient;
   private mixer: SpatialMixer;
   private playback: VoicePlayback;
+  private postProcessor: VoicePostProcessor;
 
   // State
   private localPlayerId: string = '';
@@ -82,6 +84,7 @@ export class VoiceManager {
     this.client = getVoiceClient();
     this.mixer = getSpatialMixer();
     this.playback = getVoicePlayback();
+    this.postProcessor = getVoicePostProcessor();  // CSterm radio effects
   }
 
   /**
@@ -156,41 +159,45 @@ export class VoiceManager {
    * Handle microphone frame
    */
   private onMicFrame(samples: Int16Array): void {
-    // Calculate RMS level for meter (before volume adjustment)
-    let sumSquares = 0;
-    for (let i = 0; i < samples.length; i++) {
-      sumSquares += samples[i] * samples[i];
-    }
-    const rms = Math.sqrt(sumSquares / samples.length);
-    // Normalize to 0-1 (32767 is max for 16-bit audio)
-    this.currentMicLevel = Math.min(1, rms / 16384);  // Use 16384 for headroom
-
-    if (!this.settings.voiceEnabled || !this.codec) {
-      this.isTransmitting = false;
-      return;
-    }
-
-    // Apply input volume
-    if (this.settings.voiceInputVolume < 100) {
-      const scale = this.settings.voiceInputVolume / 100;
+    try {
+      // Calculate RMS level for meter (before volume adjustment)
+      let sumSquares = 0;
       for (let i = 0; i < samples.length; i++) {
-        samples[i] = Math.round(samples[i] * scale);
+        sumSquares += samples[i] * samples[i];
       }
-    }
+      const rms = Math.sqrt(sumSquares / samples.length);
+      // Normalize to 0-1 (32767 is max for 16-bit audio)
+      this.currentMicLevel = Math.min(1, rms / 16384);  // Use 16384 for headroom
 
-    // Check PTT or VAD
-    let shouldTransmit = false;
-    if (this.settings.voicePTTEnabled) {
-      shouldTransmit = this.isPTTActive;
-    } else {
-      shouldTransmit = this.vad.process(samples);
-    }
+      if (!this.settings.voiceEnabled || !this.codec) {
+        this.isTransmitting = false;
+        return;
+      }
+      // Apply input volume
+      if (this.settings.voiceInputVolume < 100) {
+        const scale = this.settings.voiceInputVolume / 100;
+        for (let i = 0; i < samples.length; i++) {
+          samples[i] = Math.round(samples[i] * scale);
+        }
+      }
 
-    this.isTransmitting = shouldTransmit;
+      // Check PTT or VAD
+      let shouldTransmit = false;
+      if (this.settings.voicePTTEnabled) {
+        shouldTransmit = this.isPTTActive;
+      } else {
+        shouldTransmit = this.vad.process(samples);
+      }
 
-    // Send if active
-    if (shouldTransmit) {
-      this.client.sendVoice(samples, true);
+      this.isTransmitting = shouldTransmit;
+
+      // Send if active
+      if (shouldTransmit) {
+        this.client.sendVoice(samples, true);
+      }
+    } catch (error) {
+      // Swallow errors to prevent mic callback crashes
+      this.isTransmitting = false;
     }
   }
 
@@ -198,47 +205,61 @@ export class VoiceManager {
    * Process received audio for playback
    */
   private processPlayback(): void {
-    const now = Date.now();
-    const activeSenders = this.client.getActiveSenders();
-    const stereoStreams: Int16Array[] = [];
+    try {
+      const now = Date.now();
+      const activeSenders = this.client.getActiveSenders();
+      const stereoStreams: Int16Array[] = [];
 
-    for (const senderId of activeSenders) {
-      // Get next frame from jitter buffer
-      const samples = this.client.getNextFrame(senderId);
-      if (!samples) continue;
-
-      // Apply spatial processing
-      const stereo = this.mixer.processVoice(senderId, samples);
-      if (stereo) {
-        stereoStreams.push(stereo);
+      // Log active senders periodically
+      if (activeSenders.length > 0 && now % 1000 < 25) {
+        console.log(`[VoiceManager] Active senders: ${activeSenders.length}, ready: ${activeSenders.filter(s => this.client.isBufferReady(s)).length}`);
       }
 
-      // Track speaking player
-      let speaker = this.speakingPlayers.get(senderId);
-      if (!speaker) {
-        speaker = {
-          playerId: '',  // Will be resolved from network state
-          senderId,
-          lastActivity: now,
-        };
-        this.speakingPlayers.set(senderId, speaker);
-        this.emitEvent({ type: 'speaking-start', playerId: speaker.playerId });
-      }
-      speaker.lastActivity = now;
-    }
+      for (const senderId of activeSenders) {
+        // Get next frame from jitter buffer
+        const samples = this.client.getNextFrame(senderId);
+        if (!samples) continue;
 
-    // Mix and play
-    if (stereoStreams.length > 0) {
-      const mixed = this.mixer.mixStreams(stereoStreams);
-      this.playback.queueFrame(mixed);
-    }
+        // Apply CSterm radio post-processing effects
+        const processed = this.postProcessor.process(samples);
 
-    // Cleanup inactive speakers
-    for (const [senderId, speaker] of this.speakingPlayers) {
-      if (now - speaker.lastActivity > 300) {  // 300ms timeout
-        this.speakingPlayers.delete(senderId);
-        this.emitEvent({ type: 'speaking-stop', playerId: speaker.playerId });
+        // Apply spatial processing
+        const stereo = this.mixer.processVoice(senderId, processed);
+        if (stereo) {
+          stereoStreams.push(stereo);
+        }
+
+        // Track speaking player
+        let speaker = this.speakingPlayers.get(senderId);
+        if (!speaker) {
+          speaker = {
+            playerId: '',  // Will be resolved from network state
+            senderId,
+            lastActivity: now,
+          };
+          this.speakingPlayers.set(senderId, speaker);
+          this.emitEvent({ type: 'speaking-start', playerId: speaker.playerId });
+          console.log(`[VoiceManager] Speaking started from ${senderId.toString(16)}`);
+        }
+        speaker.lastActivity = now;
       }
+
+      // Mix and play
+      if (stereoStreams.length > 0) {
+        const mixed = this.mixer.mixStreams(stereoStreams);
+        this.playback.queueFrame(mixed);
+      }
+
+      // Cleanup inactive speakers
+      for (const [senderId, speaker] of this.speakingPlayers) {
+        if (now - speaker.lastActivity > 300) {  // 300ms timeout
+          this.speakingPlayers.delete(senderId);
+          this.emitEvent({ type: 'speaking-stop', playerId: speaker.playerId });
+        }
+      }
+    } catch (error) {
+      // Swallow errors to prevent playback crashes
+      console.error('[VoiceManager] Playback error:', error);
     }
   }
 
@@ -442,6 +463,7 @@ export class VoiceManager {
     destroyVoiceClient();
     destroySpatialMixer();
     destroyVoicePlayback();
+    destroyVoicePostProcessor();
 
     this.codec = null;
     this.mic = null;

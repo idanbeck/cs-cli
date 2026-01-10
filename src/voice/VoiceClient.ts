@@ -95,16 +95,24 @@ export class VoiceClient {
    */
   sendVoice(samples: Int16Array, vadActive: boolean): void {
     if (!this.sendBinary) {
-      console.warn('[VoiceClient] sendBinary callback not set');
-      return;
+      return;  // Silent - callback not set yet
     }
-    if (!this.codec.isInitialized) {
-      console.warn('[VoiceClient] codec not initialized');
+    if (!this.codec || !this.codec.isInitialized) {
+      return;  // Silent - codec not ready yet
+    }
+
+    // Encode samples - wrap in try-catch to prevent crashes
+    let payload: Uint8Array;
+    try {
+      payload = this.codec.encode(samples);
+    } catch (error) {
+      console.error('[VoiceClient] Encode error:', error);
       return;
     }
 
-    // Encode samples
-    const payload = this.codec.encode(samples);
+    if (!payload || payload.length === 0) {
+      return;  // Encoding failed
+    }
 
     // Build flags
     let flags = 0;
@@ -149,10 +157,18 @@ export class VoiceClient {
       return true;
     }
 
-    // Decode audio
+    // Decode audio - wrap in try-catch to prevent crashes
     let samples: Int16Array;
     try {
+      if (!this.codec || !this.codec.isInitialized) {
+        console.warn('[VoiceClient] Codec not ready, dropping frame');
+        return true;  // Codec not ready
+      }
       samples = this.codec.decode(frame.payload);
+      if (!samples || samples.length === 0) {
+        console.warn('[VoiceClient] Decode returned empty samples');
+        return true;  // Decoding failed
+      }
     } catch (error) {
       console.error('[VoiceClient] Decode error:', error);
       return true;
@@ -170,6 +186,11 @@ export class VoiceClient {
 
     // Push to jitter buffer
     this.jitterManager.pushFrame(decoded);
+
+    // Log receipt (every 50 frames to avoid spam)
+    if (frame.sequence % 50 === 0) {
+      console.log(`[VoiceClient] Received voice frame from ${frame.senderId.toString(16)}, seq=${frame.sequence}, buffers=${this.jitterManager.count}`);
+    }
 
     return true;
   }

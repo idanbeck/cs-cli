@@ -311,6 +311,9 @@ export class GameClient {
     }
   }
 
+  // Track binary message stats for logging
+  private binaryMessageCount = 0;
+
   /**
    * Handle raw message data (binary or text)
    */
@@ -319,12 +322,20 @@ export class GameClient {
     if (data instanceof ArrayBuffer) {
       const uint8 = new Uint8Array(data);
       if (isVoiceFrame(uint8)) {
+        this.binaryMessageCount++;
+        if (this.binaryMessageCount % 50 === 0) {
+          console.log(`[GameClient] Received ${this.binaryMessageCount} voice frames (ArrayBuffer)`);
+        }
         this.callbacks.onVoiceData?.(uint8);
         return;
       }
     } else if (Buffer.isBuffer(data)) {
       if (data.length > 0 && data[0] === 0x01) {
         const uint8 = new Uint8Array(data.buffer, data.byteOffset, data.length);
+        this.binaryMessageCount++;
+        if (this.binaryMessageCount % 50 === 0) {
+          console.log(`[GameClient] Received ${this.binaryMessageCount} voice frames (Buffer)`);
+        }
         this.callbacks.onVoiceData?.(uint8);
         return;
       }
@@ -333,6 +344,10 @@ export class GameClient {
       const combined = Buffer.concat(data);
       if (combined.length > 0 && combined[0] === 0x01) {
         const uint8 = new Uint8Array(combined.buffer, combined.byteOffset, combined.length);
+        this.binaryMessageCount++;
+        if (this.binaryMessageCount % 50 === 0) {
+          console.log(`[GameClient] Received ${this.binaryMessageCount} voice frames (BufferArray)`);
+        }
         this.callbacks.onVoiceData?.(uint8);
         return;
       }

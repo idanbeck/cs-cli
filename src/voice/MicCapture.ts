@@ -77,6 +77,11 @@ export class MicCapture {
   private avgRMS = 0;             // Smoothed RMS for AGC
   private dcOffset = 0;           // DC offset removal
 
+  // Cached device list (getDevices can crash, so cache it)
+  private cachedInputDevices: AudioDevice[] | null = null;
+  private cachedOutputDevices: AudioDevice[] | null = null;
+  private deviceEnumerationFailed = false;
+
   constructor() {
     this.frameBuffer = new Int16Array(VOICE_FRAME_SAMPLES);
   }
@@ -97,14 +102,46 @@ export class MicCapture {
   }
 
   /**
+   * Safely enumerate devices (can crash in some contexts, so we cache and handle errors)
+   */
+  private safeGetDevices(): PortAudioDevice[] {
+    if (!this.portaudio || this.deviceEnumerationFailed) return [];
+
+    try {
+      return this.portaudio.getDevices();
+    } catch (error) {
+      console.error('[MicCapture] Device enumeration failed:', error);
+      this.deviceEnumerationFailed = true;
+      return [];
+    }
+  }
+
+  /**
    * Get list of available input devices
+   * Note: Device enumeration can crash in some contexts - returns cached or empty list on failure
    */
   getInputDevices(): AudioDevice[] {
     if (!this.portaudio) return [];
 
+    // Return cached if available
+    if (this.cachedInputDevices !== null) {
+      return this.cachedInputDevices;
+    }
+
+    // Don't try to enumerate if we know it failed before
+    if (this.deviceEnumerationFailed) {
+      return [{ id: 'default', name: 'Default Input', isDefault: true, isInput: true }];
+    }
+
     try {
-      const devices = this.portaudio.getDevices();
-      return devices
+      const devices = this.safeGetDevices();
+      if (devices.length === 0) {
+        // Return a default entry if enumeration failed
+        this.cachedInputDevices = [{ id: 'default', name: 'Default Input', isDefault: true, isInput: true }];
+        return this.cachedInputDevices;
+      }
+
+      this.cachedInputDevices = devices
         .filter((d: PortAudioDevice) => d.maxInputChannels > 0)
         .map((d: PortAudioDevice) => ({
           id: String(d.id),
@@ -112,21 +149,40 @@ export class MicCapture {
           isDefault: d.id === this.getDefaultInputDeviceId(),
           isInput: true,
         }));
+
+      return this.cachedInputDevices;
     } catch (error) {
       console.error('[MicCapture] Failed to enumerate input devices:', error);
-      return [];
+      this.cachedInputDevices = [{ id: 'default', name: 'Default Input', isDefault: true, isInput: true }];
+      return this.cachedInputDevices;
     }
   }
 
   /**
    * Get list of available output devices
+   * Note: Device enumeration can crash in some contexts - returns cached or empty list on failure
    */
   getOutputDevices(): AudioDevice[] {
     if (!this.portaudio) return [];
 
+    // Return cached if available
+    if (this.cachedOutputDevices !== null) {
+      return this.cachedOutputDevices;
+    }
+
+    // Don't try to enumerate if we know it failed before
+    if (this.deviceEnumerationFailed) {
+      return [{ id: 'default', name: 'Default Output', isDefault: true, isInput: false }];
+    }
+
     try {
-      const devices = this.portaudio.getDevices();
-      return devices
+      const devices = this.safeGetDevices();
+      if (devices.length === 0) {
+        this.cachedOutputDevices = [{ id: 'default', name: 'Default Output', isDefault: true, isInput: false }];
+        return this.cachedOutputDevices;
+      }
+
+      this.cachedOutputDevices = devices
         .filter((d: PortAudioDevice) => d.maxOutputChannels > 0)
         .map((d: PortAudioDevice) => ({
           id: String(d.id),
@@ -134,9 +190,12 @@ export class MicCapture {
           isDefault: d.id === this.getDefaultOutputDeviceId(),
           isInput: false,
         }));
+
+      return this.cachedOutputDevices;
     } catch (error) {
       console.error('[MicCapture] Failed to enumerate output devices:', error);
-      return [];
+      this.cachedOutputDevices = [{ id: 'default', name: 'Default Output', isDefault: true, isInput: false }];
+      return this.cachedOutputDevices;
     }
   }
 
@@ -144,11 +203,13 @@ export class MicCapture {
    * Get default output device ID
    */
   private getDefaultOutputDeviceId(): number {
-    if (!this.portaudio) return -1;
+    if (!this.portaudio || this.deviceEnumerationFailed) return -1;
 
     try {
-      // portaudio doesn't have getDefaultOutputDevice, so find first device with output channels
-      const devices = this.portaudio.getDevices();
+      // Use cached devices if available
+      const devices = this.cachedOutputDevices
+        ? this.safeGetDevices()
+        : this.safeGetDevices();
       const outputDevice = devices.find((d: PortAudioDevice) => d.maxOutputChannels > 0);
       return outputDevice?.id ?? -1;
     } catch {
@@ -160,7 +221,7 @@ export class MicCapture {
    * Get default input device ID
    */
   private getDefaultInputDeviceId(): number {
-    if (!this.portaudio) return -1;
+    if (!this.portaudio || this.deviceEnumerationFailed) return -1;
 
     try {
       const device = this.portaudio.getDefaultInputDevice();
@@ -186,48 +247,55 @@ export class MicCapture {
    * Start capturing audio
    *
    * @param onFrame Callback invoked with each 160-sample frame
+   * @throws Error if capture fails to start
    */
   start(onFrame: FrameCallback): void {
-    if (this.isCapturing || !this.portaudio) {
-      return;
+    if (this.isCapturing) {
+      return; // Already capturing
+    }
+
+    if (!this.portaudio) {
+      throw new Error('PortAudio not available');
     }
 
     this.onFrame = onFrame;
     this.frameOffset = 0;
 
-    try {
-      const inputOptions: AudioIOOptions = {
-        channelCount: 1,
-        sampleFormat: this.portaudio.SampleFormat16Bit,
-        sampleRate: VOICE_SAMPLE_RATE,
-        highwaterMark: 320,  // ~2 frames buffer
-      };
+    const inputOptions: AudioIOOptions = {
+      channelCount: 1,
+      sampleFormat: this.portaudio.SampleFormat16Bit,
+      sampleRate: VOICE_SAMPLE_RATE,
+      highwaterMark: 320,  // ~2 frames buffer
+    };
 
-      if (this.deviceId >= 0) {
-        inputOptions.deviceId = this.deviceId;
-      }
-
-      this.audioIO = new this.portaudio.AudioIO({
-        inOptions: inputOptions,
-      });
-
-      this.audioIO.on('data', (data: Buffer) => {
-        this.processAudioData(data);
-      });
-
-      this.audioIO.on('error', (_error: Error) => {
-        // Audio error - ignore silently
-      });
-
-      this.audioIO.on('close', () => {
-        // Stream closed
-      });
-
-      this.audioIO.start();
-      this.isCapturing = true;
-    } catch (error) {
-      this.isCapturing = false;
+    if (this.deviceId >= 0) {
+      inputOptions.deviceId = this.deviceId;
     }
+
+    this.audioIO = new this.portaudio.AudioIO({
+      inOptions: inputOptions,
+    });
+
+    this.audioIO.on('data', (data: Buffer) => {
+      try {
+        this.processAudioData(data);
+      } catch (error) {
+        // Swallow errors in audio callback to prevent crashes
+        console.error('[MicCapture] Error in audio callback:', error);
+      }
+    });
+
+    this.audioIO.on('error', (error: Error) => {
+      console.error('[MicCapture] Audio error:', error.message);
+      this.isCapturing = false;
+    });
+
+    this.audioIO.on('close', () => {
+      this.isCapturing = false;
+    });
+
+    this.audioIO.start();
+    this.isCapturing = true;
   }
 
   /**

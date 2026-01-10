@@ -150,9 +150,10 @@ export class RoomManager {
     client.name = playerName;
     client.roomId = roomId;
     client.isReady = false;
-    room.addPlayer(clientId, client);
 
-    // Send join confirmation
+    // IMPORTANT: Send join confirmation BEFORE addPlayer
+    // addPlayer sends existing player info, and client resets lobby on room_joined
+    // So room_joined must come first, otherwise existing players get cleared
     this.sendToClient(clientId, {
       type: 'room_joined',
       roomId,
@@ -160,12 +161,11 @@ export class RoomManager {
       room: room.getInfo(),
     });
 
-    // Notify other players
-    room.broadcastExcept(clientId, {
-      type: 'player_joined',
-      playerId: clientId,
-      playerName,
-    });
+    // Now add player - this sends existing player info to new joiner
+    room.addPlayer(clientId, client);
+
+    // Notify other players (this is also done in room.addPlayer, so remove duplicate)
+    // Note: room.addPlayer already broadcasts to other clients
 
     console.log(`${playerName} (${clientId}) joined room ${roomId}`);
     return true;

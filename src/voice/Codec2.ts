@@ -1,204 +1,317 @@
 /**
- * Codec2 WASM Wrapper
+ * Codec2 Native Speech Codec Wrapper
  *
- * Wraps the Codec2 vocoder library compiled to WebAssembly.
- * Provides ultra-low bitrate speech encoding (2400bps target).
+ * Wraps the native Codec2 speech codec library via N-API bindings.
+ * Codec2 is an open-source ultra-low bitrate speech codec optimized for
+ * voice communication over narrow bandwidth channels.
  *
- * Codec2 2400bps mode:
- * - Input: 160 samples (20ms at 8kHz)
- * - Output: 6 bytes (48 bits)
+ * Supported modes:
+ *   3200 bps - Best quality, 20ms frames, 8 bytes/frame
+ *   2400 bps - Good quality, 20ms frames, 6 bytes/frame
+ *   1600 bps - Moderate quality, 40ms frames, 8 bytes/frame
+ *   1400 bps - 40ms frames, 7 bytes/frame
+ *   1300 bps - 40ms frames, 6.5 bytes/frame
+ *   1200 bps - 40ms frames, 6 bytes/frame
+ *   700C bps - Lowest bitrate, 40ms frames, 4 bytes/frame
  */
 
-import { readFile } from 'fs/promises';
-import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
+import * as path from "path";
+import { fileURLToPath } from "url";
+import { createRequire } from "module";
 import {
-  Codec2Mode,
-  CODEC2_PAYLOAD_SIZE,
+  Codec2Mode as Codec2ModeEnum,
   VOICE_SAMPLE_RATE,
   VOICE_FRAME_SAMPLES,
-} from './types.js';
+} from "./types.js";
 
-// Codec2 WASM module interface
-interface Codec2WasmModule {
-  _codec2_create(mode: number): number;
-  _codec2_destroy(codec: number): void;
-  _codec2_encode(codec: number, bits: number, speech: number): void;
-  _codec2_decode(codec: number, speech: number, bits: number): void;
-  _codec2_samples_per_frame(codec: number): number;
-  _codec2_bits_per_frame(codec: number): number;
-  _malloc(size: number): number;
-  _free(ptr: number): void;
-  HEAPU8: Uint8Array;
-  HEAP16: Int16Array;
+// Re-export the enum for backwards compatibility
+export { Codec2Mode as Codec2ModeEnum } from "./types.js";
+
+// ESM compatibility - get __dirname equivalent
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const require = createRequire(import.meta.url);
+
+// String-based mode type for native API
+export type Codec2ModeString =
+  | "3200"
+  | "2400"
+  | "1600"
+  | "1400"
+  | "1300"
+  | "1200"
+  | "700C";
+
+// Native module interface
+interface NativeCodec2 {
+  getModes(): Codec2ModeString[];
+  getModeInfo(mode: Codec2ModeString): Codec2ModeInfo;
+  encode(mode: Codec2ModeString, samples: Int16Array): Uint8Array;
+  decode(mode: Codec2ModeString, bytes: Uint8Array): Int16Array;
+  encodeFrame(mode: Codec2ModeString, samples: Int16Array): Uint8Array;
+  decodeFrame(mode: Codec2ModeString, bytes: Uint8Array): Int16Array;
+}
+
+export interface Codec2ModeInfo {
+  samplesPerFrame: number; // Audio samples per frame (160 or 320 @ 8kHz)
+  bytesPerFrame: number; // Compressed bytes per frame
+  bitsPerFrame: number; // Compressed bits per frame
+  bitrate: number; // Bits per second
+  frameDurationMs: number; // Frame duration in milliseconds (20 or 40)
+}
+
+// Load native module
+const nativeCodec2: NativeCodec2 | null = (() => {
+  try {
+    // Try multiple possible paths
+    const paths = [
+      path.join(__dirname, "../../native/build/Release/codec2.node"),
+      path.join(process.cwd(), "native/build/Release/codec2.node"),
+    ];
+
+    for (const p of paths) {
+      try {
+        return require(p);
+      } catch {
+        continue;
+      }
+    }
+    return null;
+  } catch (e) {
+    // Silent fail - will use LPC fallback
+    return null;
+  }
+})();
+
+// Map enum to string mode
+function modeEnumToString(mode: Codec2ModeEnum): Codec2ModeString {
+  switch (mode) {
+    case Codec2ModeEnum.MODE_3200:
+      return "3200";
+    case Codec2ModeEnum.MODE_2400:
+      return "2400";
+    case Codec2ModeEnum.MODE_1600:
+      return "1600";
+    case Codec2ModeEnum.MODE_1400:
+      return "1400";
+    case Codec2ModeEnum.MODE_1300:
+      return "1300";
+    case Codec2ModeEnum.MODE_1200:
+      return "1200";
+    case Codec2ModeEnum.MODE_700C:
+    default:
+      return "700C";
+  }
 }
 
 /**
  * Codec2 encoder/decoder instance
+ *
+ * Now uses native Codec2 library via N-API bindings.
+ * Falls back to LPC-based synthesis when native module unavailable.
  */
 export class Codec2 {
-  private wasmModule: Codec2WasmModule | null = null;
-  private codecPtr: number = 0;
-  private speechPtr: number = 0;
-  private bitsPtr: number = 0;
-  private mode: Codec2Mode;
-  private samplesPerFrame: number = VOICE_FRAME_SAMPLES;
-  private bytesPerFrame: number = CODEC2_PAYLOAD_SIZE;
+  private modeEnum: Codec2ModeEnum;
+  private modeString: Codec2ModeString;
+  private modeInfo: Codec2ModeInfo | null = null;
   private _isInitialized = false;
 
-  constructor(mode: Codec2Mode = Codec2Mode.MODE_2400) {
-    this.mode = mode;
+  // Fallback LPC state
+  private hpState1 = 0;
+  private hpState2 = 0;
+  private lpState1 = 0;
+  private lpState2 = 0;
+
+  constructor(mode: Codec2ModeEnum = Codec2ModeEnum.MODE_2400) {
+    this.modeEnum = mode;
+    this.modeString = modeEnumToString(mode);
   }
 
   /**
-   * Initialize the Codec2 WASM module
+   * Initialize the Codec2 module
    */
   async initialize(): Promise<void> {
     if (this._isInitialized) return;
 
-    try {
-      // Try to load WASM module
-      const wasmPath = this.getWasmPath();
-      this.wasmModule = await this.loadWasmModule(wasmPath);
-
-      if (this.wasmModule) {
-        // Create codec instance
-        this.codecPtr = this.wasmModule._codec2_create(this.mode);
-        if (this.codecPtr === 0) {
-          throw new Error('Failed to create Codec2 instance');
-        }
-
-        // Get frame sizes
-        this.samplesPerFrame = this.wasmModule._codec2_samples_per_frame(this.codecPtr);
-        const bitsPerFrame = this.wasmModule._codec2_bits_per_frame(this.codecPtr);
-        this.bytesPerFrame = Math.ceil(bitsPerFrame / 8);
-
-        // Allocate buffers
-        this.speechPtr = this.wasmModule._malloc(this.samplesPerFrame * 2); // 16-bit samples
-        this.bitsPtr = this.wasmModule._malloc(this.bytesPerFrame);
-      }
-    } catch (error) {
-      // Fall back to LPC mode when WASM not available
-      this.wasmModule = null;
+    if (nativeCodec2) {
+      this.modeInfo = nativeCodec2.getModeInfo(this.modeString);
+    } else {
+      // Fallback mode info
+      this.modeInfo = {
+        samplesPerFrame: VOICE_FRAME_SAMPLES,
+        bytesPerFrame: 16, // LPC fallback uses 16 bytes
+        bitsPerFrame: 128,
+        bitrate: 6400, // 16 bytes * 8 bits / 0.02s = 6400 bps
+        frameDurationMs: 20,
+      };
     }
 
     this._isInitialized = true;
   }
 
   /**
-   * Get path to WASM file
+   * Check if native Codec2 is available
    */
-  private getWasmPath(): string {
-    const __filename = fileURLToPath(import.meta.url);
-    const __dirname = dirname(__filename);
-    return join(__dirname, 'codec2.wasm');
+  static isNativeAvailable(): boolean {
+    return nativeCodec2 !== null;
   }
 
   /**
-   * Load WASM module
+   * Get available codec modes
    */
-  private async loadWasmModule(wasmPath: string): Promise<Codec2WasmModule | null> {
-    try {
-      const wasmBuffer = await readFile(wasmPath);
-
-      // Simple WASM instantiation - real implementation would use Emscripten loader
-      const wasmModule = await WebAssembly.instantiate(wasmBuffer, {
-        env: {
-          memory: new WebAssembly.Memory({ initial: 256 }),
-          __memory_base: 0,
-          __table_base: 0,
-          abort: () => { throw new Error('WASM abort'); },
-        },
-      });
-
-      return wasmModule.instance.exports as unknown as Codec2WasmModule;
-    } catch {
-      return null;
+  static getModes(): Codec2ModeString[] {
+    if (nativeCodec2) {
+      return nativeCodec2.getModes();
     }
+    return ["3200", "2400", "1600", "1400", "1300", "1200", "700C"];
+  }
+
+  /**
+   * Get info about a specific mode
+   */
+  static getModeInfo(mode: Codec2ModeString): Codec2ModeInfo | null {
+    if (nativeCodec2) {
+      return nativeCodec2.getModeInfo(mode);
+    }
+    // Approximate info for fallback
+    const infos: Record<Codec2ModeString, Codec2ModeInfo> = {
+      "3200": {
+        samplesPerFrame: 160,
+        bytesPerFrame: 8,
+        bitsPerFrame: 64,
+        bitrate: 3200,
+        frameDurationMs: 20,
+      },
+      "2400": {
+        samplesPerFrame: 160,
+        bytesPerFrame: 6,
+        bitsPerFrame: 48,
+        bitrate: 2400,
+        frameDurationMs: 20,
+      },
+      "1600": {
+        samplesPerFrame: 320,
+        bytesPerFrame: 8,
+        bitsPerFrame: 64,
+        bitrate: 1600,
+        frameDurationMs: 40,
+      },
+      "1400": {
+        samplesPerFrame: 320,
+        bytesPerFrame: 7,
+        bitsPerFrame: 56,
+        bitrate: 1400,
+        frameDurationMs: 40,
+      },
+      "1300": {
+        samplesPerFrame: 320,
+        bytesPerFrame: 7,
+        bitsPerFrame: 52,
+        bitrate: 1300,
+        frameDurationMs: 40,
+      },
+      "1200": {
+        samplesPerFrame: 320,
+        bytesPerFrame: 6,
+        bitsPerFrame: 48,
+        bitrate: 1200,
+        frameDurationMs: 40,
+      },
+      "700C": {
+        samplesPerFrame: 320,
+        bytesPerFrame: 4,
+        bitsPerFrame: 28,
+        bitrate: 700,
+        frameDurationMs: 40,
+      },
+    };
+    return infos[mode] || null;
   }
 
   /**
    * Encode audio samples to Codec2 bitstream
    *
-   * @param samples 160 16-bit samples (20ms at 8kHz)
-   * @returns 6 bytes of encoded data
+   * @param samples 16-bit signed PCM samples at 8kHz
+   * @returns Compressed codec2 data
    */
   encode(samples: Int16Array): Uint8Array {
     if (!this._isInitialized) {
-      throw new Error('Codec2 not initialized');
+      throw new Error("Codec2 not initialized");
     }
 
-    // If WASM is available, use it
-    if (this.wasmModule && this.codecPtr) {
-      // Copy samples to WASM memory
-      const heap16 = this.wasmModule.HEAP16;
-      const speechOffset = this.speechPtr >> 1; // Divide by 2 for 16-bit array
-      for (let i = 0; i < this.samplesPerFrame; i++) {
-        heap16[speechOffset + i] = samples[i] || 0;
-      }
-
-      // Encode
-      this.wasmModule._codec2_encode(this.codecPtr, this.bitsPtr, this.speechPtr);
-
-      // Copy result
-      const result = new Uint8Array(this.bytesPerFrame);
-      result.set(this.wasmModule.HEAPU8.subarray(this.bitsPtr, this.bitsPtr + this.bytesPerFrame));
-      return result;
+    if (nativeCodec2) {
+      return nativeCodec2.encode(this.modeString, samples);
     }
 
-    // Fallback: simple compression for testing
+    // Fallback to LPC
     return this.fallbackEncode(samples);
   }
 
   /**
    * Decode Codec2 bitstream to audio samples
    *
-   * @param bits 6 bytes of encoded data
-   * @returns 160 16-bit samples (20ms at 8kHz)
+   * @param bits Compressed codec2 data
+   * @returns 16-bit signed PCM samples at 8kHz
    */
   decode(bits: Uint8Array): Int16Array {
     if (!this._isInitialized) {
-      throw new Error('Codec2 not initialized');
+      throw new Error("Codec2 not initialized");
     }
 
-    // If WASM is available, use it
-    if (this.wasmModule && this.codecPtr) {
-      // Copy bits to WASM memory
-      this.wasmModule.HEAPU8.set(bits, this.bitsPtr);
-
-      // Decode
-      this.wasmModule._codec2_decode(this.codecPtr, this.speechPtr, this.bitsPtr);
-
-      // Copy result
-      const result = new Int16Array(this.samplesPerFrame);
-      const heap16 = this.wasmModule.HEAP16;
-      const speechOffset = this.speechPtr >> 1;
-      for (let i = 0; i < this.samplesPerFrame; i++) {
-        result[i] = heap16[speechOffset + i];
-      }
-      return result;
+    if (nativeCodec2) {
+      return nativeCodec2.decode(this.modeString, bits);
     }
 
-    // Fallback: simple decompression for testing
+    // Fallback to LPC
     return this.fallbackDecode(bits);
   }
 
-  // Bandpass filter state (persistent across frames for continuity)
-  private hpState1 = 0;  // High-pass filter state
-  private hpState2 = 0;
-  private lpState1 = 0;  // Low-pass filter state
-  private lpState2 = 0;
+  /**
+   * Get samples per frame
+   */
+  getSamplesPerFrame(): number {
+    return this.modeInfo?.samplesPerFrame || VOICE_FRAME_SAMPLES;
+  }
 
   /**
-   * Apply bandpass filter (120Hz - 2500Hz) to focus on speech frequencies
-   * Uses cascaded biquad filters for stability
+   * Get bytes per frame
+   */
+  getBytesPerFrame(): number {
+    return this.modeInfo?.bytesPerFrame || 16;
+  }
+
+  /**
+   * Check if initialized
+   */
+  get isInitialized(): boolean {
+    return this._isInitialized;
+  }
+
+  /**
+   * Check if using real native codec or fallback
+   */
+  get isWasmAvailable(): boolean {
+    // Kept for backwards compatibility - now checks native availability
+    return nativeCodec2 !== null;
+  }
+
+  /**
+   * Cleanup resources
+   */
+  destroy(): void {
+    this._isInitialized = false;
+  }
+
+  // ========== Fallback LPC Implementation ==========
+
+  /**
+   * Apply bandpass filter (120Hz - 2500Hz)
    */
   private applyBandpassFilter(samples: Int16Array): Float32Array {
     const N = samples.length;
     const output = new Float32Array(N);
 
-    // High-pass filter coefficients (120Hz cutoff at 8kHz sample rate)
-    // 2nd order Butterworth - removes rumble and DC
+    // High-pass filter coefficients (120Hz cutoff at 8kHz)
     const hpCutoff = 120 / (VOICE_SAMPLE_RATE / 2);
     const hpQ = 0.707;
     const hpW0 = Math.PI * hpCutoff;
@@ -211,8 +324,7 @@ export class Codec2 {
     const hpA1 = (-2 * hpCosW0) / hpA0;
     const hpA2 = (1 - hpAlpha) / hpA0;
 
-    // Low-pass filter coefficients (2500Hz cutoff at 8kHz sample rate)
-    // 2nd order Butterworth - allows more high frequency for transients
+    // Low-pass filter coefficients (2500Hz cutoff)
     const lpCutoff = 2500 / (VOICE_SAMPLE_RATE / 2);
     const lpQ = 0.707;
     const lpW0 = Math.PI * lpCutoff;
@@ -225,27 +337,37 @@ export class Codec2 {
     const lpA1 = (-2 * lpCosW0) / lpA0;
     const lpA2 = (1 - lpAlpha) / lpA0;
 
-    // Apply high-pass filter
-    let x1 = 0, x2 = 0, y1 = this.hpState1, y2 = this.hpState2;
+    // Apply high-pass
+    let x1 = 0,
+      x2 = 0,
+      y1 = this.hpState1,
+      y2 = this.hpState2;
     const hpFiltered = new Float32Array(N);
     for (let i = 0; i < N; i++) {
       const x0 = samples[i];
       const y0 = hpB0 * x0 + hpB1 * x1 + hpB2 * x2 - hpA1 * y1 - hpA2 * y2;
       hpFiltered[i] = y0;
-      x2 = x1; x1 = x0;
-      y2 = y1; y1 = y0;
+      x2 = x1;
+      x1 = x0;
+      y2 = y1;
+      y1 = y0;
     }
     this.hpState1 = y1;
     this.hpState2 = y2;
 
-    // Apply low-pass filter
-    x1 = 0; x2 = 0; y1 = this.lpState1; y2 = this.lpState2;
+    // Apply low-pass
+    x1 = 0;
+    x2 = 0;
+    y1 = this.lpState1;
+    y2 = this.lpState2;
     for (let i = 0; i < N; i++) {
       const x0 = hpFiltered[i];
       const y0 = lpB0 * x0 + lpB1 * x1 + lpB2 * x2 - lpA1 * y1 - lpA2 * y2;
       output[i] = y0;
-      x2 = x1; x1 = x0;
-      y2 = y1; y1 = y0;
+      x2 = x1;
+      x1 = x0;
+      y2 = y1;
+      y1 = y0;
     }
     this.lpState1 = y1;
     this.lpState2 = y2;
@@ -254,27 +376,15 @@ export class Codec2 {
   }
 
   /**
-   * Fallback encoder using enhanced LPC (Linear Predictive Coding)
-   * This provides intelligible vocoded speech when WASM is not available.
-   *
-   * Encodes 160 samples into 16 bytes:
-   * - Bytes 0-1: Energy (16-bit for better dynamic range)
-   * - Byte 2: Pitch period (0 = unvoiced, 1-255 = voiced pitch in samples)
-   * - Byte 3: Voicing strength (0-255)
-   * - Bytes 4-15: 12 LPC reflection coefficients (8 bits each)
-   *
-   * Uses 12 LPC coefficients for detailed formant modeling
-   * Includes bandpass filtering (120Hz-2.5kHz) and pre-emphasis
+   * Fallback encoder using LPC
    */
   private fallbackEncode(samples: Int16Array): Uint8Array {
-    const result = new Uint8Array(CODEC2_PAYLOAD_SIZE);
+    const result = new Uint8Array(16);
     const N = samples.length;
 
-    // Apply bandpass filter (120Hz - 2.5kHz) to focus on speech frequencies
     const bandpassed = this.applyBandpassFilter(samples);
 
-    // Pre-emphasis filter (boost high frequencies for better LPC analysis)
-    // H(z) = 1 - 0.97*z^-1
+    // Pre-emphasis
     const preEmphasis = 0.97;
     const emphasized = new Float32Array(N);
     emphasized[0] = bandpassed[0];
@@ -282,34 +392,32 @@ export class Codec2 {
       emphasized[i] = bandpassed[i] - preEmphasis * bandpassed[i - 1];
     }
 
-    // Calculate energy (RMS of emphasized signal)
+    // Calculate energy
     let sumSquares = 0;
     for (let i = 0; i < N; i++) {
       sumSquares += emphasized[i] * emphasized[i];
     }
     const rms = Math.sqrt(sumSquares / N);
-
-    // Energy quantization (16-bit for better dynamic range)
-    // Map log energy to 0-65535 range
     const logEnergy = rms > 1 ? Math.log(rms) / Math.log(32768) : 0;
-    const energyQuant = Math.max(0, Math.min(65535, Math.floor(logEnergy * 65535)));
-    result[0] = energyQuant & 0xFF;         // Low byte
-    result[1] = (energyQuant >> 8) & 0xFF;  // High byte
+    const energyQuant = Math.max(
+      0,
+      Math.min(65535, Math.floor(logEnergy * 65535))
+    );
+    result[0] = energyQuant & 0xff;
+    result[1] = (energyQuant >> 8) & 0xff;
 
-    // Pitch detection using autocorrelation
-    const minPitch = 16;  // ~500 Hz max
-    const maxPitch = 100; // ~80 Hz min
+    // Pitch detection
+    const minPitch = 16;
+    const maxPitch = 100;
     let bestPitch = 0;
     let bestCorr = 0;
 
-    // Calculate autocorrelation at lag 0 for normalization
     let r0 = 0;
     for (let i = 0; i < N; i++) {
       r0 += emphasized[i] * emphasized[i];
     }
 
     if (r0 > 1000) {
-      // Find pitch using autocorrelation
       for (let lag = minPitch; lag <= maxPitch; lag++) {
         let corr = 0;
         for (let i = 0; i < N - lag; i++) {
@@ -321,40 +429,32 @@ export class Codec2 {
           bestPitch = lag;
         }
       }
-
-      // Voicing decision - require strong correlation
       if (bestCorr < 0.25) {
-        bestPitch = 0; // Unvoiced
+        bestPitch = 0;
       }
     }
     result[2] = bestPitch;
+    result[3] = Math.max(0, Math.min(255, Math.floor(bestCorr * 255)));
 
-    // Voicing strength (0-255) - used for mixed excitation
-    const voicingStrength = Math.max(0, Math.min(255, Math.floor(bestCorr * 255)));
-    result[3] = voicingStrength;
-
-    // LPC analysis using autocorrelation method (Levinson-Durbin)
-    // Use 12 coefficients for detailed formant modeling
+    // LPC analysis
     const order = 12;
     const r = new Float32Array(order + 1);
 
-    // Calculate autocorrelation with Hamming window
     for (let k = 0; k <= order; k++) {
       let sum = 0;
       for (let i = 0; i < N - k; i++) {
-        const w = 0.54 - 0.46 * Math.cos(2 * Math.PI * i / (N - 1));
+        const w = 0.54 - 0.46 * Math.cos((2 * Math.PI * i) / (N - 1));
         sum += emphasized[i] * emphasized[i + k] * w;
       }
       r[k] = sum;
     }
 
-    // Bandwidth expansion to prevent filter instability
     const bwExpand = 0.994;
     for (let k = 1; k <= order; k++) {
       r[k] *= Math.pow(bwExpand, k);
     }
 
-    // Levinson-Durbin recursion to get reflection coefficients
+    // Levinson-Durbin
     const reflectionCoeffs = new Float32Array(order);
     const a = new Float32Array(order + 1);
     a[0] = 1;
@@ -381,13 +481,11 @@ export class Codec2 {
       if (e < 1e-10) e = 1e-10;
     }
 
-    // Quantize 12 reflection coefficients to 8 bits each
-    // Use arcsine quantization for better distribution near ±1
+    // Quantize reflection coefficients
     for (let i = 0; i < 12; i++) {
       const k = reflectionCoeffs[i];
-      // Arcsine transform for better quantization of values near ±1
       const arcsin = Math.asin(Math.max(-0.99, Math.min(0.99, k)));
-      const normalized = (arcsin / (Math.PI / 2) + 1) * 127.5; // Map to 0-255
+      const normalized = (arcsin / (Math.PI / 2) + 1) * 127.5;
       result[4 + i] = Math.max(0, Math.min(255, Math.round(normalized)));
     }
 
@@ -395,42 +493,34 @@ export class Codec2 {
   }
 
   /**
-   * Fallback decoder using enhanced LPC synthesis with sawtooth excitation
-   *
-   * Decodes 16 bytes:
-   * - Bytes 0-1: Energy (16-bit)
-   * - Byte 2: Pitch period
-   * - Byte 3: Voicing strength
-   * - Bytes 4-15: 12 LPC reflection coefficients (8-bit each)
+   * Fallback decoder using LPC synthesis
    */
   private fallbackDecode(bits: Uint8Array): Int16Array {
     const result = new Int16Array(VOICE_FRAME_SAMPLES);
     const order = 12;
 
-    // Decode 16-bit energy
+    // Decode energy
     const energyQuant = bits[0] | (bits[1] << 8);
     const logEnergy = energyQuant / 65535;
     const energy = Math.pow(32768, logEnergy);
-    const gain = energy / 3; // Scale factor
+    const gain = energy / 3;
 
     // Decode pitch and voicing
     const pitch = bits[2];
     const voicingStrength = bits[3];
     const voiced = pitch > 0 && voicingStrength > 30;
-    const voicingMix = voicingStrength / 255; // 0 = all noise, 1 = all voiced
+    const voicingMix = voicingStrength / 255;
 
-    // Decode 12 LPC reflection coefficients (8 bits each)
+    // Decode reflection coefficients
     const reflectionCoeffs = new Float32Array(order);
     for (let i = 0; i < 12; i++) {
       const quantized = bits[4 + i];
-      // Inverse arcsine transform
-      const normalized = (quantized / 127.5) - 1; // Map back to [-1, 1]
+      const normalized = quantized / 127.5 - 1;
       reflectionCoeffs[i] = Math.sin(normalized * (Math.PI / 2));
-      // Clamp to ensure stability
       reflectionCoeffs[i] = Math.max(-0.98, Math.min(0.98, reflectionCoeffs[i]));
     }
 
-    // Convert reflection coefficients to LPC coefficients
+    // Convert to LPC coefficients
     const a = new Float32Array(order + 1);
     a[0] = 1;
     for (let i = 0; i < order; i++) {
@@ -443,34 +533,26 @@ export class Codec2 {
       a.set(aNew);
     }
 
-    // Generate mixed excitation signal using SAWTOOTH for better transients
+    // Generate excitation
     const excitation = new Float32Array(VOICE_FRAME_SAMPLES);
     if (voiced && pitch > 0) {
-      // Mixed excitation: sawtooth train + noise
       let pulsePhase = 0;
       for (let i = 0; i < VOICE_FRAME_SAMPLES; i++) {
-        // Sawtooth wave - rich in harmonics for better formant excitation
-        // Phase goes from 0 to 1 over pitch period, sawtooth goes from 1 to -1
         const phaseInPitch = pulsePhase / pitch;
         const sawtooth = (1 - 2 * phaseInPitch) * gain;
-
-        // Add aspiration noise (more for weaker voicing)
         const aspirationAmount = 0.15 * (1 - voicingMix * 0.7);
         const noise = (Math.random() * 2 - 1) * gain * aspirationAmount;
-
         excitation[i] = sawtooth * voicingMix + noise;
-
         pulsePhase++;
         if (pulsePhase >= pitch) pulsePhase = 0;
       }
     } else {
-      // Unvoiced: filtered noise (fricatives, sibilants)
       for (let i = 0; i < VOICE_FRAME_SAMPLES; i++) {
         excitation[i] = (Math.random() * 2 - 1) * gain * 0.5;
       }
     }
 
-    // LPC synthesis filter (all-pole filter)
+    // LPC synthesis
     const state = new Float32Array(order);
     const deEmphasis = 0.95;
     let prevOutput = 0;
@@ -481,18 +563,14 @@ export class Codec2 {
         sample -= a[j + 1] * state[j];
       }
 
-      // Update state (shift register)
       for (let j = order - 1; j > 0; j--) {
         state[j] = state[j - 1];
       }
       state[0] = sample;
 
-      // De-emphasis filter (restore low frequencies)
-      // H(z) = 1 / (1 - 0.95*z^-1)
       sample = sample + deEmphasis * prevOutput;
       prevOutput = sample;
 
-      // Soft clipping for better sound quality
       if (sample > 24000) {
         sample = 24000 + (sample - 24000) * 0.3;
       } else if (sample < -24000) {
@@ -504,51 +582,6 @@ export class Codec2 {
 
     return result;
   }
-
-  /**
-   * Get samples per frame
-   */
-  getSamplesPerFrame(): number {
-    return this.samplesPerFrame;
-  }
-
-  /**
-   * Get bytes per frame
-   */
-  getBytesPerFrame(): number {
-    return this.bytesPerFrame;
-  }
-
-  /**
-   * Check if initialized
-   */
-  get isInitialized(): boolean {
-    return this._isInitialized;
-  }
-
-  /**
-   * Check if using real WASM or fallback
-   */
-  get isWasmAvailable(): boolean {
-    return this.wasmModule !== null;
-  }
-
-  /**
-   * Cleanup resources
-   */
-  destroy(): void {
-    if (this.wasmModule && this.codecPtr) {
-      if (this.speechPtr) this.wasmModule._free(this.speechPtr);
-      if (this.bitsPtr) this.wasmModule._free(this.bitsPtr);
-      this.wasmModule._codec2_destroy(this.codecPtr);
-    }
-
-    this.wasmModule = null;
-    this.codecPtr = 0;
-    this.speechPtr = 0;
-    this.bitsPtr = 0;
-    this._isInitialized = false;
-  }
 }
 
 // Singleton encoder instance
@@ -559,7 +592,7 @@ let encoderInstance: Codec2 | null = null;
  */
 export function getCodec2Encoder(): Codec2 {
   if (!encoderInstance) {
-    encoderInstance = new Codec2(Codec2Mode.MODE_2400);
+    encoderInstance = new Codec2(Codec2ModeEnum.MODE_2400);
   }
   return encoderInstance;
 }
@@ -581,4 +614,54 @@ export function destroyCodec2(): void {
     encoderInstance.destroy();
     encoderInstance = null;
   }
+}
+
+/**
+ * Resample audio from one sample rate to 8kHz
+ */
+export function resampleTo8kHz(
+  samples: Float32Array,
+  sourceSampleRate: number
+): Int16Array {
+  const ratio = sourceSampleRate / 8000;
+  const outputLength = Math.floor(samples.length / ratio);
+  const output = new Int16Array(outputLength);
+
+  for (let i = 0; i < outputLength; i++) {
+    const srcIndex = i * ratio;
+    const srcIndexFloor = Math.floor(srcIndex);
+    const srcIndexCeil = Math.min(srcIndexFloor + 1, samples.length - 1);
+    const frac = srcIndex - srcIndexFloor;
+
+    const sample =
+      samples[srcIndexFloor] * (1 - frac) + samples[srcIndexCeil] * frac;
+    output[i] = Math.max(-32768, Math.min(32767, Math.floor(sample * 32767)));
+  }
+
+  return output;
+}
+
+/**
+ * Resample audio from 8kHz to target sample rate
+ */
+export function resampleFrom8kHz(
+  samples: Int16Array,
+  targetSampleRate: number
+): Float32Array {
+  const ratio = targetSampleRate / 8000;
+  const outputLength = Math.floor(samples.length * ratio);
+  const output = new Float32Array(outputLength);
+
+  for (let i = 0; i < outputLength; i++) {
+    const srcIndex = i / ratio;
+    const srcIndexFloor = Math.floor(srcIndex);
+    const srcIndexCeil = Math.min(srcIndexFloor + 1, samples.length - 1);
+    const frac = srcIndex - srcIndexFloor;
+
+    const sample16 =
+      samples[srcIndexFloor] * (1 - frac) + samples[srcIndexCeil] * frac;
+    output[i] = sample16 / 32767;
+  }
+
+  return output;
 }

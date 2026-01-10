@@ -22,8 +22,8 @@ export interface JitterBufferConfig {
 }
 
 const DEFAULT_JITTER_CONFIG: JitterBufferConfig = {
-  minLatencyMs: 60,
-  maxLatencyMs: 100,
+  minLatencyMs: 20,   // Reduced to 1 frame for immediate playback
+  maxLatencyMs: 60,   // Reduced from 100
   adaptiveDepth: true,
 };
 

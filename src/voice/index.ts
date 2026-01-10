@@ -94,6 +94,14 @@ export {
   destroyVoiceManager,
 } from './VoiceManager.js';
 
+// Voice post-processor (CSterm radio effects)
+export {
+  VoicePostProcessor,
+  getVoicePostProcessor,
+  destroyVoicePostProcessor,
+  PostProcessParams,
+} from './VoicePostProcessor.js';
+
 // Settings persistence
 export {
   loadVoiceSettings,

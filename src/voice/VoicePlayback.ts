@@ -48,6 +48,8 @@ export class VoicePlayback {
     if (this.isPlaying) return;
 
     try {
+      console.log('[VoicePlayback] Starting speaker...');
+
       // Create speaker
       this.speaker = new Speaker({
         channels: this.config.channels,
@@ -65,20 +67,23 @@ export class VoicePlayback {
       });
 
       // Handle speaker events silently
-      this.speaker.on('error', () => {
-        // Silently ignore speaker errors
+      this.speaker.on('error', (err) => {
+        console.error('[VoicePlayback] Speaker error:', err);
       });
 
       this.speaker.on('close', () => {
+        console.log('[VoicePlayback] Speaker closed');
         this.isPlaying = false;
       });
 
       // Pipe readable to speaker
       this.readable.pipe(this.speaker);
       this.isPlaying = true;
+      console.log('[VoicePlayback] Speaker started successfully');
 
     } catch (error) {
-      console.error('[VoicePlayback] Failed to start:', error);
+      // Log error for debugging voice playback issues
+      console.error('[VoicePlayback] Failed to start speaker:', error);
       this.isPlaying = false;
     }
   }
@@ -115,6 +120,9 @@ export class VoicePlayback {
     this.isPushing = false;
   }
 
+  // Track frame count for logging
+  private frameCount = 0;
+
   /**
    * Queue a stereo audio frame for playback
    *
@@ -127,6 +135,12 @@ export class VoicePlayback {
 
     // Add to pending frames
     this.pendingFrames.push(samples);
+
+    // Log periodically
+    this.frameCount++;
+    if (this.frameCount % 50 === 0) {
+      console.log(`[VoicePlayback] Queued ${this.frameCount} frames, buffer depth: ${this.pendingFrames.length}`);
+    }
 
     // Prevent buffer overflow
     const maxFrames = Math.ceil(200 / VOICE_FRAME_MS); // Max 200ms buffer

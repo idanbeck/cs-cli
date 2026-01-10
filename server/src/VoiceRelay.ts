@@ -96,6 +96,9 @@ export class VoiceRelay {
     return this.senderIdToPlayerId.get(senderId);
   }
 
+  // Track relay stats
+  private relayCount = 0;
+
   /**
    * Relay a voice frame to room members
    *
@@ -113,8 +116,16 @@ export class VoiceRelay {
     const flags = getFrameFlags(data);
     const teamOnly = (flags & VOICE_FLAG_TEAM_ONLY) !== 0;
     const senderTeam = teamAssignments.get(senderClientId);
+    const senderId = getSenderIdFromFrame(data);
+
+    // Log relay periodically
+    this.relayCount++;
+    if (this.relayCount % 50 === 0) {
+      console.log(`[VoiceRelay] Relaying frame from ${senderId.toString(16)} to ${clients.size - 1} clients`);
+    }
 
     // Relay to all other clients (optionally filtered by team)
+    let relayedTo = 0;
     for (const [clientId, client] of clients) {
       // Don't send back to sender
       if (clientId === senderClientId) continue;
@@ -129,6 +140,7 @@ export class VoiceRelay {
       if (client.socket.readyState === WebSocket.OPEN) {
         try {
           client.socket.send(data);
+          relayedTo++;
         } catch {
           // Ignore send errors
         }
