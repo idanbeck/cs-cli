@@ -1,8 +1,25 @@
 // Mouse handling for terminal using SGR 1006 extended mode
 // Works in modern terminals: iTerm2, Ghostty, Kitty, etc.
-// Uses robotjs to recenter mouse for true FPS-style capture
+// Uses robotjs to recenter mouse for true FPS-style capture (optional)
 
-import robot from 'robotjs';
+// robotjs is optional - dynamically loaded to avoid crashes if not installed
+let robot: any = null;
+let robotLoaded = false;
+
+async function loadRobot(): Promise<boolean> {
+  if (robotLoaded) return robot !== null;
+  robotLoaded = true;
+  try {
+    robot = (await import('robotjs')).default;
+    return true;
+  } catch {
+    robot = null;
+    return false;
+  }
+}
+
+// Try to load robotjs immediately but don't block
+loadRobot();
 
 export interface MouseState {
   x: number;
@@ -131,7 +148,7 @@ export class MouseHandler {
 
     // Get current mouse position as lock point using robotjs
     // Skip this entirely in native mouse mode - native input handles movement
-    if (this.useRobotCapture && !this.nativeMouseMode) {
+    if (this.useRobotCapture && !this.nativeMouseMode && robot) {
       try {
         const pos = robot.getMousePos();
         this.lockX = pos.x;
@@ -141,6 +158,8 @@ export class MouseHandler {
         // robotjs not available, fall back to terminal-only mode
         this.useRobotCapture = false;
       }
+    } else if (!robot) {
+      this.useRobotCapture = false;
     }
 
     this.onCapture?.(true);
@@ -230,7 +249,7 @@ export class MouseHandler {
     if (this.state.captured && !this.nativeMouseMode) {
       // Only process terminal mouse movement when NOT in native mode
       // Native mode gets movement directly from CGEventTap
-      if (this.useRobotCapture) {
+      if (this.useRobotCapture && robot) {
         // robotjs-based capture: get actual pixel position and recenter
         try {
           const pos = robot.getMousePos();

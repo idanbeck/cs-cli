@@ -5,8 +5,27 @@
  * Provides TUI for tweaking vocoder parameters in real-time.
  */
 
-import Speaker from 'speaker';
 import { appendFileSync, writeFileSync } from 'fs';
+
+// Speaker is optional - dynamically loaded
+let SpeakerClass: any = null;
+let speakerLoaded = false;
+
+async function loadSpeaker(): Promise<boolean> {
+  if (speakerLoaded) return SpeakerClass !== null;
+  speakerLoaded = true;
+  try {
+    const mod = await import('speaker');
+    SpeakerClass = mod.default;
+    return true;
+  } catch {
+    SpeakerClass = null;
+    return false;
+  }
+}
+
+// Try to load speaker immediately
+loadSpeaker();
 import { MicCapture, initializeMicCapture, destroyMicCapture } from './MicCapture.js';
 import { VOICE_SAMPLE_RATE, VOICE_FRAME_SAMPLES } from './types.js';
 import { Codec2, Codec2ModeString } from './Codec2.js';
@@ -288,7 +307,7 @@ type PlaybackPositionCallback = (position: number) => void; // 0-1 normalized po
  */
 export class VocoderDebug {
   private mic: MicCapture | null = null;
-  private speaker: Speaker | null = null;
+  private speaker: any = null;
   private params: VocoderParams;
 
   // Native Codec2 instance
@@ -819,6 +838,12 @@ export class VocoderDebug {
    * Play a set of frames
    */
   private playFrames(frames: Int16Array[], newState: DebugState, statusText: string): void {
+    // Check if speaker is available
+    if (!SpeakerClass) {
+      this.emitState('Speaker not available - audio disabled');
+      return;
+    }
+
     this.state = newState;
     this.emitState(statusText);
 
@@ -837,7 +862,7 @@ export class VocoderDebug {
     }, this.PLAYBACK_UPDATE_INTERVAL);
 
     // Create speaker
-    this.speaker = new Speaker({
+    this.speaker = new SpeakerClass({
       channels: 1,  // Mono
       bitDepth: 16,
       sampleRate: VOICE_SAMPLE_RATE,

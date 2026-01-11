@@ -4,9 +4,28 @@
  * Uses Speaker with direct write for low-latency continuous playback.
  */
 
-import Speaker from 'speaker';
 import { VOICE_SAMPLE_RATE } from './types.js';
 import { voiceLog } from './voiceLog.js';
+
+// Speaker is optional - dynamically loaded
+let SpeakerClass: any = null;
+let speakerLoaded = false;
+
+async function loadSpeaker(): Promise<boolean> {
+  if (speakerLoaded) return SpeakerClass !== null;
+  speakerLoaded = true;
+  try {
+    const mod = await import('speaker');
+    SpeakerClass = mod.default;
+    return true;
+  } catch {
+    SpeakerClass = null;
+    return false;
+  }
+}
+
+// Try to load speaker immediately
+loadSpeaker();
 
 // Output format - 16-bit stereo at voice sample rate
 const OUTPUT_SAMPLE_RATE = VOICE_SAMPLE_RATE; // 8kHz
@@ -17,7 +36,7 @@ const OUTPUT_BIT_DEPTH = 16;
  * Streaming voice audio playback using direct writes to Speaker
  */
 export class VoicePlayback {
-  private speaker: Speaker | null = null;
+  private speaker: any = null;
   private isPlaying = false;
 
   // Stats
@@ -33,11 +52,17 @@ export class VoicePlayback {
   start(): void {
     if (this.isPlaying) return;
 
+    // Check if speaker is available
+    if (!SpeakerClass) {
+      voiceLog(`[VoicePlayback] Speaker not available - audio disabled`);
+      return;
+    }
+
     voiceLog(`[VoicePlayback] Starting streaming playback at ${OUTPUT_SAMPLE_RATE}Hz stereo`);
 
     try {
       // Create the speaker - it will start playing when we write to it
-      this.speaker = new Speaker({
+      this.speaker = new SpeakerClass({
         channels: OUTPUT_CHANNELS,
         bitDepth: OUTPUT_BIT_DEPTH,
         sampleRate: OUTPUT_SAMPLE_RATE,

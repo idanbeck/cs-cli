@@ -1,8 +1,27 @@
 // 8-bit procedural sound engine for CS-CLI
 // Generates retro-style sound effects without external samples
 
-import Speaker from 'speaker';
 import { Readable, Writable } from 'stream';
+
+// Speaker is optional - dynamically loaded
+let SpeakerClass: any = null;
+let speakerLoaded = false;
+
+async function loadSpeaker(): Promise<boolean> {
+  if (speakerLoaded) return SpeakerClass !== null;
+  speakerLoaded = true;
+  try {
+    const mod = await import('speaker');
+    SpeakerClass = mod.default;
+    return true;
+  } catch {
+    SpeakerClass = null;
+    return false;
+  }
+}
+
+// Try to load speaker immediately
+loadSpeaker();
 import { Vector3 } from '../engine/math/Vector3.js';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -418,9 +437,12 @@ export class SoundEngine {
 
   private playDefSpatial(def: SoundDef, spatialVolume: number, pan: number): void {
     try {
+      // Skip if speaker not available
+      if (!SpeakerClass) return;
+
       const samples = this.generateStereoSamples(def, spatialVolume, pan);
 
-      const speaker = new Speaker({
+      const speaker = new SpeakerClass({
         channels: CHANNELS,
         bitDepth: BIT_DEPTH,
         sampleRate: SAMPLE_RATE,

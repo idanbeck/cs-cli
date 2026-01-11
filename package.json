@@ -1,6 +1,6 @@
 {
   "name": "csterm",
-  "version": "1.0.8",
+  "version": "1.0.12",
   "description": "Counter-Strike in your terminal - true 3D FPS with software rendering",
   "type": "module",
   "main": "dist/index.js",
@@ -9,7 +9,14 @@
   },
   "files": [
     "dist",
-    "native"
+    "native",
+    "assets/maps/de_dust.bsp",
+    "assets/maps/de_dust2.bsp",
+    "assets/maps/de_inferno.bsp",
+    "assets/maps/cs_italy.bsp",
+    "assets/wads/cs_dust.wad",
+    "assets/wads/cstrike.wad",
+    "assets/wads/itsitaly.wad"
   ],
   "scripts": {
     "play": "npx tsx src/index.tsx 2>/dev/null",
@@ -46,9 +53,11 @@
   },
   "dependencies": {
     "ink": "^5.0.1",
+    "react": "^18.3.1"
+  },
+  "optionalDependencies": {
     "naudiodon2": "^2.5.0",
     "node-addon-api": "^8.5.0",
-    "react": "^18.3.1",
     "robotjs": "^0.6.0",
     "speaker": "^0.5.5"
   },

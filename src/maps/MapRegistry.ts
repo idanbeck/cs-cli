@@ -30,7 +30,7 @@ const BSP_MAPS: MapInfo[] = [
     modes: 'both',
     description: 'The legendary CS map',
     bspPath: 'assets/maps/de_dust2.bsp',
-    wadPaths: ['assets/wads/cs_dust.wad', 'assets/wads/cstrike.wad', 'assets/wads/halflife.wad'],
+    wadPaths: ['assets/wads/cs_dust.wad', 'assets/wads/cstrike.wad'],
   },
   {
     id: 'de_dust',
@@ -39,7 +39,7 @@ const BSP_MAPS: MapInfo[] = [
     modes: 'both',
     description: 'The original Dust',
     bspPath: 'assets/maps/de_dust.bsp',
-    wadPaths: ['assets/wads/cs_dust.wad', 'assets/wads/cstrike.wad', 'assets/wads/halflife.wad'],
+    wadPaths: ['assets/wads/cs_dust.wad', 'assets/wads/cstrike.wad'],
   },
   {
     id: 'de_inferno',
@@ -48,7 +48,7 @@ const BSP_MAPS: MapInfo[] = [
     modes: 'both',
     description: 'Italian village bombsite',
     bspPath: 'assets/maps/de_inferno.bsp',
-    wadPaths: ['assets/wads/cstrike.wad', 'assets/wads/halflife.wad'],
+    wadPaths: ['assets/wads/cstrike.wad'],
   },
   {
     id: 'cs_italy',
@@ -57,7 +57,7 @@ const BSP_MAPS: MapInfo[] = [
     modes: 'both',
     description: 'Italian village hostage rescue',
     bspPath: 'assets/maps/cs_italy.bsp',
-    wadPaths: ['assets/wads/itsitaly.wad', 'assets/wads/cstrike.wad', 'assets/wads/halflife.wad'],
+    wadPaths: ['assets/wads/itsitaly.wad', 'assets/wads/cstrike.wad'],
   },
 ];
 
@@ -85,7 +85,8 @@ export class MapRegistry {
       // Try multiple base paths
       const possiblePaths = [
         join(process.cwd(), relativePath),
-        join(dirname(fileURLToPath(import.meta.url)), '../../..', relativePath),
+        // From dist/maps/MapRegistry.js, go up 2 dirs to package root
+        join(dirname(fileURLToPath(import.meta.url)), '../..', relativePath),
       ];
 
       for (const path of possiblePaths) {
@@ -103,7 +104,8 @@ export class MapRegistry {
   private static resolvePath(relativePath: string): string {
     const possiblePaths = [
       join(process.cwd(), relativePath),
-      join(dirname(fileURLToPath(import.meta.url)), '../../..', relativePath),
+      // From dist/maps/MapRegistry.js, go up 2 dirs to package root
+      join(dirname(fileURLToPath(import.meta.url)), '../..', relativePath),
     ];
 
     for (const path of possiblePaths) {
