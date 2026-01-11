@@ -2,6 +2,9 @@
 // Handles connection to game server, lobby operations, and in-game networking
 
 import WebSocket, { CloseEvent, ErrorEvent, MessageEvent, RawData } from 'ws';
+import { readFileSync, existsSync } from 'fs';
+import { join, dirname } from 'path';
+import { fileURLToPath } from 'url';
 import { isVoiceFrame } from '../voice/types.js';
 import {
   ClientMessage,
@@ -31,8 +34,33 @@ export interface GameClientConfig {
   inputSendRate: number;  // Hz for input updates
 }
 
+// Server URL priority: ~/.csterm/settings.json > GAME_SERVER_URL env var > official server
+// Supports both ws:// and wss:// protocols
+import { homedir } from 'os';
+
+const DEFAULT_SERVER_URL = 'wss://cs-cli-server.fly.dev';  // Official multiplayer server
+
+const getDefaultServerUrl = (): string => {
+  // Try to read from ~/.csterm/settings.json (same as game settings)
+  try {
+    const settingsPath = join(homedir(), '.csterm', 'settings.json');
+
+    if (existsSync(settingsPath)) {
+      const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+      if (settings.serverUrl) {
+        return settings.serverUrl;
+      }
+    }
+  } catch {
+    // Settings file doesn't exist or is invalid, continue to fallbacks
+  }
+
+  // Fall back to environment variable or default official server
+  return process.env.GAME_SERVER_URL || DEFAULT_SERVER_URL;
+};
+
 export const DEFAULT_CLIENT_CONFIG: GameClientConfig = {
-  serverUrl: 'ws://localhost:8080',
+  serverUrl: getDefaultServerUrl(),
   reconnectAttempts: 3,
   reconnectDelay: 2000,
   inputSendRate: 60,

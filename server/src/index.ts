@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 // CS-CLI Multiplayer Server
 // Supports multiple startup modes:
 //   Default: Hub + built-in pool server (standalone)
@@ -16,14 +17,16 @@ function parseArgs(): {
   port: number;
   hubPort: number;
   maxRooms: number;
+  publicUrl?: string;  // Public-facing URL for clients to connect
 } {
   const args = process.argv.slice(2);
   const parsed: ReturnType<typeof parseArgs> = {
     mode: 'standalone',
-    serverName: 'CS-CLI Server',
+    serverName: process.env.SERVER_NAME || 'CS-CLI Server',
     port: parseInt(process.env.PORT || '8080', 10),
     hubPort: parseInt(process.env.HUB_PORT || '8081', 10),
     maxRooms: parseInt(process.env.MAX_ROOMS || '100', 10),
+    publicUrl: process.env.PUBLIC_URL,  // e.g., wss://game.example.com
   };
 
   for (const arg of args) {
@@ -41,6 +44,8 @@ function parseArgs(): {
       parsed.hubPort = parseInt(arg.substring(11), 10);
     } else if (arg.startsWith('--max-rooms=')) {
       parsed.maxRooms = parseInt(arg.substring(12), 10);
+    } else if (arg.startsWith('--public-url=')) {
+      parsed.publicUrl = arg.substring(13);
     }
   }
 
@@ -82,15 +87,18 @@ switch (config.mode) {
     hubServer.start();
 
     // Start built-in game server that connects to hub
+    // Use PUBLIC_URL if set, otherwise default to localhost
+    const standalonePublicEndpoint = config.publicUrl || `ws://localhost:${config.port}`;
     gameServer = new GameServer({
       ...DEFAULT_SERVER_CONFIG,
       port: config.port,
       maxRooms: config.maxRooms,
       serverName: config.serverName,
-      publicEndpoint: `ws://localhost:${config.port}`,
+      publicEndpoint: standalonePublicEndpoint,
       hubUrl: `ws://localhost:${config.hubPort}`,
     });
     gameServer.start();
+    console.log(`  Public endpoint: ${standalonePublicEndpoint}`);
     break;
 
   case 'hub-only':
@@ -128,15 +136,18 @@ switch (config.mode) {
   ╚═══════════════════════════════════════════════════╝
 `);
 
+    // Use PUBLIC_URL if set, otherwise default to localhost
+    const poolPublicEndpoint = config.publicUrl || `ws://localhost:${config.port}`;
     gameServer = new GameServer({
       ...DEFAULT_SERVER_CONFIG,
       port: config.port,
       maxRooms: config.maxRooms,
       serverName: config.serverName,
-      publicEndpoint: `ws://localhost:${config.port}`,
+      publicEndpoint: poolPublicEndpoint,
       hubUrl: config.hubUrl,
     });
     gameServer.start();
+    console.log(`  Public endpoint: ${poolPublicEndpoint}`);
     break;
 }
 

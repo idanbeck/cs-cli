@@ -59,10 +59,10 @@ async function testBSPLoading() {
     console.error('  FAILED:', e);
   }
 
-  // Try loading dm_arena (built-in)
+  // Try loading de_dust2
   try {
-    console.log('Loading dm_arena (built-in)...');
-    const arena = await MapRegistry.loadMap('dm_arena');
+    console.log('Loading de_dust2...');
+    const arena = await MapRegistry.loadMap('de_dust2');
     console.log(`  Name: ${arena.name}`);
     console.log(`  Render objects: ${arena.renderObjects.length}`);
     console.log(`  Spawns: ${arena.spawns.length}`);

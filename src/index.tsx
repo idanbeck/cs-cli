@@ -558,7 +558,7 @@ import { getTeamManager, resetTeamManager, TeamId } from './game/Team.js';
 import { getDroppedWeaponManager, resetDroppedWeaponManager } from './game/DroppedWeapon.js';
 import { getServerBrowser, ServerBrowser } from './ui/ServerBrowser.js';
 import { getLobbyScreen, LobbyScreen } from './ui/LobbyScreen.js';
-import { getGameClient, GameClient } from './network/GameClient.js';
+import { getGameClient, GameClient, DEFAULT_CLIENT_CONFIG } from './network/GameClient.js';
 import { getMultiplayerState, resetMultiplayerState } from './network/MultiplayerState.js';
 
 type AppMode = 'menu' | 'playing' | 'server_browser' | 'lobby';
@@ -2398,7 +2398,7 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
             },
           });
 
-          gameClient.connect('ws://localhost:8080').catch((err) => {
+          gameClient.connect(DEFAULT_CLIENT_CONFIG.serverUrl).catch((err) => {
             serverBrowser.setError(`Failed to connect: ${err.message}`);
             consoleError(`Connection failed: ${err.message}`);
           });

@@ -10,7 +10,7 @@ export type MSAAMode = 'none' | '4x' | '16x';
 export type TextureFilterMode = 'normal' | 'pixelated' | 'blockavg';
 
 // Settings tab types
-export type SettingsTab = 'controls' | 'graphics' | 'audio';
+export type SettingsTab = 'controls' | 'graphics' | 'audio' | 'network';
 
 export type MenuScreen = 'main' | 'mode_select' | 'map_select' | 'settings' | 'help';
 
@@ -91,6 +91,9 @@ export interface Settings {
   voiceCodec: 'codec2' | 'lpc'; // Codec type
   voiceCodec2Mode: string;     // Codec2 mode (e.g., '2400', '3200')
   voicePreset: string;         // Post-processing preset name
+
+  // Network
+  serverUrl: string;           // Multiplayer server URL (ws:// or wss://)
 }
 
 // Settings persistence path
@@ -133,6 +136,8 @@ function loadSettingsFromDisk(): Partial<Settings> {
       if (parsed.voiceCodec === 'codec2' || parsed.voiceCodec === 'lpc') settings.voiceCodec = parsed.voiceCodec;
       if (typeof parsed.voiceCodec2Mode === 'string') settings.voiceCodec2Mode = parsed.voiceCodec2Mode;
       if (typeof parsed.voicePreset === 'string') settings.voicePreset = parsed.voicePreset;
+      // Network
+      if (typeof parsed.serverUrl === 'string') settings.serverUrl = parsed.serverUrl;
       return settings;
     }
   } catch {
@@ -189,6 +194,8 @@ export class MainMenu {
     voiceCodec: 'codec2',      // Default: Codec2 for best compression
     voiceCodec2Mode: '2400',   // Default: 2400bps mode
     voicePreset: 'CSterm',     // Default: CSterm radio effect preset
+    // Network
+    serverUrl: 'wss://cs-cli-server.fly.dev',  // Default: Official multiplayer server
   };
   private onSettingsChange?: (settings: Settings) => void;
 
@@ -238,11 +245,12 @@ export class MainMenu {
   ];
 
   // Settings menu items organized by tab
-  private settingsTabs: SettingsTab[] = ['controls', 'graphics', 'audio'];
+  private settingsTabs: SettingsTab[] = ['controls', 'graphics', 'audio', 'network'];
   private settingsItemsByTab: Record<SettingsTab, string[]> = {
     controls: ['Mouse Sensitivity', 'Back'],
     graphics: ['Render Mode', 'Anti-Aliasing', 'Texture Filter', 'Renderer Backend', 'Frame Rate Cap', 'Field of View', 'Back'],
     audio: ['Voice Enabled', 'Voice Codec', 'Voice Preset', 'Input Volume', 'Output Volume', 'Input Device', 'Output Device', 'Voice Mode', 'VAD Sensitivity', 'Max Distance', 'Spatial Audio', 'Test Audio', 'Back'],
+    network: ['Server URL', 'Back'],
   };
 
   // Available audio devices (populated dynamically)
@@ -253,6 +261,12 @@ export class MainMenu {
   private voiceCodecs: ('codec2' | 'lpc')[] = ['codec2', 'lpc'];
   private codec2Modes: string[] = ['3200', '2400', '1600', '1400', '1300', '1200', '700C'];
   private voicePresets: string[] = ['CSterm', 'Clean', 'Lo-Fi Radio', 'Walkie-Talkie', 'Robot'];
+
+  // Server URL presets (can add custom via settings file)
+  private serverUrls: string[] = [
+    'wss://cs-cli-server.fly.dev',  // Official server
+    'ws://localhost:8080',           // Local development
+  ];
 
   // Test audio state
   private testAudioActive = false;
@@ -343,6 +357,7 @@ export class MainMenu {
       controls: 'Controls',
       graphics: 'Graphics',
       audio: 'Audio',
+      network: 'Network',
     };
     return names[tab];
   }
@@ -623,6 +638,10 @@ export class MainMenu {
       case 'Test Audio':
         this.triggerTestAudio();
         break;
+      // Network
+      case 'Server URL':
+        this.cycleServerUrl(delta);
+        break;
     }
   }
 
@@ -770,6 +789,20 @@ export class MainMenu {
     saveSettingsToDisk(this.settings);
   }
 
+  private cycleServerUrl(delta: number): void {
+    // If current URL is not in presets, add it temporarily
+    let urls = [...this.serverUrls];
+    if (!urls.includes(this.settings.serverUrl)) {
+      urls.push(this.settings.serverUrl);
+    }
+    const currentIndex = urls.indexOf(this.settings.serverUrl);
+    const idx = currentIndex >= 0 ? currentIndex : 0;
+    const newIndex = (idx + delta + urls.length) % urls.length;
+    this.settings.serverUrl = urls[newIndex];
+    this.onSettingsChange?.(this.settings);
+    saveSettingsToDisk(this.settings);
+  }
+
   private triggerTestAudio(): void {
     this.testAudioActive = true;
     this.onTestAudio?.();
@@ -839,6 +872,10 @@ export class MainMenu {
 
   getVoicePreset(): string {
     return this.settings.voicePreset;
+  }
+
+  getServerUrl(): string {
+    return this.settings.serverUrl;
   }
 
   getFov(): number {
@@ -947,6 +984,20 @@ export class MainMenu {
         return `< ${this.settings.voicePreset} >`;
       case 'Test Audio':
         return this.testAudioActive ? '[ Testing... ]' : '[ Press Enter ]';
+      // Network
+      case 'Server URL': {
+        const url = this.settings.serverUrl;
+        // Show friendly name for known servers
+        if (url === 'wss://cs-cli-server.fly.dev') {
+          return '< Official Server >';
+        } else if (url === 'ws://localhost:8080') {
+          return '< Local (localhost) >';
+        } else {
+          // Truncate long custom URLs
+          const truncated = url.length > 25 ? url.slice(0, 23) + '..' : url;
+          return `< ${truncated} >`;
+        }
+      }
       default:
         return '';
     }

@@ -1,0 +1,56 @@
+# Fly.io Configuration for CS-CLI Game Server
+# Deploy with: fly launch (first time) or fly deploy (updates)
+
+app = "cs-cli-server"
+primary_region = "sjc"  # San Jose - change to your preferred region
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  HUB_PORT = "8081"
+  MAX_ROOMS = "100"
+  SERVER_NAME = "CS-CLI Fly.io Server"
+  # PUBLIC_URL is set automatically via fly secrets or below
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = false  # Keep server running for game connections
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "connections"
+    hard_limit = 1000
+    soft_limit = 800
+
+# WebSocket support - critical for game server
+[[services]]
+  internal_port = 8080
+  protocol = "tcp"
+
+  [[services.ports]]
+    handlers = ["tls", "http"]
+    port = 443
+
+  [[services.ports]]
+    handlers = ["http"]
+    port = 80
+
+  [[services.tcp_checks]]
+    grace_period = "5s"
+    interval = "30s"
+    timeout = "3s"
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1
+
+# For production, scale up:
+# [[vm]]
+#   memory = "1gb"
+#   cpu_kind = "performance"
+#   cpus = 2

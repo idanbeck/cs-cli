@@ -21,7 +21,7 @@ export interface ServerBrowserState {
 // Default room configuration
 const DEFAULT_ROOM_CONFIG: RoomConfig = {
   name: 'My Game',
-  map: 'dm_arena',
+  map: 'de_dust2',
   mode: 'deathmatch',
   maxPlayers: 8,
   botCount: 0,

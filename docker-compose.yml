@@ -1,0 +1,27 @@
+# CS-CLI Game Server - Docker Compose
+# Usage: docker-compose up --build
+
+version: '3.8'
+
+services:
+  game-server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"   # Game server port
+      - "8081:8081"   # Hub server port (internal, for federation)
+    environment:
+      - PORT=8080
+      - HUB_PORT=8081
+      - MAX_ROOMS=100
+      - SERVER_NAME=CS-CLI Docker Server
+      # For production, set PUBLIC_URL to your domain:
+      # - PUBLIC_URL=wss://game.yourdomain.com
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "const http = require('http'); http.get('http://localhost:8080', (r) => process.exit(r.statusCode === 426 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s

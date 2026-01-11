@@ -271,7 +271,7 @@ export class HeadlessVoiceClient {
   private createRoom(): void {
     const config = {
       name: `VoiceTest-${Date.now()}`,
-      map: 'dm_arena',
+      map: 'de_dust2',
       mode: 'deathmatch' as const,
       maxPlayers: 10,
       botCount: 0,
