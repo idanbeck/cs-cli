@@ -20,7 +20,10 @@
     "typecheck": "tsc --noEmit",
     "build:native": "node native/build-native.cjs",
     "postinstall": "node native/build-native.cjs",
-    "start": "node dist/index.js 2>/dev/null"
+    "start": "node dist/index.js 2>/dev/null",
+    "test:voice": "npm run build && cd server && npm run build && cd .. && node dist/test/voiceTestHarness.js",
+    "test:voice:3": "npm run test:voice -- 3",
+    "test:voice:5": "npm run test:voice -- 5"
   },
   "keywords": [
     "cli",

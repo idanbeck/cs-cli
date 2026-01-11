@@ -6,8 +6,8 @@
 
 // Binary protocol constants
 export const VOICE_FRAME_TYPE = 0x01;
-export const VOICE_FRAME_SIZE = 28;  // Total frame size in bytes (12 header + 16 payload)
-export const CODEC2_PAYLOAD_SIZE = 16; // Enhanced LPC: 16 bytes per 20ms (~6.4kbps)
+export const VOICE_HEADER_SIZE = 12;  // Header size (frameType + flags + senderId + seq + timestamp)
+// Payload size varies: 6 bytes for native Codec2 2400, 16 bytes for LPC fallback
 export const VOICE_SAMPLE_RATE = 8000;
 export const VOICE_FRAME_SAMPLES = 160; // 20ms at 8kHz
 export const VOICE_FRAME_MS = 20;
@@ -159,9 +159,10 @@ export enum Codec2Mode {
 
 /**
  * Serialize a voice frame to binary
+ * Frame size is dynamic based on payload length
  */
 export function serializeVoiceFrame(frame: VoiceFrame): Uint8Array {
-  const buffer = new Uint8Array(VOICE_FRAME_SIZE);
+  const buffer = new Uint8Array(VOICE_HEADER_SIZE + frame.payload.length);
   const view = new DataView(buffer.buffer);
 
   buffer[0] = frame.frameType;
@@ -169,16 +170,17 @@ export function serializeVoiceFrame(frame: VoiceFrame): Uint8Array {
   view.setUint32(2, frame.senderId, true);  // Little-endian
   view.setUint32(6, frame.sequence, true);
   view.setUint16(10, frame.timestampOffset, true);
-  buffer.set(frame.payload, 12);
+  buffer.set(frame.payload, VOICE_HEADER_SIZE);
 
   return buffer;
 }
 
 /**
  * Deserialize a binary voice frame
+ * Payload size is derived from total frame size
  */
 export function deserializeVoiceFrame(data: Uint8Array): VoiceFrame | null {
-  if (data.length < VOICE_FRAME_SIZE) return null;
+  if (data.length < VOICE_HEADER_SIZE) return null;
   if (data[0] !== VOICE_FRAME_TYPE) return null;
 
   const view = new DataView(data.buffer, data.byteOffset);
@@ -189,7 +191,7 @@ export function deserializeVoiceFrame(data: Uint8Array): VoiceFrame | null {
     senderId: view.getUint32(2, true),
     sequence: view.getUint32(6, true),
     timestampOffset: view.getUint16(10, true),
-    payload: data.slice(12, 28),
+    payload: data.slice(VOICE_HEADER_SIZE),  // Extract actual payload (variable size)
   };
 }
 

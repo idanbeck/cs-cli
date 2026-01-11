@@ -277,17 +277,8 @@ export class VoiceManager {
 
       // Mix and play
       if (stereoStreams.length > 0) {
-        voiceLog(`[VoiceManager] About to mix ${stereoStreams.length} streams, sizes: ${stereoStreams.map(s => s.length).join(',')}`);
         const mixed = this.mixer.mixStreams(stereoStreams);
-        voiceLog(`[VoiceManager] Mixed result: ${mixed.length} samples`);
-        if (shouldLog) {
-          let maxAmp = 0;
-          for (let i = 0; i < mixed.length; i++) maxAmp = Math.max(maxAmp, Math.abs(mixed[i]));
-          voiceLog(`[VoiceManager] Mixing ${stereoStreams.length} streams, output max amp: ${maxAmp}`);
-        }
-        voiceLog(`[VoiceManager] Calling playback.queueFrame`);
         this.playback.queueFrame(mixed);
-        voiceLog(`[VoiceManager] queueFrame returned`);
       }
 
       // Cleanup inactive speakers

@@ -225,8 +225,9 @@ export class SpatialMixer {
     this.debugProcessCount++;
     const spatial = this.getStreamSpatial(senderId);
 
-    if (this.debugProcessCount % 50 === 1) {
-      voiceLog(`[SpatialMixer] processVoice: sender=${senderId.toString(16)}, volume=${spatial.volume.toFixed(3)}, pan=${spatial.pan.toFixed(2)}, outputVol=${this.outputVolume}, spatialEnabled=${this.spatialEnabled}`);
+    // Reduced logging frequency
+    if (this.debugProcessCount % 500 === 1) {
+      voiceLog(`[SpatialMixer] processVoice: sender=${senderId.toString(16)}, volume=${spatial.volume.toFixed(3)}, pan=${spatial.pan.toFixed(2)}`);
     }
 
     if (spatial.volume < 0.01) {
