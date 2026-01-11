@@ -215,7 +215,9 @@ export type ClientMessage =
   | SelectWeaponMessage
   | ChatMessage
   | ReadyMessage
-  | StartGameMessage;
+  | StartGameMessage
+  | LockstepInputMessage
+  | LockstepSyncMessage;
 
 // ============ Server → Client Messages ============
 
@@ -333,6 +335,75 @@ export interface InputAckMessage {
   position: Vec3;
 }
 
+// ============ Lockstep Protocol Messages ============
+
+export interface LockstepAction {
+  type: 'fire' | 'reload' | 'buy' | 'drop' | 'pickup' | 'select_weapon' | 'hit' | 'death';
+  data?: any;
+}
+
+export interface LockstepInputMessage {
+  type: 'lockstep_input';
+  tick: number;
+  input: PlayerInput;
+  actions: LockstepAction[];
+  // Position calculated by client (each client authoritative for own physics)
+  position: Vec3;
+  yaw: number;
+  pitch: number;
+  // Health state (each client authoritative for own health)
+  health: number;
+  isAlive: boolean;
+}
+
+export interface LockstepSyncMessage {
+  type: 'lockstep_sync';
+  tick: number;
+  hash: string;
+}
+
+export interface LockstepTickMessage {
+  type: 'lockstep_tick';
+  tick: number;
+  inputs: Array<{
+    playerId: string;
+    input: PlayerInput;
+    actions: LockstepAction[];
+    // Position reported by client (each client authoritative for own physics)
+    position: Vec3;
+    yaw: number;
+    pitch: number;
+    // Health state reported by client
+    health: number;
+    isAlive: boolean;
+  }>;
+}
+
+export interface LockstepStartMessage {
+  type: 'lockstep_start';
+  tick: number;
+  players: Array<{
+    id: string;
+    name: string;
+    team: TeamId;
+    spawnPosition: Vec3;
+    spawnYaw: number;
+  }>;
+  mapData: {
+    bounds: { min: Vec3; max: Vec3 };
+    colliders: Array<{ min: Vec3; max: Vec3 }>;
+    spawnPoints: Array<{ position: Vec3; angle: number; team: string }>;
+  };
+}
+
+export interface LockstepDesyncMessage {
+  type: 'lockstep_desync';
+  tick: number;
+  expectedHash: string;
+  receivedHash: string;
+  playerId: string;
+}
+
 export type ServerMessage =
   | RoomListMessage
   | RoomJoinedMessage
@@ -352,7 +423,10 @@ export type ServerMessage =
   | PlayerTeamChangedMessage
   | GameStartingMessage
   | AssignedTeamMessage
-  | InputAckMessage;
+  | InputAckMessage
+  | LockstepTickMessage
+  | LockstepStartMessage
+  | LockstepDesyncMessage;
 
 // ============ Helpers ============
 

@@ -8,6 +8,7 @@ import { Transform } from './engine/Transform.js';
 import { Vector3 } from './engine/math/Vector3.js';
 import { Color, Materials, CURSOR_HIDE, CURSOR_SHOW, ALT_SCREEN_ON, ALT_SCREEN_OFF, RESET } from './utils/Colors.js';
 import { degToRad } from './engine/math/MathUtils.js';
+import { getGameLoop, PHYSICS_DT, PHYSICS_TICK_RATE, lerp, lerpAngle } from './engine/GameLoop.js';
 import { MouseHandler } from './input/MouseHandler.js';
 import {
   initNativeKeyboard,
@@ -34,11 +35,9 @@ import {
 // Keys are considered "held" for a short duration after each keypress
 const KEY_HOLD_MS = 120; // How long a key stays "pressed" after last stdin event
 import { MapLoader, LoadedMap } from './maps/MapLoader.js';
-import { MapRegistry } from './maps/MapRegistry.js';
-import { dm_arena } from './maps/maps/dm_arena.js';
-import { AABB } from './maps/MapFormat.js';
-import { moveAndSlide, checkOnGround, setCollisionEnabled, rayAABBIntersection } from './physics/Collision.js';
-import { CollisionMesh, moveWithMeshCollision, checkGroundMesh, setGlobalCollisionMesh, getGlobalCollisionMesh, adjustSpawnPosition } from './physics/MeshCollision.js';
+import { MapRegistry, getDefaultMapId } from './maps/MapRegistry.js';
+import { setCollisionEnabled } from './physics/Collision.js';
+import { CollisionMesh, moveWithMeshCollision, checkGroundMesh, setGlobalCollisionMesh, getGlobalCollisionMesh, adjustSpawnPosition, raycastMesh } from './physics/MeshCollision.js';
 import { Player } from './game/Player.js';
 import { WeaponSlot } from './game/Weapon.js';
 import { getWeaponSprite } from './game/WeaponSprites.js';
@@ -53,6 +52,7 @@ import { VoiceSettings } from './voice/types.js';
 import { getVoicePlayback } from './voice/VoicePlayback.js';
 import { initializeMicCapture, getMicCapture } from './voice/MicCapture.js';
 import { VocoderDebugUI } from './voice/VocoderDebugUI.js';
+import { getFileLogger, enableFileLogging } from './utils/FileLogger.js';
 
 // CLI options interface
 interface CLIOptions {
@@ -1165,39 +1165,46 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
   // Collision enabled ref (for debug toggle)
   const collisionEnabledRef = useRef(true);
 
-  // Load map (use ref so we can switch maps dynamically)
-  const loadedMapRef = useRef<LoadedMap>(MapLoader.load(dm_arena));
-  const currentMapIdRef = useRef<string>('dm_arena');
+  // Empty placeholder map until real map loads
+  const EMPTY_MAP: LoadedMap = {
+    name: 'Loading...',
+    renderObjects: [],
+    colliders: [],
+    spawns: [{ position: [0, 2, 0], angle: 0, team: 'DM' as const }],
+    bounds: { min: new Vector3(-100, -100, -100), max: new Vector3(100, 100, 100) },
+    skyColor: new Color(50, 50, 80),
+    ambientLight: 0.3,
+  };
 
-  // Colliders ref for physics
-  const collidersRef = useRef<AABB[]>(loadedMapRef.current.colliders);
+  // Map state - starts with placeholder, loaded asynchronously
+  const loadedMapRef = useRef<LoadedMap>(EMPTY_MAP);
+  const currentMapIdRef = useRef<string>('');
+  const mapLoadingRef = useRef<boolean>(false);
+  const mapLoadedRef = useRef<boolean>(false);
 
   // Collision mesh ref for triangle-based BSP collision
-  const collisionMeshRef = useRef<CollisionMesh | null>(loadedMapRef.current.collisionMesh || null);
-
-  // Set global collision mesh (for bot AI to use)
-  if (collisionMeshRef.current) {
-    setGlobalCollisionMesh(collisionMeshRef.current);
-  }
+  const collisionMeshRef = useRef<CollisionMesh | null>(null);
 
   // Function to load a new map
   const loadMapAsync = async (mapId: string): Promise<boolean> => {
+    if (mapLoadingRef.current) return false;
+    mapLoadingRef.current = true;
+
     try {
       const newMap = await MapRegistry.loadMap(mapId);
       loadedMapRef.current = newMap;
       currentMapIdRef.current = mapId;
-      collidersRef.current = newMap.colliders;
 
-      // Update collision mesh for BSP maps
-      collisionMeshRef.current = newMap.collisionMesh || null;
-      if (collisionMeshRef.current) {
-        setGlobalCollisionMesh(collisionMeshRef.current);
+      // BSP maps must have a collision mesh
+      if (!newMap.collisionMesh) {
+        throw new Error(`Map ${mapId} has no collision mesh`);
       }
+      collisionMeshRef.current = newMap.collisionMesh;
+      setGlobalCollisionMesh(newMap.collisionMesh);
 
       // Update renderer with new map
       renderer.clearObjects();
 
-      // Add map objects (no ground plane - BSP maps have their own floors)
       for (const obj of newMap.renderObjects) {
         renderer.addObject(obj);
       }
@@ -1209,19 +1216,32 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
       // Update bot spawns
       botManager.setSpawnPoints(newMap.spawns);
 
+      mapLoadedRef.current = true;
+      mapLoadingRef.current = false;
       return true;
     } catch (error) {
       consoleError(`Failed to load map ${mapId}: ${error}`);
+      mapLoadingRef.current = false;
       return false;
     }
   };
 
-  // Bot manager
-  const [botManager] = useState(() => {
-    const manager = new BotManager();
-    manager.setSpawnPoints(loadedMapRef.current.spawns);
-    return manager;
-  });
+  // Load default map on startup
+  useEffect(() => {
+    const loadDefaultMap = async () => {
+      try {
+        const defaultMapId = getDefaultMapId();
+        consoleLog(`Loading default map: ${defaultMapId}`);
+        await loadMapAsync(defaultMapId);
+      } catch (error) {
+        consoleError(`Failed to load default map: ${error}`);
+      }
+    };
+    loadDefaultMap();
+  }, []);
+
+  // Bot manager (spawn points set when map loads)
+  const [botManager] = useState(() => new BotManager());
 
   // Game mode ref (can be reconfigured when starting a new game)
   const gameModeRef = useRef<GameMode>(new GameMode({
@@ -1473,11 +1493,12 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
 
       const botHit = botManager.checkPlayerHit(eyePos, spreadDir, weapon.def.damage, meleeRange);
 
+      // Check if wall blocks the melee attack
       let wallHitDist = meleeRange + 1;
-      for (const collider of collidersRef.current) {
-        const result = rayAABBIntersection(eyePos, spreadDir, collider);
-        if (result.hit && result.distance < wallHitDist) {
-          wallHitDist = result.distance;
+      if (collisionMeshRef.current) {
+        const wallResult = raycastMesh(eyePos, spreadDir, collisionMeshRef.current, meleeRange + 1);
+        if (wallResult.hit) {
+          wallHitDist = wallResult.distance;
         }
       }
 
@@ -1510,18 +1531,96 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
 
       const botHit = botManager.checkPlayerHit(eyePos, spreadDir, weapon.def.damage, maxRange);
 
+      // Check wall hits FIRST using collision mesh (to not hit through walls)
       let wallHit: { distance: number; point: Vector3; normal: Vector3 } | null = null;
-      for (const collider of collidersRef.current) {
-        const result = rayAABBIntersection(eyePos, spreadDir, collider);
-        if (result.hit && (!wallHit || result.distance < wallHit.distance)) {
+      if (collisionMeshRef.current) {
+        const result = raycastMesh(eyePos, spreadDir, collisionMeshRef.current, maxRange);
+        if (result.hit) {
           wallHit = { distance: result.distance, point: result.point, normal: result.normal };
+        }
+      }
+      const effectiveRange = wallHit ? wallHit.distance : maxRange;
+
+      // Check hits against remote players in lockstep mode
+      // Use ray-cylinder intersection for proper hitbox detection
+      let remoteHit: { playerId: string; distance: number; position: Vector3 } | null = null;
+      const mpState = getMultiplayerState();
+      if (mpState.isActive() && mpState.isLockstepMode()) {
+        const playerRadius = 0.4; // ~40cm radius (80cm diameter)
+        const playerHeight = 1.8; // ~1.8m tall
+
+        for (const remote of mpState.getRemotePlayers()) {
+          if (!remote.isAlive) continue;
+
+          // remote.position is at eye level, calculate foot position
+          const remoteFootY = remote.position.y - 1.7; // Eye height offset
+          const remoteHeadY = remoteFootY + playerHeight;
+          const remoteCenterXZ = new Vector3(remote.position.x, 0, remote.position.z);
+
+          // Ray-cylinder intersection: solve for t where ray hits cylinder
+          // Cylinder is infinite along Y, radius = playerRadius, centered at remote XZ
+          const rayOriginXZ = new Vector3(eyePos.x, 0, eyePos.z);
+          const rayDirXZ = new Vector3(spreadDir.x, 0, spreadDir.z);
+          const rayDirXZLen = rayDirXZ.length();
+
+          if (rayDirXZLen < 0.001) continue; // Ray is purely vertical
+
+          const rayDirXZNorm = rayDirXZ.scale(1 / rayDirXZLen);
+          const toCenter = Vector3.sub(remoteCenterXZ, rayOriginXZ);
+          const projDist = Vector3.dot(toCenter, rayDirXZNorm);
+
+          if (projDist < 0) continue; // Target is behind us
+
+          const closestXZ = Vector3.add(rayOriginXZ, rayDirXZNorm.scale(projDist));
+          const perpDistXZ = Vector3.distance(closestXZ, remoteCenterXZ);
+
+          if (perpDistXZ > playerRadius) continue; // Miss - ray passes outside cylinder
+
+          // Calculate actual 3D distance along ray
+          const hitDist3D = projDist / rayDirXZLen * spreadDir.length();
+
+          if (hitDist3D > effectiveRange) continue; // Beyond wall or max range
+
+          // Check Y bounds - does ray hit within player height?
+          const hitPoint = Vector3.add(eyePos, Vector3.scale(spreadDir, hitDist3D));
+          if (hitPoint.y < remoteFootY || hitPoint.y > remoteHeadY) continue; // Above/below player
+
+          // Valid hit!
+          if (!remoteHit || hitDist3D < remoteHit.distance) {
+            remoteHit = { playerId: remote.id, distance: hitDist3D, position: remote.position };
+            consoleLog(`[HIT] Ray hit ${remote.id.slice(0,8)} at dist=${hitDist3D.toFixed(1)}`);
+          }
         }
       }
 
       let hitPoint: Vector3;
       let hitWall = false;
 
-      if (botHit && (!wallHit || botHit.distance < wallHit.distance)) {
+      // Check remote player hit first (before bot and wall)
+      if (remoteHit && (!botHit || remoteHit.distance < botHit.distance) && (!wallHit || remoteHit.distance < wallHit.distance)) {
+        hitPoint = Vector3.add(eyePos, Vector3.scale(spreadDir, remoteHit.distance));
+        renderer.triggerHitMarker();
+        playSound('hit_enemy');
+
+        // Calculate damage based on weapon and distance
+        const baseDamage = weapon.def.damage;
+        const damage = baseDamage; // Could add distance falloff here
+
+        // Send hit action to server - SHOOTER determines hits
+        const mpState = getMultiplayerState();
+        if (mpState.isActive() && mpState.isLockstepMode()) {
+          mpState.addLockstepAction({
+            type: 'hit',
+            data: {
+              attackerId: mpState.getLocalPlayerId(),
+              victimId: remoteHit.playerId,
+              damage,
+              headshot: false, // TODO: implement headshot detection
+            },
+          });
+          consoleLog(`[SHOOTER] Hit ${remoteHit.playerId.slice(0, 8)} for ${damage} damage`);
+        }
+      } else if (botHit && (!wallHit || botHit.distance < wallHit.distance)) {
         const damage = weapon.def.damage * (botHit.headshot ? weapon.def.headshotMultiplier : 1);
         const wasAlive = botHit.bot.isAlive;
         botHit.bot.takeDamage(damage, botHit.headshot);
@@ -1962,6 +2061,341 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
                 voiceManagerRef.current.handleBinaryData(data);
               }
             },
+            // Lockstep multiplayer callbacks
+            onLockstepStart: (message) => {
+              consoleLog(`[Lockstep] Game starting at tick ${message.tick} with ${message.players.length} players`);
+
+              // Enable file logging for performance analysis
+              const logFile = enableFileLogging();
+              consoleLog(`[Logging] Performance log: ${logFile}`);
+              getFileLogger().event('lockstep_start', { tick: message.tick, players: message.players.length });
+
+              // Initialize lockstep simulation in multiplayer state
+              mpState.initializeLockstep(message);
+
+              // Each client is authoritative for their own position using their local BSP collision mesh
+              if (!collisionMeshRef.current || collisionMeshRef.current.triangles.length === 0) {
+                consoleError('[Lockstep] ERROR: No BSP collision mesh loaded! Cannot start lockstep.');
+                return;
+              }
+              consoleLog(`[Lockstep] Using local BSP collision mesh (${collisionMeshRef.current.triangles.length} triangles)`);
+
+              // Find our spawn position and set camera
+              const localId = gameClient.getPlayerId();
+              const localPlayer = message.players.find(p => p.id === localId);
+              const playerIndex = message.players.findIndex(p => p.id === localId);
+              if (localPlayer) {
+                // Use BSP map's spawn points if available, otherwise fall back to server spawns
+                // Server's DEFAULT_MAP spawns (Y=0.1) don't match BSP geometry
+                let spawnPos: Vector3;
+                let spawnYaw = localPlayer.spawnYaw;
+
+                if (loadedMapRef.current && loadedMapRef.current.spawns.length > 0) {
+                  // Use BSP map's spawn points - pick based on player index to avoid overlap
+                  const bspSpawns = loadedMapRef.current.spawns;
+                  const spawnIdx = playerIndex % bspSpawns.length;
+                  const bspSpawn = bspSpawns[spawnIdx];
+
+                  // BSP spawn position + eye height
+                  const rawPos = new Vector3(bspSpawn.position[0], bspSpawn.position[1], bspSpawn.position[2]);
+                  spawnPos = collisionMeshRef.current
+                    ? adjustSpawnPosition(rawPos, collisionMeshRef.current)
+                    : rawPos;
+                  spawnPos.y += 1.7; // Add eye height
+                  spawnYaw = bspSpawn.angle * Math.PI / 180; // Convert degrees to radians
+
+                  consoleLog(`[Spawn] Using BSP spawn point ${spawnIdx} from ${bspSpawns.length} available`);
+                } else {
+                  // Fall back to server spawn position
+                  const rawSpawnPos = new Vector3(
+                    localPlayer.spawnPosition.x,
+                    localPlayer.spawnPosition.y,
+                    localPlayer.spawnPosition.z
+                  );
+                  spawnPos = collisionMeshRef.current
+                    ? adjustSpawnPosition(rawSpawnPos, collisionMeshRef.current)
+                    : rawSpawnPos;
+                  consoleLog(`[Spawn] Using server spawn position (no BSP spawns available)`);
+                }
+
+                const spawnX = spawnPos.x;
+                const spawnY = spawnPos.y;
+                const spawnZ = spawnPos.z;
+
+                consoleLog(`[Spawn] Local player at (${spawnX.toFixed(1)}, ${spawnY.toFixed(1)}, ${spawnZ.toFixed(1)}) team=${localPlayer.team}`);
+                getFileLogger().event('spawn', {
+                  x: spawnX.toFixed(1),
+                  y: spawnY.toFixed(1),
+                  z: spawnZ.toFixed(1),
+                  team: localPlayer.team,
+                });
+
+                const camera = renderer.getCamera();
+                camera.setPosition(spawnX, spawnY, spawnZ);
+                camera.setYaw(spawnYaw);
+                camera.setPitch(0);
+
+                // Reset physics state for clean spawn
+                physics.velocityY = 0;
+                physics.onGround = true;
+
+                // Update player ref position
+                playerRef.current.position = new Vector3(spawnX, spawnY, spawnZ);
+                playerRef.current.team = localPlayer.team;
+                playerRef.current.isAlive = true;
+                playerRef.current.health = 100;
+              }
+            },
+            onLockstepTick: (message) => {
+              // Apply tick - updates remote player positions from received data
+              // (local player is authoritative for own position, handled by local physics)
+              mpState.applyLockstepTick(message);
+
+              // Debug: log tick receipt info
+              const localId = mpState.getLocalPlayerId();
+              const inputSummary = message.inputs.map(i =>
+                `${i.playerId.slice(0, 8)}:${i.actions?.length || 0}acts`
+              ).join(', ');
+              const totalActions = message.inputs.reduce((sum, i) => sum + (i.actions?.length || 0), 0);
+              if (totalActions > 0) {
+                getFileLogger().event('tick_received', {
+                  tick: message.tick,
+                  inputCount: message.inputs.length,
+                  totalActions,
+                  inputs: inputSummary,
+                  localId: localId?.slice(0, 8) || 'null',
+                });
+              }
+
+              // Process fire actions from other players
+              for (const playerInput of message.inputs) {
+                if (playerInput.playerId === mpState.getLocalPlayerId()) continue;
+
+                // Log remote player inputs with actions
+                const actionCount = playerInput.actions?.length || 0;
+                if (actionCount > 0) {
+                  getFileLogger().event('remote_player_actions', {
+                    from: playerInput.playerId.slice(0, 8),
+                    actionCount,
+                    types: playerInput.actions.map(a => a.type).join(','),
+                    hasData: playerInput.actions.map(a => !!a.data).join(','),
+                    rawActions: JSON.stringify(playerInput.actions),
+                  });
+                }
+
+                for (const action of playerInput.actions || []) {
+                  // Log ALL action types received
+                  consoleLog(`[ACTION] Type=${action.type} from=${playerInput.playerId.slice(0,8)} hasData=${!!action.data}`);
+
+                  if (action.type === 'fire') {
+                    consoleLog(`[MP] Received FIRE action from ${playerInput.playerId.slice(0, 8)}`);
+                    // Log what we actually received
+                    getFileLogger().event('fire_action_check', {
+                      type: action.type,
+                      hasData: !!action.data,
+                      dataKeys: action.data ? Object.keys(action.data).join(',') : 'none',
+                    });
+                  }
+                  if (action.type === 'fire' && action.data) {
+                    try {
+                      const { origin, direction, weaponType } = action.data;
+                      const originVec = new Vector3(origin.x, origin.y, origin.z);
+                      const dirVec = new Vector3(direction.x, direction.y, direction.z);
+
+                      // Play fire sound at remote player's position
+                      if (weaponType === 'pistol') playSoundAt('shoot_pistol', originVec);
+                      else if (weaponType === 'rifle') playSoundAt('shoot_rifle', originVec);
+                      else if (weaponType === 'shotgun') playSoundAt('shoot_shotgun', originVec);
+                      else if (weaponType === 'sniper') playSoundAt('shoot_sniper', originVec);
+
+                      // Draw tracer from remote player
+                      const tracerEndpoint = Vector3.add(originVec, Vector3.scale(dirVec.normalize(), 100));
+                      renderer.spawnTracer(originVec, tracerEndpoint, 150);
+
+                      // Log fire action received for debugging
+                      getFileLogger().event('fire_received', {
+                      from: playerInput.playerId.slice(0, 8),
+                      origin: `${origin.x.toFixed(1)},${origin.y.toFixed(1)},${origin.z.toFixed(1)}`,
+                      dir: `${direction.x.toFixed(2)},${direction.y.toFixed(2)},${direction.z.toFixed(2)}`,
+                    });
+
+                    // Note: Shooter determines hits and sends 'hit' actions
+                    // Victim just plays fire sounds and shows tracers here
+                    } catch (e: any) {
+                      getFileLogger().event('fire_error', { error: e.message || String(e) });
+                    }
+                  }
+
+                  // Handle hit action - shooter determined they hit someone
+                  if (action.type === 'hit' && action.data) {
+                    try {
+                    const { attackerId, victimId, damage, headshot } = action.data;
+                    const localId = mpState.getLocalPlayerId();
+
+                    // Safety check - ensure we have valid data
+                    if (!attackerId || !victimId || !localId) {
+                      consoleLog(`[HIT-ERROR] Missing data: attackerId=${!!attackerId} victimId=${!!victimId} localId=${!!localId}`);
+                      continue;
+                    }
+
+                    consoleLog(`[HIT-ACTION] Received: attacker=${attackerId.slice(0,8)} victim=${victimId.slice(0,8)} localId=${localId.slice(0,8)} damage=${damage}`);
+
+                    // If we're the attacker, show hit marker and play hit sound
+                    if (attackerId === localId) {
+                      renderer.triggerHitMarker();
+                      playSound(headshot ? 'hit_headshot' : 'hit_enemy');
+                      consoleLog(`[HIT] Hit ${victimId.slice(0, 8)} for ${damage} damage`);
+                      getFileLogger().event('hit_confirmed', {
+                        victim: victimId.slice(0, 8),
+                        damage,
+                        headshot,
+                      });
+                    }
+
+                    // If we're the victim, apply damage to ourselves
+                    const isVictim = victimId === localId;
+                    const isAlive = playerRef.current.isAlive;
+                    consoleLog(`[HIT-ACTION] isVictim=${isVictim} isAlive=${isAlive}`);
+                    if (isVictim && isAlive) {
+                      const localPlayer = playerRef.current;
+                      localPlayer.health -= damage;
+                      playSound('player_hurt');
+                      consoleLog(`[HIT] Took ${damage} damage from ${attackerId.slice(0, 8)} (health=${localPlayer.health})`);
+                      getFileLogger().event('damage_received', {
+                        attacker: attackerId.slice(0, 8),
+                        damage,
+                        health: localPlayer.health,
+                      });
+
+                      // Show damage indicator from attacker direction
+                      const attackerRemote = mpState.getRemotePlayers().find(p => p.id === attackerId);
+                      consoleLog(`[DAMAGE] Looking for attacker ${attackerId.slice(0,8)}, found=${!!attackerRemote}, remotePlayers=${mpState.getRemotePlayers().length}`);
+                      if (attackerRemote) {
+                        const attackerPos = new Vector3(
+                          attackerRemote.position.x,
+                          attackerRemote.position.y,
+                          attackerRemote.position.z
+                        );
+                        const camera = renderer.getCamera();
+                        renderer.addDamageIndicator(attackerPos, localPlayer.position, camera.yaw);
+                        consoleLog(`[DAMAGE] Added damage indicator from (${attackerPos.x.toFixed(0)},${attackerPos.z.toFixed(0)})`);
+                      } else {
+                        consoleLog(`[DAMAGE] Attacker not found in remote players!`);
+                      }
+
+                      // Check if we died
+                      consoleLog(`[DAMAGE] Health after damage: ${localPlayer.health}, checking death...`);
+                      if (localPlayer.health <= 0) {
+                        consoleLog(`[DEATH] Health <= 0, triggering death sequence!`);
+                        localPlayer.health = 0;
+                        localPlayer.isAlive = false;
+                        localPlayer.deaths++;
+                        const weaponType = 'pistol'; // TODO: get actual weapon from hit action
+
+                        // Trigger death camera effect
+                        consoleLog(`[DEATH] Calling renderer.setPlayerDead(true)`);
+                        renderer.setPlayerDead(true, 0);
+
+                        // Send death action to inform killer
+                        mpState.addLockstepAction({
+                          type: 'death',
+                          data: {
+                            killerId: attackerId,
+                            victimId: localId,
+                            weapon: weaponType,
+                          },
+                        });
+                        consoleLog(`[DEATH] Killed by ${attackerId.slice(0, 8)}`);
+
+                        // Respawn after delay
+                        setTimeout(() => {
+                          // Pick a random spawn point
+                          let spawnPos: Vector3;
+                          let spawnYaw = 0;
+
+                          if (loadedMapRef.current && loadedMapRef.current.spawns.length > 0) {
+                            const bspSpawns = loadedMapRef.current.spawns;
+                            const spawnIdx = Math.floor(Math.random() * bspSpawns.length);
+                            const bspSpawn = bspSpawns[spawnIdx];
+
+                            // BSP spawn position + eye height
+                            const rawPos = new Vector3(bspSpawn.position[0], bspSpawn.position[1], bspSpawn.position[2]);
+                            spawnPos = collisionMeshRef.current
+                              ? adjustSpawnPosition(rawPos, collisionMeshRef.current)
+                              : rawPos;
+                            spawnPos.y += 1.7; // Add eye height
+                            spawnYaw = bspSpawn.angle * Math.PI / 180;
+                          } else {
+                            // Fallback to current position if no spawns available
+                            spawnPos = localPlayer.position.clone();
+                          }
+
+                          // Teleport to spawn
+                          localPlayer.position = spawnPos;
+                          localPlayer.health = 100;
+                          localPlayer.isAlive = true;
+
+                          const camera = renderer.getCamera();
+                          camera.setPosition(spawnPos.x, spawnPos.y, spawnPos.z);
+                          camera.setYaw(spawnYaw);
+                          camera.setPitch(0);
+
+                          // Reset physics
+                          physics.velocityY = 0;
+                          physics.onGround = true;
+
+                          // Reset death camera effect
+                          renderer.setPlayerDead(false, 0);
+
+                          consoleLog(`[RESPAWN] Respawned at (${spawnPos.x.toFixed(1)}, ${spawnPos.y.toFixed(1)}, ${spawnPos.z.toFixed(1)})`);
+                        }, 3000);
+                      }
+                    }
+                    } catch (e: any) {
+                      consoleLog(`[HIT-ERROR] ${e.message || String(e)}`);
+                      getFileLogger().event('hit_error', { error: e.message || String(e) });
+                    }
+                  }
+
+                  // Handle death action - remote player died and is telling us who killed them
+                  if (action.type === 'death' && action.data) {
+                    const { killerId, victimId, weapon } = action.data;
+                    const localId = mpState.getLocalPlayerId();
+
+                    // If we're the killer, increment our kills
+                    if (killerId === localId) {
+                      const localPlayer = playerRef.current;
+                      localPlayer.kills++;
+                      playSound('bot_death'); // Kill confirmation sound
+                      consoleLog(`[KILL] You killed ${victimId.slice(0, 8)} with ${weapon}!`);
+                      getFileLogger().event('kill_confirmed', {
+                        victim: victimId.slice(0, 8),
+                        weapon,
+                        totalKills: localPlayer.kills,
+                      });
+                    }
+                  }
+                }
+              }
+
+              // Update voice spatial positions for remote players
+              if (voiceManagerRef.current) {
+                for (const playerInput of message.inputs) {
+                  if (playerInput.playerId !== mpState.getLocalPlayerId()) {
+                    voiceManagerRef.current.updatePlayerPosition(
+                      playerInput.playerId,
+                      new Vector3(playerInput.position.x, playerInput.position.y, playerInput.position.z)
+                    );
+                  }
+                }
+              }
+            },
+            onLockstepDesync: (message) => {
+              consoleError(`[Lockstep] DESYNC detected at tick ${message.tick}!`);
+              consoleError(`  Expected: ${message.expectedHash}`);
+              consoleError(`  Got: ${message.receivedHash}`);
+              // TODO: Could implement resync by requesting full state from server
+            },
           });
 
           gameClient.connect('ws://localhost:8080').catch((err) => {
@@ -2302,25 +2736,49 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
       consoleLog('Input: Stdin (fallback) - Native keyboard unavailable');
     }
 
-    process.stdin.setRawMode(true);
-    process.stdin.resume();
-    process.stdin.on('data', handleData);
+    if (process.stdin.isTTY && process.stdin.setRawMode) {
+      process.stdin.setRawMode(true);
+      process.stdin.resume();
+      process.stdin.on('data', handleData);
+    }
 
     return () => {
       mouseHandler.disable();
       setNativeCursorCaptured(false);  // Ensure cursor is released
       stopNativeKeyboard();
-      process.stdin.setRawMode(false);
-      process.stdin.pause();
-      process.stdin.off('data', handleData);
+      if (process.stdin.isTTY && process.stdin.setRawMode) {
+        process.stdin.setRawMode(false);
+        process.stdin.pause();
+        process.stdin.off('data', handleData);
+      }
     };
   }, [mouseHandler]);
 
   // Game loop
   useEffect(() => {
     let running = true;
-    let lastTime = performance.now();
     let lastJumpTime = 0; // Prevent jump spam
+
+    // Interpolation state for smooth rendering
+    // We store previous and current positions, then interpolate between them
+    const interpState = {
+      prevX: 0, prevY: 0, prevZ: 0,
+      currX: 0, currY: 0, currZ: 0,
+      prevYaw: 0, currYaw: 0,
+      prevPitch: 0, currPitch: 0,
+    };
+
+    // Initialize interpolation state from camera
+    const initCamera = renderer.getCamera();
+    interpState.prevX = interpState.currX = initCamera.position.x;
+    interpState.prevY = interpState.currY = initCamera.position.y;
+    interpState.prevZ = interpState.currZ = initCamera.position.z;
+    interpState.prevYaw = interpState.currYaw = initCamera.yaw;
+    interpState.prevPitch = interpState.currPitch = initCamera.pitch;
+
+    // Get the GameLoop manager instance (handles fixed timestep physics)
+    const gameLoopManager = getGameLoop();
+    gameLoopManager.reset();
 
     // Helper: check if key is currently "held" via stdin (fallback)
     const isKeyHeld = (key: string, now: number): boolean => {
@@ -2328,12 +2786,12 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
       return lastPress !== undefined && (now - lastPress) < KEY_HOLD_MS;
     };
 
-    const gameLoop = () => {
-      if (!running) return;
-
+    // ============ PHYSICS UPDATE (Fixed 60Hz) ============
+    // This function runs at a fixed rate for consistent physics
+    const physicsUpdate = (dt: number) => {
+      // Use the fixed timestep dt for all physics calculations
+      // This ensures consistent physics regardless of frame rate
       const now = performance.now();
-      const deltaTime = (now - lastTime) / 1000; // Convert to seconds
-      lastTime = now;
 
       const camera = renderer.getCamera();
       const physics = physicsRef.current;
@@ -2462,20 +2920,23 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
       }
 
       // Apply rotation from keyboard (arrow keys)
-      if (lookYaw !== 0) camera.rotate(0, -TURN_SPEED * deltaTime * lookYaw);
-      if (lookPitch !== 0) camera.rotate(TURN_SPEED * deltaTime * lookPitch, 0);
+      if (lookYaw !== 0) camera.rotate(0, -TURN_SPEED * dt * lookYaw);
+      if (lookPitch !== 0) camera.rotate(TURN_SPEED * dt * lookPitch, 0);
 
       // Check if player is frozen (freeze phase in competitive mode)
       // Solo mode is never frozen
+      // In multiplayer, use server-provided freeze state
       const isSoloModeMove = gameModeTypeRef.current === 'solo';
-      const playerFrozen = isSoloModeMove ? false : gameModeRef.current.isPlayerFrozen();
+      const mpState = getMultiplayerState();
+      const playerFrozen = isSoloModeMove ? false :
+        (isMultiplayerRef.current && mpState.isActive() ? mpState.isPlayerFrozen() : gameModeRef.current.isPlayerFrozen());
 
       // Calculate movement direction (blocked during freeze phase)
       let moveForward = 0;
       let moveRight = 0;
       if (!playerFrozen) {
-        moveForward = forward * MOVE_SPEED * deltaTime;
-        moveRight = strafe * MOVE_SPEED * deltaTime;
+        moveForward = forward * MOVE_SPEED * dt;
+        moveRight = strafe * MOVE_SPEED * dt;
       }
 
       // Handle jump (with cooldown to prevent spam from key repeat)
@@ -2498,17 +2959,37 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
           const weapon = player.getCurrentWeapon();
 
           if (isMultiplayerRef.current) {
-            // Multiplayer: send fire event to server
-            // Still check fire timing locally for responsive feel
-            if (player.fire(now) && weapon) {
-              getGameClient().sendFire();
-              // Play local fire sound immediately for responsiveness
-              const weaponType = weapon.def.type;
-              if (weaponType === 'pistol') playSound('shoot_pistol');
-              else if (weaponType === 'rifle') playSound('shoot_rifle');
-              else if (weaponType === 'shotgun') playSound('shoot_shotgun');
-              else if (weaponType === 'sniper') playSound('shoot_sniper');
-              renderer.triggerMuzzleFlash(80);
+            const mpState = getMultiplayerState();
+
+            if (mpState.isLockstepMode()) {
+              // Lockstep mode: add fire action and handle locally
+              if (player.fire(now) && weapon) {
+                // Add fire action to be sent with next tick
+                const fireDir = camera.getForward();
+                mpState.addLockstepAction({
+                  type: 'fire',
+                  data: {
+                    origin: { x: camera.position.x, y: camera.position.y, z: camera.position.z },
+                    direction: { x: fireDir.x, y: fireDir.y, z: fireDir.z },
+                    weaponType: weapon.def.type,
+                  },
+                });
+
+                // Handle fire locally for immediate feedback
+                handlePlayerFire(player, weapon, now);
+              }
+            } else {
+              // Server-authoritative: send fire event to server
+              if (player.fire(now) && weapon) {
+                getGameClient().sendFire();
+                // Play local fire sound immediately for responsiveness
+                const weaponType = weapon.def.type;
+                if (weaponType === 'pistol') playSound('shoot_pistol');
+                else if (weaponType === 'rifle') playSound('shoot_rifle');
+                else if (weaponType === 'shotgun') playSound('shoot_shotgun');
+                else if (weaponType === 'sniper') playSound('shoot_sniper');
+                renderer.triggerMuzzleFlash(80);
+              }
             }
           } else {
             // Single player: handle fire locally
@@ -2531,7 +3012,7 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
 
       // Apply gravity
       if (!physics.onGround) {
-        physics.velocityY -= GRAVITY * deltaTime;
+        physics.velocityY -= GRAVITY * dt;
       }
 
       // Get feet position (camera is at eye level)
@@ -2541,7 +3022,7 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
         camera.position.z
       );
 
-      // Use mesh collision if available (BSP maps), otherwise use AABB collision
+      // Use BSP mesh collision (required)
       const collisionMesh = collisionMeshRef.current;
       let newFeetPos: Vector3;
       let newOnGround: boolean;
@@ -2549,30 +3030,15 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
       if (collisionMesh && collisionMesh.triangles.length > 0 && collisionEnabledRef.current) {
         // Use triangle-based collision for BSP maps
         const velocity = new Vector3(velocityX, physics.velocityY, velocityZ);
-        const result = moveWithMeshCollision(feetPos, velocity, collisionMesh, deltaTime);
+        const result = moveWithMeshCollision(feetPos, velocity, collisionMesh, dt);
         newFeetPos = result.newPosition;
         physics.velocityY = result.newVelocity.y;
         newOnGround = result.onGround;
       } else {
-        // Fall back to AABB collision
-        let movement = Vector3.zero();
-        movement = Vector3.add(movement, Vector3.scale(forwardDir, moveForward));
-        movement = Vector3.add(movement, Vector3.scale(rightDir, moveRight));
-        movement.y = physics.velocityY * deltaTime;
-
-        newFeetPos = moveAndSlide(
-          feetPos,
-          movement,
-          PLAYER_RADIUS,
-          PLAYER_HEIGHT,
-          collidersRef.current
-        );
-
-        newOnGround = checkOnGround(
-          newFeetPos,
-          PLAYER_RADIUS,
-          collidersRef.current
-        );
+        // No collision mesh - just apply movement directly (for loading screens, etc)
+        newFeetPos = Vector3.add(feetPos, new Vector3(velocityX * dt, physics.velocityY * dt, velocityZ * dt));
+        newOnGround = newFeetPos.y <= 0.1;
+        if (newFeetPos.y < 0) newFeetPos.y = 0;
       }
 
       // Update camera position (convert feet to eye level)
@@ -2616,7 +3082,6 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
 
       // Multiplayer: send input to server and record for prediction
       const isMultiplayer = isMultiplayerRef.current;
-      const mpState = getMultiplayerState();
 
       if (isMultiplayer && mpState.isActive()) {
         const gameClient = getGameClient();
@@ -2631,15 +3096,36 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
           crouch: false, // TODO: implement crouch
         };
 
-        // Get sequence and send to server
-        const sequence = mpState.getNextInputSequence();
-        gameClient.sendInput(inputState);
-
-        // Record for client-side prediction reconciliation
-        mpState.recordPendingInput(sequence, inputState, player.position);
-
-        // Update interpolation for remote entities
-        mpState.updateInterpolation(now);
+        if (mpState.isLockstepMode()) {
+          // Lockstep mode: client is authoritative for own position and health
+          // Send input + our calculated position to server
+          const tick = mpState.getCurrentTick();
+          const actions = mpState.popPendingActions();
+          if (actions.length > 0) {
+            consoleLog(`[SEND] Sending ${actions.length} actions: ${actions.map(a => a.type).join(',')}, health=${player.health}`);
+            getFileLogger().event('sending_actions', {
+              tick,
+              actionCount: actions.length,
+              types: actions.map(a => a.type).join(','),
+            });
+          }
+          gameClient.sendLockstepInput(
+            tick,
+            inputState,
+            { x: player.position.x, y: player.position.y, z: player.position.z },
+            camera.yaw,
+            camera.pitch,
+            player.health,
+            player.isAlive,
+            actions
+          );
+        } else {
+          // Server-authoritative mode: use client-side prediction
+          const sequence = mpState.getNextInputSequence();
+          gameClient.sendInput(inputState);
+          mpState.recordPendingInput(sequence, inputState, player.position);
+          mpState.updateInterpolation(now);
+        }
       }
 
       // Get weapon state for HUD
@@ -2673,7 +3159,8 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
           // Game mode is handled by server, we just render what server tells us
         } else {
           // Single player mode: run local bot simulation
-          botManager.update(player, collidersRef.current, now, deltaTime, areBotsFrozen, isTeamMode);
+          // Bots use getGlobalCollisionMesh() for BSP collision, AABB param is deprecated
+          botManager.update(player, [], now, dt, areBotsFrozen, isTeamMode);
 
           // Bot combat is now handled by BotManager.update() via callbacks
 
@@ -2683,7 +3170,7 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
       }
 
       // Handle death camera effect
-      renderer.setPlayerDead(!player.isAlive, deltaTime);
+      renderer.setPlayerDead(!player.isAlive, dt);
       if (!player.isAlive) {
         // Play death sound and drop weapons on transition to dead
         if (wasAliveRef.current) {
@@ -2750,9 +3237,86 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
         gameMode.onPlayerRespawn();
       }
 
+      // NOTE: interpState is updated in the render loop, not here
+      // This allows proper interpolation across multiple physics ticks
+    };  // End of physicsUpdate
+
+    // Register physics callback with game loop manager
+    gameLoopManager.setPhysicsCallback(physicsUpdate);
+
+    // ============ RENDER LOOP (Variable rate with interpolation) ============
+    // Performance tracking
+    let frameCount = 0;
+    let lastPerfLog = performance.now();
+
+    const gameLoop = () => {
+      if (!running) return;
+
+      const now = performance.now();
+      const camera = renderer.getCamera();
+      const player = playerRef.current;
+      const isMultiplayer = isMultiplayerRef.current;
+      const mpState = getMultiplayerState();
+
+      // Start game loop manager if not running
+      if (!gameLoopManager['isRunning']) {
+        gameLoopManager.start();
+      }
+
+      // Run fixed timestep physics
+      // The gameLoopManager runs physicsUpdate at a fixed rate (60Hz)
+      // and returns alpha for potential interpolation
+      const alpha = gameLoopManager.tick();
+      const physicsTicks = gameLoopManager.getPhysicsTicksThisFrame();
+
+      // NOTE: For now, we skip interpolation because the camera is used for both
+      // physics and rendering. With 60Hz physics, movement should be smooth enough.
+      // Proper interpolation would require separating physics state from render state.
+
+      // Performance logging to file (every second) and console (every 5 seconds)
+      frameCount++;
+      const fileLogger = getFileLogger();
+
+      // Log to file every second for detailed analysis
+      if (isMultiplayer && mpState.isActive() && fileLogger.isEnabled() && (now - lastPerfLog) > 1000) {
+        const metrics = mpState.getPerformanceMetrics();
+        const avgFPS = frameCount / ((now - lastPerfLog) / 1000);
+        fileLogger.perf({
+          fps: avgFPS,
+          physicsTicks: physicsTicks,
+          serverTickRate: metrics.tickRate,
+          totalTicks: metrics.ticksReceived,
+          frameTime: (now - lastPerfLog) / frameCount,
+          alpha: alpha,
+        });
+
+        // Console log every 5 seconds
+        if (metrics.ticksReceived % 300 < 60) {
+          consoleDebug(`[Perf] FPS: ${avgFPS.toFixed(1)}, Physics/frame: ${physicsTicks}, Server tick rate: ${metrics.tickRate.toFixed(1)}Hz`);
+        }
+
+        frameCount = 0;
+        lastPerfLog = now;
+      }
+
+      // Get delta time for render-related updates (not physics)
+      const frameTime = 1 / 60; // Approximate for render updates
+
+      // Get weapon state for HUD
+      const weapon = player.getCurrentWeapon();
+
+      // Check game mode types
+      const gameMode = gameModeRef.current;
+      const isTeamMode = gameModeTypeRef.current === 'competitive';
+      const isSoloMode = gameModeTypeRef.current === 'solo';
+
       // Pass bots to renderer (use multiplayer entities or local bots)
       if (isMultiplayer && mpState.isActive()) {
         // Multiplayer: use remote entities from server
+        // Interpolate lockstep positions for smooth movement
+        if (mpState.isLockstepMode()) {
+          mpState.interpolateLockstepPositions(frameTime);
+        }
         renderer.setBots(mpState.getBotCompatibleEntities() as any);
       } else {
         // Single player: use local bots

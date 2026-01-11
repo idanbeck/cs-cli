@@ -23,7 +23,10 @@
     "start": "node dist/index.js 2>/dev/null",
     "test:voice": "npm run build && cd server && npm run build && cd .. && node dist/test/voiceTestHarness.js",
     "test:voice:3": "npm run test:voice -- 3",
-    "test:voice:5": "npm run test:voice -- 5"
+    "test:voice:5": "npm run test:voice -- 5",
+    "test:lockstep": "npm run build && node dist/test/lockstepTestHarness.js",
+    "test:lockstep:5": "npm run test:lockstep -- 5",
+    "test:lockstep:10": "npm run test:lockstep -- 10"
   },
   "keywords": [
     "cli",

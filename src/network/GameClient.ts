@@ -16,6 +16,10 @@ import {
   TeamId,
   GamePhase,
   Vec3,
+  LockstepAction,
+  LockstepStartMessage,
+  LockstepTickMessage,
+  LockstepDesyncMessage,
 } from '../shared/types/Protocol.js';
 
 export type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'in_lobby' | 'in_game';
@@ -73,6 +77,11 @@ export interface GameClientCallbacks {
 
   // Voice (binary data)
   onVoiceData?: (data: Uint8Array) => void;
+
+  // Lockstep events
+  onLockstepStart?: (message: LockstepStartMessage) => void;
+  onLockstepTick?: (message: LockstepTickMessage) => void;
+  onLockstepDesync?: (message: LockstepDesyncMessage) => void;
 }
 
 export class GameClient {
@@ -279,6 +288,39 @@ export class GameClient {
     this.send({ type: 'chat', message, teamOnly });
   }
 
+  // ============ Lockstep Operations ============
+
+  sendLockstepInput(
+    tick: number,
+    input: PlayerInput,
+    position: Vec3,
+    yaw: number,
+    pitch: number,
+    health: number,
+    isAlive: boolean,
+    actions: LockstepAction[] = []
+  ): void {
+    this.send({
+      type: 'lockstep_input',
+      tick,
+      input,
+      actions,
+      position,
+      yaw,
+      pitch,
+      health,
+      isAlive,
+    });
+  }
+
+  sendSyncCheck(tick: number, hash: string): void {
+    this.send({
+      type: 'lockstep_sync',
+      tick,
+      hash,
+    });
+  }
+
   // Get pending inputs for reconciliation
   getPendingInputs(): Map<number, PlayerInput> {
     return this.pendingInputs;
@@ -457,6 +499,20 @@ export class GameClient {
       case 'input_ack':
         this.acknowledgeInput(message.sequence);
         this.callbacks.onInputAck?.(message.sequence, message.position);
+        break;
+
+      // Lockstep messages
+      case 'lockstep_start':
+        this.state = 'in_game';
+        this.callbacks.onLockstepStart?.(message);
+        break;
+
+      case 'lockstep_tick':
+        this.callbacks.onLockstepTick?.(message);
+        break;
+
+      case 'lockstep_desync':
+        this.callbacks.onLockstepDesync?.(message);
         break;
 
       default:

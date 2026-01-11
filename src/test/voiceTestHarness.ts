@@ -55,6 +55,9 @@ interface ClientStats {
   bytesSent: number;
   bytesReceived: number;
   latencies: number[];
+  // SNR tracking - compare sent vs received amplitude patterns
+  sentAmplitudes: number[];
+  receivedAmplitudes: Map<number, number[]>; // senderId -> amplitudes
 }
 
 const clientStats: Map<string, ClientStats> = new Map();
@@ -101,6 +104,8 @@ class TestVoiceClient {
       bytesSent: 0,
       bytesReceived: 0,
       latencies: [],
+      sentAmplitudes: [],
+      receivedAmplitudes: new Map(),
     };
     clientStats.set(playerId, this.stats);
   }
@@ -205,14 +210,24 @@ class TestVoiceClient {
     if (this.codec) {
       try {
         const samples = this.codec.decode(frame.payload);
-        // Calculate max amplitude
+
+        // Calculate RMS amplitude for SNR tracking
+        let sumSquares = 0;
         let maxAmp = 0;
         for (let i = 0; i < samples.length; i++) {
+          sumSquares += samples[i] * samples[i];
           maxAmp = Math.max(maxAmp, Math.abs(samples[i]));
         }
+        const rmsAmplitude = Math.sqrt(sumSquares / samples.length);
+
+        // Track received amplitudes by sender
+        if (!this.stats.receivedAmplitudes.has(frame.senderId)) {
+          this.stats.receivedAmplitudes.set(frame.senderId, []);
+        }
+        this.stats.receivedAmplitudes.get(frame.senderId)!.push(rmsAmplitude);
 
         if (this.stats.framesReceived % 50 === 1) {
-          this.log(`Received frame #${this.stats.framesReceived} from ${frame.senderId.toString(16)}, seq=${frame.sequence}, samples=${samples.length}, maxAmp=${maxAmp}`);
+          this.log(`Received frame #${this.stats.framesReceived} from ${frame.senderId.toString(16)}, seq=${frame.sequence}, samples=${samples.length}, rms=${rmsAmplitude.toFixed(0)}, maxAmp=${maxAmp}`);
         }
       } catch (err) {
         this.log(`Decode error: ${err}`);
@@ -263,6 +278,14 @@ class TestVoiceClient {
 
     // Generate 20ms of test tone (160 samples at 8kHz)
     const samples = generateTestTone(8000, this.toneFrequency, 20, 0.3);
+
+    // Track RMS amplitude of sent samples for SNR calculation
+    let sumSquares = 0;
+    for (let i = 0; i < samples.length; i++) {
+      sumSquares += samples[i] * samples[i];
+    }
+    const rmsAmplitude = Math.sqrt(sumSquares / samples.length);
+    this.stats.sentAmplitudes.push(rmsAmplitude);
 
     // Encode
     const payload = this.codec.encode(samples);
@@ -315,6 +338,14 @@ class TestVoiceClient {
 
   getStats(): ClientStats {
     return this.stats;
+  }
+
+  getSenderId(): number {
+    return this.senderId;
+  }
+
+  getToneFrequency(): number {
+    return this.toneFrequency;
   }
 }
 
@@ -468,41 +499,105 @@ async function runTest() {
 
     let totalSent = 0;
     let totalReceived = 0;
+    let totalExpectedReceived = 0;
+
+    // Build sender ID to client index map
+    const senderIdToIndex = new Map<number, number>();
+    for (let i = 0; i < clients.length; i++) {
+      senderIdToIndex.set(clients[i].getSenderId(), i);
+    }
 
     for (let i = 0; i < clients.length; i++) {
       const stats = clients[i].getStats();
       const color = clientColors[i % clientColors.length];
 
+      // Calculate average sent RMS
+      const avgSentRms = stats.sentAmplitudes.length > 0
+        ? stats.sentAmplitudes.reduce((a, b) => a + b, 0) / stats.sentAmplitudes.length
+        : 0;
+
       console.log(`${color}`);
-      console.log(`  Client ${i}:`);
+      console.log(`  Client ${i} (${clients[i].getToneFrequency()}Hz):`);
       console.log(`    Frames sent:     ${stats.framesSent}`);
       console.log(`    Frames received: ${stats.framesReceived}`);
       console.log(`    Bytes sent:      ${stats.bytesSent}`);
       console.log(`    Bytes received:  ${stats.bytesReceived}`);
+      console.log(`    Avg sent RMS:    ${avgSentRms.toFixed(0)}`);
+
+      // Show received RMS per sender
+      if (stats.receivedAmplitudes.size > 0) {
+        console.log(`    Received RMS by sender:`);
+        for (const [senderId, amplitudes] of stats.receivedAmplitudes) {
+          const avgRecvRms = amplitudes.reduce((a, b) => a + b, 0) / amplitudes.length;
+          const senderIdx = senderIdToIndex.get(senderId) ?? '?';
+          console.log(`      From Client ${senderIdx}: ${avgRecvRms.toFixed(0)} (${amplitudes.length} frames)`);
+        }
+      }
       console.log(`${colors.reset}`);
 
       totalSent += stats.framesSent;
       totalReceived += stats.framesReceived;
+
+      // Expected received = frames from all other clients
+      totalExpectedReceived += stats.framesSent * (NUM_CLIENTS - 1);
     }
 
-    // Expected frames: each client sends frames, each other client should receive them
-    const expectedFramesPerClient = Math.floor(TEST_DURATION_MS / VOICE_FRAME_INTERVAL_MS);
-    const expectedTotalReceived = expectedFramesPerClient * NUM_CLIENTS * (NUM_CLIENTS - 1);
-    const receiveRate = totalReceived / expectedTotalReceived * 100;
+    // Calculate actual delivery rate based on frames sent (not theoretical max)
+    const actualDeliveryRate = totalExpectedReceived > 0
+      ? (totalReceived / totalExpectedReceived) * 100
+      : 0;
+
+    // Calculate SNR metric: compare average sent vs received RMS across all clients
+    let snrTotal = 0;
+    let snrCount = 0;
+    for (let i = 0; i < clients.length; i++) {
+      const senderStats = clients[i].getStats();
+      const avgSentRms = senderStats.sentAmplitudes.length > 0
+        ? senderStats.sentAmplitudes.reduce((a, b) => a + b, 0) / senderStats.sentAmplitudes.length
+        : 0;
+
+      // Check what other clients received from this sender
+      for (let j = 0; j < clients.length; j++) {
+        if (i === j) continue;
+        const receiverStats = clients[j].getStats();
+        const receivedFromSender = receiverStats.receivedAmplitudes.get(clients[i].getSenderId());
+        if (receivedFromSender && receivedFromSender.length > 0) {
+          const avgRecvRms = receivedFromSender.reduce((a, b) => a + b, 0) / receivedFromSender.length;
+          // SNR-like ratio: how close is received to sent (1.0 = perfect)
+          if (avgSentRms > 0) {
+            const ratio = avgRecvRms / avgSentRms;
+            snrTotal += ratio;
+            snrCount++;
+          }
+        }
+      }
+    }
+    const avgSnrRatio = snrCount > 0 ? snrTotal / snrCount : 0;
 
     console.log('  Summary:');
     console.log(`    Total frames sent:     ${totalSent}`);
     console.log(`    Total frames received: ${totalReceived}`);
-    console.log(`    Expected received:     ${expectedTotalReceived}`);
-    console.log(`    Receive rate:          ${receiveRate.toFixed(1)}%`);
+    console.log(`    Expected received:     ${totalExpectedReceived}`);
+    console.log(`    Delivery rate:         ${actualDeliveryRate.toFixed(1)}%`);
+    console.log(`    SNR ratio (recv/sent): ${avgSnrRatio.toFixed(3)} (1.0 = perfect)`);
     console.log('='.repeat(60) + '\n');
 
-    if (receiveRate > 90) {
+    // Determine test result
+    const deliveryPass = actualDeliveryRate > 95;
+    const snrPass = avgSnrRatio > 0.5 && avgSnrRatio < 2.0; // Within reasonable range
+
+    if (deliveryPass && snrPass) {
       console.log(`${colors.green}✓ TEST PASSED${colors.reset}`);
-    } else if (receiveRate > 50) {
+      console.log(`  Delivery: ${actualDeliveryRate.toFixed(1)}% (>95% required)`);
+      console.log(`  SNR: ${avgSnrRatio.toFixed(3)} (0.5-2.0 acceptable)`);
+    } else if (actualDeliveryRate > 80) {
       console.log(`${colors.yellow}⚠ TEST PARTIAL${colors.reset}`);
+      if (!deliveryPass) console.log(`  Delivery: ${actualDeliveryRate.toFixed(1)}% (>95% required)`);
+      if (!snrPass) console.log(`  SNR: ${avgSnrRatio.toFixed(3)} (0.5-2.0 acceptable)`);
     } else {
       console.log(`${colors.red}✗ TEST FAILED${colors.reset}`);
+      console.log(`  Delivery: ${actualDeliveryRate.toFixed(1)}%`);
+      console.log(`  SNR: ${avgSnrRatio.toFixed(3)}`);
     }
 
   } catch (err) {

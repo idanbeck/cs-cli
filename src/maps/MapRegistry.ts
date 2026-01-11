@@ -1,13 +1,11 @@
 // MapRegistry - Central registry of available maps
 
 import { MapLoader, LoadedMap } from './MapLoader.js';
-import { MapDef } from './MapFormat.js';
-import { dm_arena } from './maps/dm_arena.js';
 import { existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
-export type MapType = 'brushdef' | 'bsp';
+export type MapType = 'bsp';
 export type MapGameMode = 'deathmatch' | 'competitive' | 'both';
 
 export interface MapInfo {
@@ -17,25 +15,10 @@ export interface MapInfo {
   modes: MapGameMode;
   description?: string;
 
-  // For brushdef maps
-  def?: MapDef;
-
   // For BSP maps
   bspPath?: string;
   wadPaths?: string[];
 }
-
-// Built-in maps
-const BUILTIN_MAPS: MapInfo[] = [
-  {
-    id: 'dm_arena',
-    name: 'DM Arena',
-    type: 'brushdef',
-    modes: 'both',
-    description: 'Small deathmatch arena',
-    def: dm_arena,
-  },
-];
 
 // BSP maps (will be loaded from assets/maps if they exist)
 const BSP_MAPS: MapInfo[] = [
@@ -214,16 +197,11 @@ export class MapRegistry {
   static initialize(): void {
     if (this.initialized) return;
 
-    // Add BSP maps first (so dust2 appears at top of list)
+    // Add BSP maps
     for (const map of BSP_MAPS) {
       if (map.bspPath && this.checkMapExists(map.bspPath)) {
         this.maps.set(map.id, map);
       }
-    }
-
-    // Add built-in maps after BSP maps
-    for (const map of BUILTIN_MAPS) {
-      this.maps.set(map.id, map);
     }
 
     this.initialized = true;
@@ -293,15 +271,13 @@ export class MapRegistry {
       throw new Error(`Map not found: ${id}`);
     }
 
-    if (mapInfo.type === 'brushdef' && mapInfo.def) {
-      return MapLoader.load(mapInfo.def);
-    } else if (mapInfo.type === 'bsp' && mapInfo.bspPath) {
-      const bspPath = this.resolvePath(mapInfo.bspPath);
-      const wadPaths = mapInfo.wadPaths?.map(p => this.resolvePath(p));
-      return MapLoader.loadBSP(bspPath, wadPaths);
+    if (!mapInfo.bspPath) {
+      throw new Error(`Invalid map configuration: ${id}`);
     }
 
-    throw new Error(`Invalid map configuration: ${id}`);
+    const bspPath = this.resolvePath(mapInfo.bspPath);
+    const wadPaths = mapInfo.wadPaths?.map(p => this.resolvePath(p));
+    return MapLoader.loadBSP(bspPath, wadPaths);
   }
 
   // Register a custom map
@@ -332,7 +308,15 @@ export class MapRegistry {
 
 // Export default maps list for UI
 export function getDefaultMapId(): string {
-  return 'dm_arena';
+  // Default to de_dust2 or first available BSP map
+  MapRegistry.initialize();
+  const maps = MapRegistry.getAvailableMaps();
+  if (maps.length === 0) {
+    throw new Error('No BSP maps available. Please add BSP maps to assets/maps/');
+  }
+  // Prefer de_dust2 if available
+  const dust2 = maps.find(m => m.id === 'de_dust2');
+  return dust2 ? dust2.id : maps[0].id;
 }
 
 export function getMapList(): { id: string; name: string }[] {

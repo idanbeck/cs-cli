@@ -13,7 +13,7 @@
  * - alpha: Interpolation factor for smooth rendering (0-1)
  */
 
-export const PHYSICS_TICK_RATE = 20;  // 20 Hz = 50ms per tick
+export const PHYSICS_TICK_RATE = 60;  // 60 Hz = ~16.67ms per tick (matches lockstep)
 export const PHYSICS_DT = 1 / PHYSICS_TICK_RATE;
 const MAX_FRAME_TIME = 0.25;  // Prevent spiral of death (250ms max)
 

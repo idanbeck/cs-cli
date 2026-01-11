@@ -2,6 +2,7 @@
 // Handles server state, client-side prediction, and interpolation
 
 import { Vector3 } from '../engine/math/Vector3.js';
+import { getFileLogger } from '../utils/FileLogger.js';
 import {
   GameStateSnapshot,
   PlayerSnapshot,
@@ -14,6 +15,9 @@ import {
   KillEvent,
   HitEvent,
   FireEvent,
+  LockstepStartMessage,
+  LockstepTickMessage,
+  LockstepAction,
 } from '../shared/types/Protocol.js';
 
 // Convert protocol Vec3 to engine Vector3
@@ -61,6 +65,12 @@ interface RemoteEntity {
   position: Vector3;
   yaw: number;
   pitch: number;
+
+  // Lockstep interpolation (for smooth movement between ticks)
+  targetPosition: Vector3;  // Position received from server
+  targetYaw: number;
+  targetPitch: number;
+  lastUpdateTime: number;
 }
 
 // Events queued from server
@@ -76,6 +86,12 @@ export class MultiplayerState {
 
   // Local player ID (assigned by server)
   private localPlayerId: string | null = null;
+
+  // Lockstep mode
+  private lockstepMode: boolean = false;
+  private currentTick: number = 0;
+  private pendingLockstepInput: PlayerInput | null = null;
+  private pendingLockstepActions: LockstepAction[] = [];
 
   // Server state
   private serverTick: number = 0;
@@ -108,6 +124,19 @@ export class MultiplayerState {
 
   // Local player authoritative position from server (for reconciliation)
   private serverPosition: Vector3 | null = null;
+
+  // Callback for incoming fire actions (for hit detection)
+  private onRemoteFireCallback: ((
+    shooterId: string,
+    origin: Vec3,
+    direction: Vec3,
+    weaponType: string
+  ) => void) | null = null;
+
+  // Performance metrics
+  private ticksReceived: number = 0;
+  private lastTickTime: number = 0;
+  private tickRate: number = 0;  // Measured ticks per second
 
   constructor() {}
 
@@ -150,6 +179,12 @@ export class MultiplayerState {
     this.inputSequence = 0;
     this.eventQueue = [];
     this.serverPosition = null;
+
+    // Lockstep reset
+    this.lockstepMode = false;
+    this.currentTick = 0;
+    this.pendingLockstepInput = null;
+    this.pendingLockstepActions = [];
   }
 
   // ============ Server State Updates ============
@@ -215,6 +250,7 @@ export class MultiplayerState {
 
     if (!entity) {
       // New entity
+      const pos = toVector3(data.position);
       entity = {
         id: data.id,
         name: data.name,
@@ -226,9 +262,14 @@ export class MultiplayerState {
         kills: data.kills,
         deaths: data.deaths,
         states: [],
-        position: toVector3(data.position),
+        position: pos.clone(),
         yaw: data.yaw,
         pitch: data.pitch,
+        // Lockstep interpolation fields (needed for all modes)
+        targetPosition: pos.clone(),
+        targetYaw: data.yaw,
+        targetPitch: data.pitch,
+        lastUpdateTime: Date.now(),
       };
       map.set(data.id, entity);
     }
@@ -393,6 +434,216 @@ export class MultiplayerState {
     return events;
   }
 
+  // ============ Lockstep Mode ============
+
+  isLockstepMode(): boolean {
+    return this.lockstepMode;
+  }
+
+  initializeLockstep(message: LockstepStartMessage): void {
+    this.lockstepMode = true;
+    this.currentTick = message.tick;
+    this.phase = 'live';
+
+    // Each client is authoritative for their own physics - no full simulation needed
+    // Just track remote player positions for rendering
+
+    for (const player of message.players) {
+      // Track remote players for rendering (skip local player)
+      if (player.id !== this.localPlayerId) {
+        const spawnPos = toVector3(player.spawnPosition);
+        const remoteEntity: RemoteEntity = {
+          id: player.id,
+          name: player.name,
+          team: player.team,
+          health: 100,
+          armor: 0,
+          isAlive: true,
+          currentWeapon: 'rifle',
+          kills: 0,
+          deaths: 0,
+          states: [],
+          position: spawnPos.clone(),
+          yaw: player.spawnYaw,
+          pitch: 0,
+          // Lockstep interpolation - target is same as current at start
+          targetPosition: spawnPos.clone(),
+          targetYaw: player.spawnYaw,
+          targetPitch: 0,
+          lastUpdateTime: Date.now(),
+        };
+        this.remotePlayers.set(player.id, remoteEntity);
+      }
+    }
+
+    console.log(`[MultiplayerState] Lockstep initialized at tick ${message.tick} with ${message.players.length} players`);
+  }
+
+  /**
+   * Set the local player's input for the current tick.
+   * This will be sent to the server and applied when the tick is processed.
+   */
+  setLockstepInput(input: PlayerInput): void {
+    this.pendingLockstepInput = input;
+  }
+
+  /**
+   * Add an action (fire, reload, etc) to be sent with the next tick's input.
+   */
+  addLockstepAction(action: LockstepAction): void {
+    this.pendingLockstepActions.push(action);
+    console.log(`[MPSTATE] Added action: ${action.type}, pending count: ${this.pendingLockstepActions.length}`);
+    getFileLogger().event('action_added', { type: action.type, pending: this.pendingLockstepActions.length });
+  }
+
+  /**
+   * Get and clear pending lockstep actions.
+   * Call this when sending input to include any queued actions.
+   */
+  popPendingActions(): LockstepAction[] {
+    const actions = [...this.pendingLockstepActions];
+    if (actions.length > 0) {
+      console.log(`[MPSTATE] Popping ${actions.length} actions: ${actions.map(a => a.type).join(',')}`);
+      getFileLogger().event('actions_sent', { count: actions.length, types: actions.map(a => a.type).join(',') });
+    }
+    this.pendingLockstepActions = [];
+    return actions;
+  }
+
+  /**
+   * Get the current tick's input to send to server.
+   */
+  getLockstepInputToSend(): { tick: number; input: PlayerInput; actions: LockstepAction[] } | null {
+    if (!this.pendingLockstepInput) return null;
+
+    const result = {
+      tick: this.currentTick,
+      input: this.pendingLockstepInput,
+      actions: [...this.pendingLockstepActions],
+    };
+
+    // Clear pending actions (they'll be sent with this input)
+    this.pendingLockstepActions = [];
+
+    return result;
+  }
+
+  /**
+   * Process a lockstep tick received from the server.
+   * Each client is authoritative for their own position - we just use received positions.
+   */
+  applyLockstepTick(message: LockstepTickMessage): void {
+    if (!this.lockstepMode) return;
+
+    // Update performance metrics
+    const now = Date.now();
+    this.ticksReceived++;
+    if (this.lastTickTime > 0) {
+      const elapsed = now - this.lastTickTime;
+      // Exponential moving average for tick rate (avoid division by zero)
+      if (elapsed > 0) {
+        const instantRate = 1000 / elapsed;
+        this.tickRate = this.tickRate === 0 ? instantRate : this.tickRate * 0.9 + instantRate * 0.1;
+      }
+    }
+    this.lastTickTime = now;
+
+    // Verify tick sequence
+    if (message.tick !== this.currentTick) {
+      console.warn(`[MultiplayerState] Tick mismatch: expected ${this.currentTick}, got ${message.tick}`);
+      // For now, accept it anyway to avoid desync
+      this.currentTick = message.tick;
+    }
+
+    // Update remote player positions from received data
+    // Each client is authoritative for their own position (no simulation needed)
+    for (const playerInput of message.inputs) {
+      if (playerInput.playerId === this.localPlayerId) {
+        // This is our own position echoed back - we can ignore it
+        // since we're authoritative for our own physics
+        continue;
+      }
+
+      // Update remote player with received position and health
+      const remote = this.remotePlayers.get(playerInput.playerId);
+      if (remote) {
+        // Update target position (current position will interpolate toward this)
+        remote.targetPosition = toVector3(playerInput.position);
+        remote.targetYaw = playerInput.yaw;
+        remote.targetPitch = playerInput.pitch;
+        remote.lastUpdateTime = now;
+        // Update health and alive status from authoritative client
+        remote.health = playerInput.health;
+        remote.isAlive = playerInput.isAlive;
+      }
+
+      // Process fire actions from this remote player
+      if (this.onRemoteFireCallback && playerInput.actions) {
+        for (const action of playerInput.actions) {
+          if (action.type === 'fire' && action.data) {
+            this.onRemoteFireCallback(
+              playerInput.playerId,
+              action.data.origin,
+              action.data.direction,
+              action.data.weaponType || 'rifle'
+            );
+          }
+        }
+      }
+    }
+
+    // Advance tick counter
+    this.currentTick++;
+  }
+
+  /**
+   * Get the current tick number.
+   */
+  getCurrentTick(): number {
+    return this.currentTick;
+  }
+
+  /**
+   * Interpolate remote player positions for smooth rendering.
+   * Call this every frame before rendering.
+   * @param deltaTime Time since last frame in seconds
+   * @param lerpSpeed Interpolation speed (higher = faster catch-up, default 15)
+   */
+  interpolateLockstepPositions(deltaTime: number, lerpSpeed: number = 15): void {
+    if (!this.lockstepMode) return;
+
+    const t = Math.min(1, deltaTime * lerpSpeed);
+
+    for (const remote of this.remotePlayers.values()) {
+      // Smoothly interpolate current position toward target
+      remote.position = Vector3.lerp(remote.position, remote.targetPosition, t);
+
+      // Interpolate angles
+      remote.yaw = this.lerpAngleLockstep(remote.yaw, remote.targetYaw, t);
+      remote.pitch = remote.pitch + (remote.targetPitch - remote.pitch) * t;
+    }
+  }
+
+  private lerpAngleLockstep(a: number, b: number, t: number): number {
+    let diff = b - a;
+    while (diff > Math.PI) diff -= Math.PI * 2;
+    while (diff < -Math.PI) diff += Math.PI * 2;
+    return a + diff * t;
+  }
+
+  /**
+   * Get the state hash for sync verification.
+   * Since each client is authoritative for their own position, this is informational only.
+   */
+  getLockstepStateHash(): string {
+    // Simple hash based on tick and known remote player positions
+    const parts: string[] = [`tick${this.currentTick}`];
+    for (const [id, player] of this.remotePlayers) {
+      parts.push(`${id}:${player.position.x.toFixed(2)},${player.position.z.toFixed(2)}`);
+    }
+    return parts.join('|');
+  }
+
   // ============ Getters ============
 
   getPhase(): GamePhase {
@@ -502,6 +753,54 @@ export class MultiplayerState {
 
   canBuy(): boolean {
     return this.phase === 'freeze' || this.phase === 'warmup';
+  }
+
+  // ============ Fire Action Callback ============
+
+  /**
+   * Set callback for when a remote player fires.
+   * The callback should check if the shot hits the local player and apply damage.
+   */
+  setOnRemoteFireCallback(callback: (
+    shooterId: string,
+    origin: Vec3,
+    direction: Vec3,
+    weaponType: string
+  ) => void): void {
+    this.onRemoteFireCallback = callback;
+  }
+
+  // ============ Performance Metrics ============
+
+  /**
+   * Get the measured tick rate (ticks per second received from server).
+   */
+  getTickRate(): number {
+    return this.tickRate;
+  }
+
+  /**
+   * Get total ticks received.
+   */
+  getTicksReceived(): number {
+    return this.ticksReceived;
+  }
+
+  /**
+   * Get performance metrics for debugging.
+   */
+  getPerformanceMetrics(): {
+    tickRate: number;
+    ticksReceived: number;
+    currentTick: number;
+    remotePlayers: number;
+  } {
+    return {
+      tickRate: this.tickRate,
+      ticksReceived: this.ticksReceived,
+      currentTick: this.currentTick,
+      remotePlayers: this.remotePlayers.size,
+    };
   }
 }
 

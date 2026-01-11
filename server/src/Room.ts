@@ -23,7 +23,11 @@ import {
   DEFAULT_ECONOMY_CONFIG,
 } from './types.js';
 import { GameRunner } from './GameRunner.js';
+import { LockstepRunner } from './LockstepRunner.js';
 import { VoiceRelay, getVoiceRelay, removeVoiceRelay, isVoiceFrame } from './VoiceRelay.js';
+
+// Enable lockstep mode (set to true to use deterministic lockstep)
+const USE_LOCKSTEP = true;
 
 // Default map data for dm_arena
 const DEFAULT_MAP: MapData = {
@@ -90,6 +94,7 @@ export class Room {
 
   private clients: Map<string, ConnectedClient> = new Map();
   private gameRunner: GameRunner | null = null;
+  private lockstepRunner: LockstepRunner | null = null;
   private serverConfig: ServerConfig;
   private mapData: MapData;
 
@@ -179,7 +184,9 @@ export class Room {
     });
 
     // If game is running, spawn the player
-    if (this.gameRunner) {
+    if (USE_LOCKSTEP && this.lockstepRunner) {
+      this.lockstepRunner.addPlayer(clientId, client.name || 'Player', team);
+    } else if (this.gameRunner) {
       this.gameRunner.addPlayer(clientId, client.name || 'Player', team);
     }
   }
@@ -189,7 +196,9 @@ export class Room {
     this.teamAssignments.delete(clientId);
     this.lastActivity = Date.now();
 
-    if (this.gameRunner) {
+    if (USE_LOCKSTEP && this.lockstepRunner) {
+      this.lockstepRunner.removePlayer(clientId);
+    } else if (this.gameRunner) {
       this.gameRunner.removePlayer(clientId);
     }
 
@@ -225,6 +234,49 @@ export class Room {
   // ============ Game Control ============
 
   startGame(): void {
+    if (USE_LOCKSTEP) {
+      this.startLockstepGame();
+    } else {
+      this.startServerAuthoritativeGame();
+    }
+  }
+
+  private startLockstepGame(): void {
+    if (this.lockstepRunner) {
+      // Already running, don't restart
+      return;
+    }
+
+    console.log(`[Room] Starting lockstep game in room ${this.id}`);
+
+    // Notify clients game is starting
+    this.broadcast({
+      type: 'game_starting',
+      countdown: 0,
+    });
+
+    // Create lockstep runner (no bots in lockstep mode)
+    this.lockstepRunner = new LockstepRunner(
+      this.mapData,
+      this.config,
+      this.serverConfig,
+      (msg) => this.broadcast(msg),
+      (clientId, msg) => this.sendToClient(clientId, msg)
+    );
+
+    // Add all connected players
+    for (const [clientId, client] of this.clients) {
+      const team = this.teamAssignments.get(clientId) || 'T';
+      this.lockstepRunner.addPlayer(clientId, client.name || 'Player', team);
+    }
+
+    // Start the lockstep runner
+    this.lockstepRunner.start();
+
+    console.log(`Lockstep game started in room ${this.id}`);
+  }
+
+  private startServerAuthoritativeGame(): void {
     if (this.gameRunner) {
       // Already running, don't restart
       return;
@@ -294,7 +346,7 @@ export class Room {
       ctScore: 0,
     });
 
-    console.log(`Game started in room ${this.id}`);
+    console.log(`Server-authoritative game started in room ${this.id}`);
   }
 
   private createInitialGameState(): ServerGameState {
@@ -314,6 +366,10 @@ export class Room {
   }
 
   stop(): void {
+    if (this.lockstepRunner) {
+      this.lockstepRunner.stop();
+      this.lockstepRunner = null;
+    }
     if (this.gameRunner) {
       this.gameRunner.stop();
       this.gameRunner = null;
@@ -350,6 +406,30 @@ export class Room {
         }
         break;
 
+      case 'lockstep_input':
+        // Handle lockstep input
+        if (USE_LOCKSTEP && this.lockstepRunner && 'tick' in message && 'input' in message) {
+          this.lockstepRunner.handleLockstepInput(
+            clientId,
+            message.tick,
+            message.input,
+            message.actions || [],
+            message.position || { x: 0, y: 0, z: 0 },
+            message.yaw || 0,
+            message.pitch || 0,
+            message.health ?? 100,
+            message.isAlive ?? true
+          );
+        }
+        break;
+
+      case 'lockstep_sync':
+        // Handle lockstep sync check
+        if (USE_LOCKSTEP && this.lockstepRunner && 'tick' in message && 'hash' in message) {
+          this.lockstepRunner.handleSyncCheck(clientId, message.tick, message.hash);
+        }
+        break;
+
       case 'input':
       case 'fire':
       case 'reload':
@@ -357,8 +437,8 @@ export class Room {
       case 'pickup_weapon':
       case 'drop_weapon':
       case 'select_weapon':
-        // Forward to game runner
-        if (this.gameRunner) {
+        // Forward to game runner (server-authoritative mode only)
+        if (!USE_LOCKSTEP && this.gameRunner) {
           this.gameRunner.handleInput(clientId, message);
         }
         break;
@@ -519,7 +599,7 @@ export class Room {
       maxPlayers: this.config.maxPlayers,
       botCount: this.config.botCount,
       isPrivate: this.config.isPrivate,
-      phase: this.gameRunner?.getPhase() || 'pre_match',
+      phase: this.lockstepRunner?.getPhase() || this.gameRunner?.getPhase() || 'pre_match',
       hostId: this.hostId,
     };
   }
