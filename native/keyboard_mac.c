@@ -104,6 +104,7 @@ static CGEventRef event_callback(
 
     if (type == kCGEventRightMouseDown || type == kCGEventRightMouseUp) {
         pthread_mutex_lock(&state_mutex);
+        bool is_captured = cursor_captured;
         if (type == kCGEventRightMouseDown) {
             if (!mouse_button_states[1]) {
                 mouse_button_just_pressed[1] = true;
@@ -114,7 +115,8 @@ static CGEventRef event_callback(
             mouse_button_just_released[1] = true;
         }
         pthread_mutex_unlock(&state_mutex);
-        return event;
+        // Consume right-click when cursor is captured to prevent terminal context menu
+        return is_captured ? NULL : event;
     }
 
     if (type == kCGEventOtherMouseDown || type == kCGEventOtherMouseUp) {
@@ -600,6 +602,59 @@ static napi_value is_cursor_captured(napi_env env, napi_callback_info info) {
     return result;
 }
 
+// ============ Stderr suppression ============
+
+#include <unistd.h>
+#include <fcntl.h>
+
+static int saved_stderr_fd = -1;
+static bool stderr_suppressed = false;
+
+// Suppress stderr by redirecting fd 2 to /dev/null
+// This silences native C code that writes directly to stderr
+static napi_value suppress_stderr(napi_env env, napi_callback_info info) {
+    napi_value result;
+
+    if (stderr_suppressed) {
+        napi_get_boolean(env, true, &result);
+        return result;
+    }
+
+    // Save original stderr fd
+    saved_stderr_fd = dup(STDERR_FILENO);
+
+    // Open /dev/null
+    int devnull = open("/dev/null", O_WRONLY);
+    if (devnull >= 0) {
+        // Redirect stderr to /dev/null
+        dup2(devnull, STDERR_FILENO);
+        close(devnull);
+        stderr_suppressed = true;
+    }
+
+    napi_get_boolean(env, stderr_suppressed, &result);
+    return result;
+}
+
+// Restore stderr (optional - generally keep suppressed)
+static napi_value restore_stderr(napi_env env, napi_callback_info info) {
+    napi_value result;
+
+    if (!stderr_suppressed || saved_stderr_fd < 0) {
+        napi_get_boolean(env, false, &result);
+        return result;
+    }
+
+    // Restore original stderr
+    dup2(saved_stderr_fd, STDERR_FILENO);
+    close(saved_stderr_fd);
+    saved_stderr_fd = -1;
+    stderr_suppressed = false;
+
+    napi_get_boolean(env, true, &result);
+    return result;
+}
+
 // Module initialization
 static napi_value init(napi_env env, napi_value exports) {
     napi_property_descriptor props[] = {
@@ -619,6 +674,9 @@ static napi_value init(napi_env env, napi_value exports) {
         // Cursor capture
         {"setCursorCaptured", NULL, set_cursor_captured, NULL, NULL, NULL, napi_default, NULL},
         {"isCursorCaptured", NULL, is_cursor_captured, NULL, NULL, NULL, napi_default, NULL},
+        // Stderr suppression (for silencing native audio libs)
+        {"suppressStderr", NULL, suppress_stderr, NULL, NULL, NULL, napi_default, NULL},
+        {"restoreStderr", NULL, restore_stderr, NULL, NULL, NULL, napi_default, NULL},
         // Debug
         {"getEventCount", NULL, get_event_count, NULL, NULL, NULL, napi_default, NULL},
         {"getLastKeycode", NULL, get_last_keycode, NULL, NULL, NULL, napi_default, NULL},

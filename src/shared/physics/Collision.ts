@@ -2,6 +2,7 @@
 
 import { Vector3 } from '../math/Vector3.js';
 import { AABB } from '../types/MapFormat.js';
+import { debugLog } from '../../utils/FileLogger.js';
 
 // Player collision capsule (simplified as a vertical cylinder/box)
 export interface PlayerCollider {
@@ -184,7 +185,7 @@ export function moveAndSlide(
     if (!collidersBlockHorizontal(playerAABBX, colliders, feetY)) {
       newPos.x = testX.x;
     } else if (debugCollision) {
-      console.log(`X blocked at ${testX.x}`);
+      debugLog(`X blocked at ${testX.x}`);
     }
   }
 
@@ -195,7 +196,7 @@ export function moveAndSlide(
     if (!collidersBlockHorizontal(playerAABBZ, colliders, feetY)) {
       newPos.z = testZ.z;
     } else if (debugCollision) {
-      console.log(`Z blocked at ${testZ.z}`);
+      debugLog(`Z blocked at ${testZ.z}`);
     }
   }
 

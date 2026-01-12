@@ -12,6 +12,33 @@ const BOT_RADIUS = 1.0;      // Large radius to prevent falling through crevices
 const BOT_HEIGHT = 1.8;
 const SLOPE_LIMIT = 0.5;     // More forgiving slope detection
 const MAX_LOS_DISTANCE = 40; // Skip LOS checks beyond this distance
+const NOISE_HEARING_RANGE = 30; // How far bots can hear noise (walking/shooting)
+const NOISE_MEMORY_TIME = 3000; // How long bots remember hearing noise (ms)
+const STUCK_RECOVERY_TIME = 800; // How long to try escaping when stuck (ms)
+const STAGNANT_CHECK_INTERVAL = 3000; // How often to check if bot is stagnant
+
+// Track noise sources (gunshots, footsteps)
+export interface NoiseSource {
+  position: Vector3;
+  timestamp: number;
+  loudness: number; // 1.0 = gunshot, 0.5 = walking
+}
+
+// Global noise tracking
+const recentNoises: NoiseSource[] = [];
+
+export function registerNoise(position: Vector3, loudness: number, now: number): void {
+  recentNoises.push({ position: position.clone(), timestamp: now, loudness });
+  // Keep only recent noises
+  while (recentNoises.length > 20) recentNoises.shift();
+}
+
+export function clearOldNoises(now: number): void {
+  const cutoff = now - NOISE_MEMORY_TIME;
+  while (recentNoises.length > 0 && recentNoises[0].timestamp < cutoff) {
+    recentNoises.shift();
+  }
+}
 
 export interface BotThinkContext {
   player: Player;              // The human player (target)
@@ -24,6 +51,59 @@ export interface BotThinkContext {
 }
 
 export class BotBrain {
+  // Check if bot can hear any recent noise
+  static findNearbyNoise(bot: Bot, now: number): Vector3 | null {
+    clearOldNoises(now);
+
+    let closestNoise: NoiseSource | null = null;
+    let closestDist = Infinity;
+
+    for (const noise of recentNoises) {
+      const dist = Vector3.sub(noise.position, bot.position).length();
+      const hearingRange = NOISE_HEARING_RANGE * noise.loudness;
+
+      if (dist < hearingRange && dist < closestDist) {
+        closestDist = dist;
+        closestNoise = noise;
+      }
+    }
+
+    return closestNoise ? closestNoise.position.clone() : null;
+  }
+
+  // Trigger stuck recovery - pick a random escape direction
+  static triggerStuckRecovery(bot: Bot, now: number): void {
+    // Generate a random escape direction
+    bot.stuckRecoveryDir = bot.generateRandomEscapeDirection();
+    bot.stuckRecoveryUntil = now + STUCK_RECOVERY_TIME;
+
+    // Reset stuck tracking so we can detect if we're still stuck after recovery
+    bot.stuckTime = 0;
+    bot.lastSignificantMoveTime = now;
+
+    // Also pick a new random waypoint to head toward after recovery
+    if (bot.patrolWaypoints.length > 0) {
+      bot.currentWaypointIndex = Math.floor(Math.random() * bot.patrolWaypoints.length);
+    }
+  }
+
+  // Handle stuck recovery movement - move in escape direction
+  static handleStuckRecovery(bot: Bot, colliders: AABB[], deltaTime: number): Vector3 {
+    if (!bot.stuckRecoveryDir) {
+      return Vector3.zero();
+    }
+
+    // Move faster during recovery to break free
+    const recoverySpeed = MOVE_SPEED * 1.5;
+    const movement = Vector3.scale(bot.stuckRecoveryDir, recoverySpeed * deltaTime);
+
+    // Turn to face escape direction
+    const targetYaw = Math.atan2(-bot.stuckRecoveryDir.x, -bot.stuckRecoveryDir.z);
+    bot.yaw = targetYaw;
+
+    return this.applyMovement(bot, movement, colliders, deltaTime);
+  }
+
   // Main think function - called every frame for each bot
   static think(bot: Bot, ctx: BotThinkContext): Vector3 {
     const { player, allBots, colliders, now, deltaTime, isFrozen, teamMode } = ctx;
@@ -48,14 +128,37 @@ export class BotBrain {
     }
     bot.lastThinkTime = now;
 
-    // Find closest visible target (player or other bot), respecting team mode
+    // Find closest VISIBLE target (requires line of sight!)
     const { target: visibleTarget, canSee } = this.findClosestTarget(bot, player, allBots, colliders, teamMode);
 
-    // Update target tracking
+    // Update target tracking only if we can actually SEE them
     if (canSee && visibleTarget) {
       bot.target = visibleTarget;
       bot.lastSeenTargetPos = visibleTarget.getEyePosition().clone();
       bot.lastSeenTargetTime = now;
+    }
+
+    // Check for nearby noise (gunshots, footsteps) - can investigate without LOS
+    const heardNoise = this.findNearbyNoise(bot, now);
+    if (heardNoise && !canSee) {
+      // Heard something - investigate that location
+      bot.lastSeenTargetPos = heardNoise;
+      bot.lastSeenTargetTime = now;
+    }
+
+    // Check for stuck/stagnant state and trigger recovery
+    const isStuck = bot.checkStuck(now);
+    const isStagnant = bot.isStagnant(now);
+
+    // If currently in stuck recovery mode, continue with recovery movement
+    if (bot.stuckRecoveryUntil > now) {
+      return this.handleStuckRecovery(bot, colliders, deltaTime);
+    }
+
+    // Trigger stuck recovery if stuck or stagnant
+    if (isStuck || isStagnant) {
+      this.triggerStuckRecovery(bot, now);
+      return this.handleStuckRecovery(bot, colliders, deltaTime);
     }
 
     // State machine
@@ -118,12 +221,17 @@ export class BotBrain {
       }
     }
 
-    // Only check bot-vs-bot if team mode AND not too many bots (performance)
-    // Skip bot-vs-bot entirely in non-team mode to focus on player
-    if (teamMode && allBots.length <= 8) {
+    // Check bot-vs-bot combat:
+    // - In FFA/deathmatch (non-team mode): all other bots are enemies
+    // - In team mode: only enemy team bots are targets
+    // Limit to 8 bots for performance
+    if (allBots.length <= 8) {
       for (const otherBot of allBots) {
         if (otherBot === bot || !otherBot.isAlive) continue;
-        if (!bot.isEnemy(otherBot)) continue;
+
+        // In FFA mode, everyone is an enemy. In team mode, use isEnemy check
+        const isEnemy = teamMode ? bot.isEnemy(otherBot) : true;
+        if (!isEnemy) continue;
 
         // Quick distance check
         const dx = otherBot.position.x - botPos.x;
@@ -478,10 +586,10 @@ export class BotBrain {
   }
 
   // IDLE state - just spawned or nothing to do
-  static handleIdle(bot: Bot, ctx: BotThinkContext, canSeePlayer: boolean): Vector3 {
-    const { now, colliders, deltaTime } = ctx;
+  static handleIdle(bot: Bot, ctx: BotThinkContext, canSeeTarget: boolean): Vector3 {
+    const { now } = ctx;
 
-    if (canSeePlayer) {
+    if (canSeeTarget) {
       // React after reaction time
       if (now - bot.stateStartTime > bot.botConfig.reactionTime) {
         bot.setState('attack', now);
@@ -490,73 +598,95 @@ export class BotBrain {
     }
 
     // Start patrolling after a short delay
-    if (now - bot.stateStartTime > 500) {
+    if (now - bot.stateStartTime > 300) {
       bot.setState('patrol', now);
     }
 
     return Vector3.zero();
   }
 
-  // PATROL state - moving between waypoints
-  static handlePatrol(bot: Bot, ctx: BotThinkContext, canSeePlayer: boolean): Vector3 {
+  // PATROL state - moving between waypoints, investigating sounds
+  static handlePatrol(bot: Bot, ctx: BotThinkContext, canSeeTarget: boolean): Vector3 {
     const { now, colliders, deltaTime } = ctx;
 
-    if (canSeePlayer) {
+    // If we can see an enemy, attack!
+    if (canSeeTarget) {
       bot.setState('attack', now);
       return Vector3.zero();
     }
 
-    // Check if we remember seeing player recently
+    // Check if we heard something or saw someone recently - investigate
     if (bot.lastSeenTargetPos && now - bot.lastSeenTargetTime < 5000) {
       bot.setState('chase', now);
       bot.moveTarget = bot.lastSeenTargetPos;
       return Vector3.zero();
     }
 
-    // Get next waypoint
+    // Strategic patrol - move between waypoints
     const waypoint = bot.getNextWaypoint();
     if (!waypoint) {
-      // No waypoints, just stand still
-      return Vector3.zero();
+      // No waypoints set - wander in a random direction
+      // Generate a wandering target if we don't have one
+      if (!bot.moveTarget || Vector3.sub(bot.moveTarget, bot.position).length() < 2) {
+        const wanderAngle = Math.random() * Math.PI * 2;
+        const wanderDist = 5 + Math.random() * 10;
+        bot.moveTarget = new Vector3(
+          bot.position.x + Math.cos(wanderAngle) * wanderDist,
+          bot.position.y,
+          bot.position.z + Math.sin(wanderAngle) * wanderDist
+        );
+      }
+      bot.lookAt(bot.moveTarget);
+      const movement = bot.getMoveToward(bot.moveTarget, MOVE_SPEED * 0.7, deltaTime);
+      return this.applyMovement(bot, movement, colliders, deltaTime);
     }
 
     bot.moveTarget = waypoint;
     bot.lookAt(waypoint);
 
+    // Tactical reload while patrolling - reload if magazine isn't full
+    const weapon = bot.getCurrentWeapon();
+    if (weapon && !weapon.isReloading && weapon.currentAmmo < weapon.def.magazineSize && weapon.reserveAmmo > 0) {
+      bot.reload(now);
+    }
+
     const movement = bot.getMoveToward(waypoint, MOVE_SPEED, deltaTime);
     return this.applyMovement(bot, movement, colliders, deltaTime);
   }
 
-  // CHASE state - moving to last known player position
-  static handleChase(bot: Bot, ctx: BotThinkContext, canSeePlayer: boolean): Vector3 {
+  // CHASE state - investigate last known position or sound
+  static handleChase(bot: Bot, ctx: BotThinkContext, canSeeTarget: boolean): Vector3 {
     const { now, colliders, deltaTime } = ctx;
 
-    if (canSeePlayer) {
+    // If we can see an enemy, attack!
+    if (canSeeTarget) {
       bot.setState('attack', now);
       return Vector3.zero();
     }
 
+    // No last seen/heard position - go back to patrol
     if (!bot.lastSeenTargetPos) {
       bot.setState('patrol', now);
       return Vector3.zero();
     }
 
-    // Check if reached last seen position
+    // Check if reached last known position
     const distanceToTarget = Vector3.sub(bot.lastSeenTargetPos, bot.position).length();
     if (distanceToTarget < 2) {
-      // Lost them, go back to patrol
+      // Arrived at location - nothing here, go back to patrol
       bot.lastSeenTargetPos = null;
       bot.setState('patrol', now);
       return Vector3.zero();
     }
 
-    // Give up after 10 seconds
-    if (now - bot.lastSeenTargetTime > 10000) {
+    // Give up after 8 seconds of chasing
+    if (now - bot.lastSeenTargetTime > 8000) {
       bot.lastSeenTargetPos = null;
       bot.setState('patrol', now);
       return Vector3.zero();
     }
 
+    // Move toward last known position
     bot.moveTarget = bot.lastSeenTargetPos;
     bot.lookAt(bot.lastSeenTargetPos);
 
@@ -614,6 +744,11 @@ export class BotBrain {
       const strafeDir = bot.getRight();
       const strafeSign = Math.sin(now * 0.002) > 0 ? 1 : -1; // Oscillate
       movement = Vector3.scale(strafeDir, MOVE_SPEED * 0.5 * deltaTime * strafeSign);
+    }
+
+    // Check if we need to reload
+    if (weapon.currentAmmo <= 0 && weapon.reserveAmmo > 0 && !weapon.isReloading) {
+      bot.reload(now);
     }
 
     // Try to fire - bots have a minimum fire interval based on difficulty

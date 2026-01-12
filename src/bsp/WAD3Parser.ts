@@ -3,6 +3,7 @@
 
 import { readFileSync } from 'fs';
 import { Color } from '../utils/Colors.js';
+import { debugLog } from '../utils/FileLogger.js';
 
 // WAD3 magic number
 export const WAD3_MAGIC = 'WAD3';
@@ -115,7 +116,7 @@ export class WAD3Parser {
     for (const entry of entries) {
       if (entry.type !== MIPTEX_TYPE) continue;
       if (entry.compression !== 0) {
-        console.warn(`Skipping compressed texture: ${entry.name}`);
+        debugLog(`Skipping compressed texture: ${entry.name}`);
         continue;
       }
 
@@ -125,7 +126,7 @@ export class WAD3Parser {
           textures.set(entry.name.toLowerCase(), texture);
         }
       } catch (e) {
-        console.warn(`Failed to parse texture ${entry.name}:`, e);
+        debugLog(`Failed to parse texture ${entry.name}:`, e);
       }
     }
 

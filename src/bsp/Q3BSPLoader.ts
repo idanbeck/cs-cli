@@ -19,6 +19,7 @@ import { AABB, SpawnPoint } from '../maps/MapFormat.js';
 import { CollisionMesh } from '../physics/MeshCollision.js';
 import { existsSync, readFileSync } from 'fs';
 import { join, dirname } from 'path';
+import { debugLog } from '../utils/FileLogger.js';
 
 // Q3 uses Z-up, engine uses Y-up
 function q3ToEngine(x: number, y: number, z: number): Vector3 {
@@ -134,7 +135,7 @@ export class Q3BSPLoader {
           try {
             return this.loadTextureFile(fullPath);
           } catch (e) {
-            console.warn(`Failed to load texture ${fullPath}:`, e);
+            debugLog(`Failed to load texture ${fullPath}:`, e);
           }
         }
       }
@@ -149,7 +150,7 @@ export class Q3BSPLoader {
           try {
             return this.loadTextureFile(fullPath);
           } catch (e) {
-            console.warn(`Failed to load texture ${fullPath}:`, e);
+            debugLog(`Failed to load texture ${fullPath}:`, e);
           }
         }
       }
@@ -581,7 +582,7 @@ export class Q3BSPLoader {
       }
     }
 
-    console.log(`Built collision mesh with ${mesh.triangles.length} triangles`);
+    debugLog(`Built collision mesh with ${mesh.triangles.length} triangles`);
     return mesh;
   }
 }

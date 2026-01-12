@@ -18,6 +18,7 @@ import { Texture } from '../engine/Texture.js';
 import { TextureManager, getTextureManager } from '../engine/TextureManager.js';
 import { AABB, SpawnPoint } from '../maps/MapFormat.js';
 import { CollisionMesh } from '../physics/MeshCollision.js';
+import { debugLog } from '../utils/FileLogger.js';
 
 // BSP uses Z-up, engine uses Y-up
 function bspToEngine(x: number, y: number, z: number): Vector3 {
@@ -63,7 +64,7 @@ export class BSPLoader {
         try {
           this.textureManager.loadWAD(wadPath);
         } catch (e) {
-          console.warn(`Failed to load WAD ${wadPath}:`, e);
+          debugLog(`Failed to load WAD ${wadPath}:`, e);
         }
       }
     }
@@ -534,7 +535,7 @@ export class BSPLoader {
       }
     }
 
-    console.log(`Built collision mesh with ${mesh.triangles.length} triangles`);
+    debugLog(`Built collision mesh with ${mesh.triangles.length} triangles`);
     return mesh;
   }
 }

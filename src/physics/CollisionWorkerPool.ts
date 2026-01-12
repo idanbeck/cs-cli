@@ -12,6 +12,7 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { Vector3 } from '../engine/math/Vector3.js';
 import { CollisionTriangle, CollisionMesh } from './MeshCollision.js';
+import { debugLog } from '../utils/FileLogger.js';
 import {
   RaycastQuery,
   SphereQuery,
@@ -71,12 +72,12 @@ export class CollisionWorkerPool {
       });
 
       worker.on('error', (error) => {
-        console.error(`[CollisionWorkerPool] Worker ${i} error:`, error);
+        debugLog(`[CollisionWorkerPool] Worker ${i} error:`, error);
       });
 
       worker.on('exit', (code) => {
         if (code !== 0) {
-          console.error(`[CollisionWorkerPool] Worker ${i} exited with code ${code}`);
+          debugLog(`[CollisionWorkerPool] Worker ${i} exited with code ${code}`);
         }
       });
 
@@ -97,7 +98,7 @@ export class CollisionWorkerPool {
 
     await Promise.all(initPromises);
     this._isInitialized = true;
-    console.log(`[CollisionWorkerPool] Initialized with ${this.numWorkers} workers`);
+    debugLog(`[CollisionWorkerPool] Initialized with ${this.numWorkers} workers`);
   }
 
   /**
@@ -305,7 +306,7 @@ export class CollisionWorkerPool {
     this.workerReady = [];
     this.pendingQueries.clear();
     this._isInitialized = false;
-    console.log('[CollisionWorkerPool] Shutdown complete');
+    debugLog('[CollisionWorkerPool] Shutdown complete');
   }
 }
 

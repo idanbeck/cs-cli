@@ -10,6 +10,8 @@ import {
   VOICE_SAMPLE_RATE,
   VOICE_FRAME_SAMPLES,
 } from './types.js';
+import { debugLog } from '../utils/FileLogger.js';
+import { suppressStderr } from '../audio/SoundEngine.js';
 
 // naudiodon types (the package doesn't have built-in types)
 interface AudioIOOptions {
@@ -91,6 +93,8 @@ export class MicCapture {
    */
   async initialize(): Promise<void> {
     try {
+      // Suppress stderr during import (portaudio writes to stderr)
+      await suppressStderr();
       // Dynamic import since naudiodon2 might not be installed
       // Using naudiodon2 instead of naudiodon for Node.js 22+ compatibility
       const naudiodon = await import('naudiodon2');
@@ -110,7 +114,7 @@ export class MicCapture {
     try {
       return this.portaudio.getDevices();
     } catch (error) {
-      console.error('[MicCapture] Device enumeration failed:', error);
+      debugLog('[MicCapture] Device enumeration failed:', error);
       this.deviceEnumerationFailed = true;
       return [];
     }
@@ -152,7 +156,7 @@ export class MicCapture {
 
       return this.cachedInputDevices;
     } catch (error) {
-      console.error('[MicCapture] Failed to enumerate input devices:', error);
+      debugLog('[MicCapture] Failed to enumerate input devices:', error);
       this.cachedInputDevices = [{ id: 'default', name: 'Default Input', isDefault: true, isInput: true }];
       return this.cachedInputDevices;
     }
@@ -193,7 +197,7 @@ export class MicCapture {
 
       return this.cachedOutputDevices;
     } catch (error) {
-      console.error('[MicCapture] Failed to enumerate output devices:', error);
+      debugLog('[MicCapture] Failed to enumerate output devices:', error);
       this.cachedOutputDevices = [{ id: 'default', name: 'Default Output', isDefault: true, isInput: false }];
       return this.cachedOutputDevices;
     }
@@ -281,12 +285,12 @@ export class MicCapture {
         this.processAudioData(data);
       } catch (error) {
         // Swallow errors in audio callback to prevent crashes
-        console.error('[MicCapture] Error in audio callback:', error);
+        debugLog('[MicCapture] Error in audio callback:', error);
       }
     });
 
     this.audioIO.on('error', (error: Error) => {
-      console.error('[MicCapture] Audio error:', error.message);
+      debugLog('[MicCapture] Audio error:', error.message);
       this.isCapturing = false;
     });
 

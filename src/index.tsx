@@ -37,7 +37,7 @@ const KEY_HOLD_MS = 120; // How long a key stays "pressed" after last stdin even
 import { MapLoader, LoadedMap } from './maps/MapLoader.js';
 import { MapRegistry, getDefaultMapId } from './maps/MapRegistry.js';
 import { setCollisionEnabled } from './physics/Collision.js';
-import { CollisionMesh, moveWithMeshCollision, checkGroundMesh, setGlobalCollisionMesh, getGlobalCollisionMesh, adjustSpawnPosition, raycastMesh } from './physics/MeshCollision.js';
+import { CollisionMesh, moveWithMeshCollision, checkGroundMesh, setGlobalCollisionMesh, getGlobalCollisionMesh, adjustSpawnPosition, raycastMesh, precomputeMapSpawnPoints, getSpawnFarFromEntities } from './physics/MeshCollision.js';
 import { Player } from './game/Player.js';
 import { WeaponSlot } from './game/Weapon.js';
 import { getWeaponSprite } from './game/WeaponSprites.js';
@@ -911,12 +911,7 @@ async function runMapDebugMode(mapId: string, initialRenderMode: RenderMode, ini
         log(`Ambient Occlusion: ${rast.enableAmbientOcclusion ? 'ON' : 'OFF'}`);
       }
 
-      // Backface culling toggle (B)
-      if (char === 'b' || char === 'B') {
-        const rast = renderer.getRasterizer();
-        rast.enableBackfaceCulling = !rast.enableBackfaceCulling;
-        log(`Backface culling: ${rast.enableBackfaceCulling ? 'ON' : 'OFF'}`);
-      }
+      // B is reserved for buy menu - backface culling toggle removed
 
       // White texture mode toggle (G for "ghost" mode)
       if (char === 'g' || char === 'G') {
@@ -1216,6 +1211,10 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
       // Update bot spawns
       botManager.setSpawnPoints(newMap.spawns);
 
+      // Pre-compute valid spawn points by random walking the map
+      const spawnVectors = newMap.spawns.map(s => new Vector3(s.position[0], s.position[1], s.position[2]));
+      precomputeMapSpawnPoints(spawnVectors, newMap.collisionMesh, 8.0);
+
       mapLoadedRef.current = true;
       mapLoadingRef.current = false;
       return true;
@@ -1248,7 +1247,6 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
     ...DEFAULT_DEATHMATCH_CONFIG,
     roundsToWin: 10,    // First to 10 round wins
     roundTime: 120,     // 2 minutes per round
-    warmupTime: 3,      // 3 seconds warmup
   }));
 
   // Scoreboard visibility ref
@@ -1265,6 +1263,12 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
 
   // Track mouse click fire request
   const mouseFireRef = useRef(false);
+
+  // Track if we've already fired since the fire button was pressed (for semi-auto weapons)
+  const hasFiredRef = useRef(false);
+
+  // Track sniper scope state
+  const scopedRef = useRef(false);
 
   // Track if we're in multiplayer mode
   const isMultiplayerRef = useRef(false);
@@ -1300,9 +1304,24 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
     // Position camera at spawn, adjusted to valid ground
     const camera = renderer.getCamera();
     const rawSpawnPos = new Vector3(spawn.position[0], spawn.position[1], spawn.position[2]);
-    const adjustedSpawn = collisionMeshRef.current
+    let adjustedSpawn: Vector3 | null = collisionMeshRef.current
       ? adjustSpawnPosition(rawSpawnPos, collisionMeshRef.current)
       : rawSpawnPos;
+
+    // If first spawn is invalid, try other spawn points
+    if (adjustedSpawn === null && collisionMeshRef.current && loadedMapRef.current) {
+      for (const altSpawn of loadedMapRef.current.spawns) {
+        const altPos = new Vector3(altSpawn.position[0], altSpawn.position[1], altSpawn.position[2]);
+        adjustedSpawn = adjustSpawnPosition(altPos, collisionMeshRef.current);
+        if (adjustedSpawn !== null) break;
+      }
+    }
+
+    // Fallback to raw position if all else fails
+    if (adjustedSpawn === null) {
+      adjustedSpawn = rawSpawnPos;
+    }
+
     camera.setPosition(adjustedSpawn.x, adjustedSpawn.y + PLAYER_HEIGHT, adjustedSpawn.z);
     camera.setYaw(degToRad(spawn.angle));
     camera.setPitch(0);
@@ -1315,10 +1334,12 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
       gameModeRef.current.registerKill(killer, victim, weapon, headshot, performance.now());
       consoleLog(`${killer} killed ${victim} with ${weapon}${headshot ? ' (headshot)' : ''}`);
     });
-    botManager.setPlayerDamageCallback((attackerPos, damage, headshot) => {
+    botManager.setPlayerDamageCallback((attackerPos, damage, headshot, attackerName, weaponName) => {
       const player = playerRef.current;
       renderer.addDamageIndicator(attackerPos, player.position, player.yaw);
       playSound('player_hurt');
+      // Track killer info for death screen
+      renderer.setKillerInfo(attackerName, weaponName);
     });
     botManager.setBotSoundCallback((soundType, position) => {
       playSoundAt(soundType as SoundType, position);
@@ -1364,7 +1385,7 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
       if (!['easy', 'medium', 'hard'].includes(difficulty)) {
         return 'Usage: bot_add [easy|medium|hard]';
       }
-      botManager.spawnBots(1, difficulty as 'easy' | 'medium' | 'hard');
+      botManager.spawnBots(1, difficulty as 'easy' | 'medium' | 'hard', playerRef.current.position);
       return `Added 1 ${difficulty} bot`;
     });
 
@@ -1526,126 +1547,102 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
       // RANGED ATTACK
       renderer.triggerMuzzleFlash(80);
 
-      const spreadDir = player.getAimDirection();
+      const baseDir = player.getAimDirection();
       const maxRange = weapon.def.range;
+      const pelletCount = weapon.def.pellets ?? 1;
+      // Reduce spread when scoped (near-perfect accuracy when aiming down sights)
+      const baseSpread = scopedRef.current ? 0.05 : weapon.def.spread;
+      const spreadAngle = baseSpread * (Math.PI / 180); // Convert to radians
 
-      const botHit = botManager.checkPlayerHit(eyePos, spreadDir, weapon.def.damage, maxRange);
+      // Helper to apply random spread to a direction
+      const applySpread = (dir: Vector3, spread: number): Vector3 => {
+        if (spread <= 0) return dir.clone();
+        const theta = Math.random() * 2 * Math.PI;
+        const phi = Math.random() * spread;
+        const sinPhi = Math.sin(phi);
+        // Create perpendicular vectors
+        const up = Math.abs(dir.y) < 0.9 ? new Vector3(0, 1, 0) : new Vector3(1, 0, 0);
+        const right = Vector3.cross(dir, up).normalize();
+        const actualUp = Vector3.cross(right, dir).normalize();
+        // Apply spread
+        return new Vector3(
+          dir.x + right.x * sinPhi * Math.cos(theta) + actualUp.x * sinPhi * Math.sin(theta),
+          dir.y + right.y * sinPhi * Math.cos(theta) + actualUp.y * sinPhi * Math.sin(theta),
+          dir.z + right.z * sinPhi * Math.cos(theta) + actualUp.z * sinPhi * Math.sin(theta)
+        ).normalize();
+      };
 
-      // Check wall hits FIRST using collision mesh (to not hit through walls)
-      let wallHit: { distance: number; point: Vector3; normal: Vector3 } | null = null;
-      if (collisionMeshRef.current) {
-        const result = raycastMesh(eyePos, spreadDir, collisionMeshRef.current, maxRange);
-        if (result.hit) {
-          wallHit = { distance: result.distance, point: result.point, normal: result.normal };
-        }
-      }
-      const effectiveRange = wallHit ? wallHit.distance : maxRange;
+      // Track total damage dealt to each bot for shotgun pellets
+      const botDamageMap = new Map<Bot, { damage: number; headshots: number }>();
+      const tracerEndpoints: Vector3[] = [];
+      let anyHit = false;
 
-      // Check hits against remote players in lockstep mode
-      // Use ray-cylinder intersection for proper hitbox detection
-      let remoteHit: { playerId: string; distance: number; position: Vector3 } | null = null;
-      const mpState = getMultiplayerState();
-      if (mpState.isActive() && mpState.isLockstepMode()) {
-        const playerRadius = 0.4; // ~40cm radius (80cm diameter)
-        const playerHeight = 1.8; // ~1.8m tall
+      // Fire each pellet
+      for (let p = 0; p < pelletCount; p++) {
+        const spreadDir = applySpread(baseDir, spreadAngle);
 
-        for (const remote of mpState.getRemotePlayers()) {
-          if (!remote.isAlive) continue;
+        const botHit = botManager.checkPlayerHit(eyePos, spreadDir, weapon.def.damage, maxRange);
 
-          // remote.position is at eye level, calculate foot position
-          const remoteFootY = remote.position.y - 1.7; // Eye height offset
-          const remoteHeadY = remoteFootY + playerHeight;
-          const remoteCenterXZ = new Vector3(remote.position.x, 0, remote.position.z);
-
-          // Ray-cylinder intersection: solve for t where ray hits cylinder
-          // Cylinder is infinite along Y, radius = playerRadius, centered at remote XZ
-          const rayOriginXZ = new Vector3(eyePos.x, 0, eyePos.z);
-          const rayDirXZ = new Vector3(spreadDir.x, 0, spreadDir.z);
-          const rayDirXZLen = rayDirXZ.length();
-
-          if (rayDirXZLen < 0.001) continue; // Ray is purely vertical
-
-          const rayDirXZNorm = rayDirXZ.scale(1 / rayDirXZLen);
-          const toCenter = Vector3.sub(remoteCenterXZ, rayOriginXZ);
-          const projDist = Vector3.dot(toCenter, rayDirXZNorm);
-
-          if (projDist < 0) continue; // Target is behind us
-
-          const closestXZ = Vector3.add(rayOriginXZ, rayDirXZNorm.scale(projDist));
-          const perpDistXZ = Vector3.distance(closestXZ, remoteCenterXZ);
-
-          if (perpDistXZ > playerRadius) continue; // Miss - ray passes outside cylinder
-
-          // Calculate actual 3D distance along ray
-          const hitDist3D = projDist / rayDirXZLen * spreadDir.length();
-
-          if (hitDist3D > effectiveRange) continue; // Beyond wall or max range
-
-          // Check Y bounds - does ray hit within player height?
-          const hitPoint = Vector3.add(eyePos, Vector3.scale(spreadDir, hitDist3D));
-          if (hitPoint.y < remoteFootY || hitPoint.y > remoteHeadY) continue; // Above/below player
-
-          // Valid hit!
-          if (!remoteHit || hitDist3D < remoteHit.distance) {
-            remoteHit = { playerId: remote.id, distance: hitDist3D, position: remote.position };
-            consoleLog(`[HIT] Ray hit ${remote.id.slice(0,8)} at dist=${hitDist3D.toFixed(1)}`);
+        // Check wall hits FIRST using collision mesh (to not hit through walls)
+        let wallHit: { distance: number; point: Vector3; normal: Vector3 } | null = null;
+        if (collisionMeshRef.current) {
+          const result = raycastMesh(eyePos, spreadDir, collisionMeshRef.current, maxRange);
+          if (result.hit) {
+            wallHit = { distance: result.distance, point: result.point, normal: result.normal };
           }
         }
-      }
+        const effectiveRange = wallHit ? wallHit.distance : maxRange;
 
-      let hitPoint: Vector3;
-      let hitWall = false;
+        // Determine hit point for this pellet
+        let hitPoint: Vector3;
 
-      // Check remote player hit first (before bot and wall)
-      if (remoteHit && (!botHit || remoteHit.distance < botHit.distance) && (!wallHit || remoteHit.distance < wallHit.distance)) {
-        hitPoint = Vector3.add(eyePos, Vector3.scale(spreadDir, remoteHit.distance));
-        renderer.triggerHitMarker();
-        playSound('hit_enemy');
+        // Check bot hit (simplified for pellets - no remote player handling per pellet)
+        if (botHit && (!wallHit || botHit.distance < wallHit.distance)) {
+          const damage = weapon.def.damage * (botHit.headshot ? weapon.def.headshotMultiplier : 1);
 
-        // Calculate damage based on weapon and distance
-        const baseDamage = weapon.def.damage;
-        const damage = baseDamage; // Could add distance falloff here
+          // Accumulate damage for this bot
+          const existing = botDamageMap.get(botHit.bot);
+          if (existing) {
+            existing.damage += damage;
+            if (botHit.headshot) existing.headshots++;
+          } else {
+            botDamageMap.set(botHit.bot, { damage, headshots: botHit.headshot ? 1 : 0 });
+          }
 
-        // Send hit action to server - SHOOTER determines hits
-        const mpState = getMultiplayerState();
-        if (mpState.isActive() && mpState.isLockstepMode()) {
-          mpState.addLockstepAction({
-            type: 'hit',
-            data: {
-              attackerId: mpState.getLocalPlayerId(),
-              victimId: remoteHit.playerId,
-              damage,
-              headshot: false, // TODO: implement headshot detection
-            },
-          });
-          consoleLog(`[SHOOTER] Hit ${remoteHit.playerId.slice(0, 8)} for ${damage} damage`);
+          hitPoint = Vector3.add(eyePos, Vector3.scale(spreadDir, botHit.distance));
+          anyHit = true;
+        } else if (wallHit) {
+          hitPoint = wallHit.point;
+        } else {
+          hitPoint = Vector3.add(eyePos, Vector3.scale(spreadDir, maxRange));
         }
-      } else if (botHit && (!wallHit || botHit.distance < wallHit.distance)) {
-        const damage = weapon.def.damage * (botHit.headshot ? weapon.def.headshotMultiplier : 1);
-        const wasAlive = botHit.bot.isAlive;
-        botHit.bot.takeDamage(damage, botHit.headshot);
-        hitPoint = Vector3.add(eyePos, Vector3.scale(spreadDir, botHit.distance));
 
-        renderer.triggerHitMarker();
-        playSound(botHit.headshot ? 'hit_headshot' : 'hit_enemy');
+        tracerEndpoints.push(hitPoint);
+      } // End pellet loop
 
-        if (wasAlive && !botHit.bot.isAlive) {
+      // Apply accumulated damage to all hit bots
+      for (const [bot, dmgInfo] of botDamageMap) {
+        const wasAlive = bot.isAlive;
+        bot.takeDamage(dmgInfo.damage, dmgInfo.headshots > 0);
+
+        if (wasAlive && !bot.isAlive) {
           // Drop bot's weapons on death
-          botHit.bot.dropAllWeapons(now);
+          bot.dropAllWeapons(now);
           player.kills++;
           player.awardKill(weapon.def.type);
           playSound('bot_death');
-          gameModeRef.current.registerKill(player.name, botHit.bot.name, weapon.def.name, botHit.headshot, now);
-          consoleLog(`You killed ${botHit.bot.name} with ${weapon.def.name}${botHit.headshot ? ' (headshot)' : ''}`);
+          gameModeRef.current.registerKill(player.name, bot.name, weapon.def.name, dmgInfo.headshots > 0, now);
+          consoleLog(`You killed ${bot.name} with ${weapon.def.name}${dmgInfo.headshots > 0 ? ' (headshot)' : ''}`);
         }
-      } else if (wallHit) {
-        hitPoint = wallHit.point;
-        hitWall = true;
-      } else {
-        hitPoint = Vector3.add(eyePos, Vector3.scale(spreadDir, maxRange));
       }
 
-      // Tracer
+      // Play hit sound if any pellet hit
+      if (anyHit) {
+        renderer.triggerHitMarker();
+        playSound('hit_enemy');
+      }
+
+      // Spawn tracers for pellets (limit to 4 for performance with shotgun)
       const cosYaw = Math.cos(yaw);
       const sinYaw = Math.sin(yaw);
       const muzzlePos = new Vector3(
@@ -1653,10 +1650,10 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
         eyePos.y - 0.5,
         eyePos.z + (-cosYaw * 0.8) + (-sinYaw * 0.5)
       );
-      renderer.spawnTracer(muzzlePos, hitPoint, 150);
 
-      if (hitWall && wallHit) {
-        renderer.spawnBulletDecal(wallHit.point, wallHit.normal);
+      const tracersToSpawn = Math.min(tracerEndpoints.length, 4);
+      for (let t = 0; t < tracersToSpawn; t++) {
+        renderer.spawnTracer(muzzlePos, tracerEndpoints[t], 150);
       }
     }
   };
@@ -1729,9 +1726,9 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
             if (result.mode === 'solo') {
               config = { ...DEFAULT_SOLO_CONFIG };
             } else if (result.mode === 'competitive') {
-              config = { ...DEFAULT_COMPETITIVE_CONFIG, warmupTime: 5 };
+              config = { ...DEFAULT_COMPETITIVE_CONFIG };
             } else {
-              config = { ...DEFAULT_DEATHMATCH_CONFIG, warmupTime: 3, freezeTime: 5 };  // Shorter times for DM
+              config = { ...DEFAULT_DEATHMATCH_CONFIG };
             }
             gameModeRef.current = new GameMode(config);
 
@@ -1739,40 +1736,99 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
             resetTeamManager();
             resetDroppedWeaponManager();
 
-            // Spawn bots for the game (not in solo mode)
-            botManager.clear();  // Clear any existing bots first
-            if (result.mode !== 'solo') {
-              botManager.spawnBots(6, 'medium');
-            }
+            // Clear any existing bots first
+            botManager.clear();
 
             // Set up teams if competitive mode
             const isTeamMode = result.mode === 'competitive';
             const isSoloMode = result.mode === 'solo';
             if (isTeamMode) {
               botManager.setTeamSpawnPoints(loadedMapRef.current.spawns);
-              botManager.assignBotsToTeams(playerRef.current.name);
-              const playerTeam = getTeamManager().getTeam(playerRef.current.name);
-              playerRef.current.team = playerTeam || 'T';
             }
 
-            // Respawn player at team spawn
+            // FIRST: Spawn player at a random spawn point (no bots yet to avoid)
             const player = playerRef.current;
+            if (isTeamMode) {
+              botManager.assignBotsToTeams(player.name);
+              const playerTeam = getTeamManager().getTeam(player.name);
+              player.team = playerTeam || 'T';
+            }
+
             const spawns = isTeamMode
               ? loadedMapRef.current.spawns.filter(s => s.team === player.team || s.team === 'DM')
               : loadedMapRef.current.spawns;
-            const spawn = spawns[Math.floor(Math.random() * spawns.length)];
-            player.respawn(
-              new Vector3(spawn.position[0], spawn.position[1], spawn.position[2]),
-              degToRad(spawn.angle)
-            );
+
+            // Pick a valid spawn for player
+            let spawnPos: Vector3 | null = null;
+            let spawnAngle = 0;
+
+            // For deathmatch, use blue noise distributed spawns
+            if (!isTeamMode && !isSoloMode) {
+              spawnPos = botManager.getBlueNoisePlayerSpawn();
+              spawnAngle = Math.random() * 360;
+            }
+
+            // Fall back to regular spawn selection if blue noise didn't work or for team modes
+            if (!spawnPos) {
+              const spawnPoints = spawns.map(s => new Vector3(s.position[0], s.position[1], s.position[2]));
+
+              // Shuffle spawn points for randomness
+              const shuffledIndices = [...Array(spawnPoints.length).keys()];
+              for (let i = shuffledIndices.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [shuffledIndices[i], shuffledIndices[j]] = [shuffledIndices[j], shuffledIndices[i]];
+              }
+
+              // Try each spawn point until we find one with valid ground
+              for (const idx of shuffledIndices) {
+                const rawSpawnPos = spawnPoints[idx];
+                if (collisionMeshRef.current) {
+                  const adjusted = adjustSpawnPosition(rawSpawnPos, collisionMeshRef.current);
+                  if (adjusted !== null) {
+                    spawnPos = adjusted;
+                    spawnAngle = spawns[idx]?.angle ?? Math.random() * 360;
+                    break;
+                  }
+                } else {
+                  // No collision mesh, use raw position
+                  spawnPos = rawSpawnPos;
+                  spawnAngle = spawns[idx]?.angle ?? Math.random() * 360;
+                  break;
+                }
+              }
+
+              // Fallback: if no valid spawn found, use first spawn with high Y
+              if (!spawnPos && spawnPoints.length > 0) {
+                const fallback = spawnPoints[0];
+                spawnPos = new Vector3(fallback.x, fallback.y + 5.0, fallback.z);
+                spawnAngle = spawns[0]?.angle ?? 0;
+                consoleLog('Warning: No valid spawn point found, using fallback');
+              } else if (!spawnPos) {
+                spawnPos = new Vector3(0, 10, 0);
+                spawnAngle = 0;
+              }
+            }
+
+            player.respawn(spawnPos, degToRad(spawnAngle));
 
             // Update camera
             const camera = renderer.getCamera();
-            camera.setPosition(spawn.position[0], spawn.position[1] + PLAYER_HEIGHT, spawn.position[2]);
-            camera.setYaw(degToRad(spawn.angle));
+            camera.setPosition(spawnPos.x, spawnPos.y + PLAYER_HEIGHT, spawnPos.z);
+            camera.setYaw(degToRad(spawnAngle));
             camera.setPitch(0);
 
-            // Respawn bots at team spawns (pass player for spread spawning)
+            // THEN: Spawn bots
+            if (result.mode !== 'solo') {
+              if (!isTeamMode) {
+                // Deathmatch: Use blue noise distributed spawns for even distribution
+                botManager.spawnBotsWithBlueNoise(6, 'medium', player.position);
+              } else {
+                // Team mode: Use regular spread spawning
+                botManager.spawnBots(6, 'medium', player.position);
+              }
+            }
+
+            // Respawn bots at team spawns in competitive mode
             if (isTeamMode) {
               botManager.respawnAllBots(now, player);
             }
@@ -2098,11 +2154,28 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
 
                   // BSP spawn position + eye height
                   const rawPos = new Vector3(bspSpawn.position[0], bspSpawn.position[1], bspSpawn.position[2]);
-                  spawnPos = collisionMeshRef.current
+                  let adjustedPos: Vector3 | null = collisionMeshRef.current
                     ? adjustSpawnPosition(rawPos, collisionMeshRef.current)
                     : rawPos;
+
+                  // If first spawn is invalid, try other spawn points
+                  if (adjustedPos === null && collisionMeshRef.current) {
+                    for (const altSpawn of bspSpawns) {
+                      const altPos = new Vector3(altSpawn.position[0], altSpawn.position[1], altSpawn.position[2]);
+                      adjustedPos = adjustSpawnPosition(altPos, collisionMeshRef.current);
+                      if (adjustedPos !== null) {
+                        spawnYaw = altSpawn.angle * Math.PI / 180;
+                        break;
+                      }
+                    }
+                  }
+
+                  // Fallback to raw position if all else fails
+                  spawnPos = adjustedPos ?? rawPos;
                   spawnPos.y += 1.7; // Add eye height
-                  spawnYaw = bspSpawn.angle * Math.PI / 180; // Convert degrees to radians
+                  if (adjustedPos !== null) {
+                    spawnYaw = bspSpawn.angle * Math.PI / 180; // Convert degrees to radians
+                  }
 
                   consoleLog(`[Spawn] Using BSP spawn point ${spawnIdx} from ${bspSpawns.length} available`);
                 } else {
@@ -2112,9 +2185,10 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
                     localPlayer.spawnPosition.y,
                     localPlayer.spawnPosition.z
                   );
-                  spawnPos = collisionMeshRef.current
+                  const adjustedPos = collisionMeshRef.current
                     ? adjustSpawnPosition(rawSpawnPos, collisionMeshRef.current)
                     : rawSpawnPos;
+                  spawnPos = adjustedPos ?? rawSpawnPos;
                   consoleLog(`[Spawn] Using server spawn position (no BSP spawns available)`);
                 }
 
@@ -2320,11 +2394,28 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
 
                             // BSP spawn position + eye height
                             const rawPos = new Vector3(bspSpawn.position[0], bspSpawn.position[1], bspSpawn.position[2]);
-                            spawnPos = collisionMeshRef.current
+                            let adjustedPos: Vector3 | null = collisionMeshRef.current
                               ? adjustSpawnPosition(rawPos, collisionMeshRef.current)
                               : rawPos;
+
+                            // If first spawn is invalid, try other spawn points
+                            if (adjustedPos === null && collisionMeshRef.current) {
+                              for (const altSpawn of bspSpawns) {
+                                const altPos = new Vector3(altSpawn.position[0], altSpawn.position[1], altSpawn.position[2]);
+                                adjustedPos = adjustSpawnPosition(altPos, collisionMeshRef.current);
+                                if (adjustedPos !== null) {
+                                  spawnYaw = altSpawn.angle * Math.PI / 180;
+                                  break;
+                                }
+                              }
+                            }
+
+                            // Fallback to raw position if all else fails
+                            spawnPos = adjustedPos ?? rawPos;
                             spawnPos.y += 1.7; // Add eye height
-                            spawnYaw = bspSpawn.angle * Math.PI / 180;
+                            if (adjustedPos !== null) {
+                              spawnYaw = bspSpawn.angle * Math.PI / 180;
+                            }
                           } else {
                             // Fallback to current position if no spawns available
                             spawnPos = localPlayer.position.clone();
@@ -2515,8 +2606,9 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
         return;
       }
 
-      // Check for quit (q key always quits, Esc releases mouse or quits if not captured)
-      if (str === 'q') {
+      // Check for quit (Esc quits when mouse not captured, Q quits only when not in menus)
+      // Note: Q is used for navigation in buy menu, so don't quit when buy menu is open
+      if (str === 'q' && !buyMenu.isOpen()) {
         exitingRef.current = true;
         mouseHandler.disable();
         getSoundEngine().destroy();
@@ -2565,28 +2657,33 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
         keyTimes.set('f', now);
       }
 
-      // Reload (R)
-      if (key === 'r') {
+      // Skip action keys if native keyboard is handling them
+      const useNative = useNativeKeyboardRef.current && isNativeKeyboardAvailable();
+
+      // Reload (R) - only if native keyboard not active
+      if (key === 'r' && !useNative) {
         const player = playerRef.current;
         if (player.reload(now)) {
           playSound('reload');
         }
       }
 
-      // Tab for scoreboard
-      if (str === '\t') {
+      // Tab for scoreboard (only if native keyboard is not handling it)
+      if (str === '\t' && !useNative) {
         showScoreboardRef.current = !showScoreboardRef.current;
       }
 
-      // B for buy menu (freeze phase only)
-      const canBuyMP = isMultiplayerRef.current && getMultiplayerState().canBuy();
-      const canBuySP = !isMultiplayerRef.current && gameModeRef.current.canBuy();
-      if (key === 'b' && (canBuyMP || canBuySP)) {
-        buyMenu.toggle(playerRef.current);
+      // B for buy menu (freeze phase only) - skip if native keyboard handles it
+      if (!useNative) {
+        const canBuyMP = isMultiplayerRef.current && getMultiplayerState().canBuy();
+        const canBuySP = !isMultiplayerRef.current && gameModeRef.current.canBuy();
+        if (key === 'b' && (canBuyMP || canBuySP)) {
+          buyMenu.toggle(playerRef.current);
+        }
       }
 
-      // C to toggle mouse capture (in game) or release (in menu)
-      if (key === 'c') {
+      // C to toggle mouse capture (in game) or release (in menu) - skip if native handles it
+      if (key === 'c' && !useNative) {
         if (appModeRef.current === 'playing') {
           if (mouseHandler.isCaptured()) {
             mouseHandler.release();
@@ -2599,8 +2696,8 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
         }
       }
 
-      // E for weapon pickup
-      if (key === 'e') {
+      // E for weapon pickup - skip if native keyboard handles it
+      if (key === 'e' && !useNative) {
         const player = playerRef.current;
         const droppedWeaponManager = getDroppedWeaponManager();
         const nearby = droppedWeaponManager.getWeaponsNear(player.position, 2.5);
@@ -2622,9 +2719,15 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
         }
       }
 
-      // Weapon slots (1-5)
-      if (str >= '1' && str <= '5') {
+      // Weapon slots (1-5) - skip if native keyboard handles it
+      if (str >= '1' && str <= '5' && !useNative) {
         playerRef.current.selectWeapon(parseInt(str) as WeaponSlot);
+        // Unscope when switching weapons
+        if (scopedRef.current) {
+          scopedRef.current = false;
+          renderer.getCamera().setFov(90);
+          renderer.setScoped(false);
+        }
       }
     };
 
@@ -2835,6 +2938,12 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
         const slot = getNativeWeaponSlot();
         if (slot !== null) {
           playerRef.current.selectWeapon(slot as WeaponSlot);
+          // Unscope when switching weapons
+          if (scopedRef.current) {
+            scopedRef.current = false;
+            camera.setFov(90);
+            renderer.setScoped(false);
+          }
         }
 
         // Handle other action keys via native
@@ -2879,6 +2988,21 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
                 consoleLog(`Picked up ${weaponState.def.name}`);
               }
             }
+          }
+        }
+
+        // Right-click to toggle scope on sniper
+        if (wasMouseButtonJustPressed('Right') && mouseHandler.isCaptured()) {
+          const weapon = playerRef.current.getCurrentWeapon();
+          if (weapon && weapon.def.type === 'sniper') {
+            scopedRef.current = !scopedRef.current;
+            // Adjust FOV when scoping
+            if (scopedRef.current) {
+              camera.setFov(20); // Zoomed in
+            } else {
+              camera.setFov(90); // Normal FOV
+            }
+            renderer.setScoped(scopedRef.current);
           }
         }
 
@@ -2947,23 +3071,37 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
         playSound('jump');
       }
 
-      // Handle fire key (F) - continuous fire while held
+      // Handle fire key (F) - auto weapons fire while held, semi-auto require click per shot
       const gameConsole = getGameConsole();
       if (!gameConsole.getIsOpen() && appModeRef.current === 'playing') {
         const isFrozenMP = isMultiplayerRef.current && getMultiplayerState().isPlayerFrozen();
         const isFrozenSP = !isMultiplayerRef.current && !isSoloModeMove && gameModeRef.current.isPlayerFrozen();
         const isFrozen = isFrozenMP || isFrozenSP;
 
-        if (firePressed && !isFrozen) {
-          const player = playerRef.current;
-          const weapon = player.getCurrentWeapon();
+        const player = playerRef.current;
+        const weapon = player.getCurrentWeapon();
 
+        // Reset hasFired when fire is released
+        if (!firePressed) {
+          hasFiredRef.current = false;
+        }
+
+        // Determine if we should fire
+        // Automatic weapons: fire while held
+        // Semi-auto weapons: only fire on initial press (hasn't fired since pressing)
+        const isAuto = weapon?.def.isAutomatic ?? false;
+        const shouldFire = firePressed && !isFrozen && (isAuto || !hasFiredRef.current);
+
+        if (shouldFire && weapon) {
           if (isMultiplayerRef.current) {
             const mpState = getMultiplayerState();
 
             if (mpState.isLockstepMode()) {
               // Lockstep mode: add fire action and handle locally
-              if (player.fire(now) && weapon) {
+              if (player.fire(now)) {
+                // Mark as fired for semi-auto
+                if (!isAuto) hasFiredRef.current = true;
+
                 // Add fire action to be sent with next tick
                 const fireDir = camera.getForward();
                 mpState.addLockstepAction({
@@ -2980,7 +3118,10 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
               }
             } else {
               // Server-authoritative: send fire event to server
-              if (player.fire(now) && weapon) {
+              if (player.fire(now)) {
+                // Mark as fired for semi-auto
+                if (!isAuto) hasFiredRef.current = true;
+
                 getGameClient().sendFire();
                 // Play local fire sound immediately for responsiveness
                 const weaponType = weapon.def.type;
@@ -2993,7 +3134,10 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
             }
           } else {
             // Single player: handle fire locally
-            if (player.fire(now) && weapon) {
+            if (player.fire(now)) {
+              // Mark as fired for semi-auto
+              if (!isAuto) hasFiredRef.current = true;
+
               handlePlayerFire(player, weapon, now);
             }
           }
@@ -3177,6 +3321,13 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
           playSound('player_death');
           wasAliveRef.current = false;
 
+          // Unscope on death
+          if (scopedRef.current) {
+            scopedRef.current = false;
+            camera.setFov(90);
+            renderer.setScoped(false);
+          }
+
           // Drop weapons on death in competitive mode
           if (isTeamMode) {
             player.dropAllWeapons(now);
@@ -3207,22 +3358,54 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
 
       // Handle player respawn (not in solo mode - player is always alive)
       if (!isSoloMode && gameMode.shouldPlayerRespawn(player, now)) {
-        // Use spread spawning - pick spawn far from bots
-        const mapSpawns = loadedMapRef.current.spawns;
-        const spawnPoints = mapSpawns.map(s => new Vector3(s.position[0], s.position[1], s.position[2]));
-        const botPositions = botManager.getAllEntityPositions();
-        const rawSpawnPos = botManager.getSpreadSpawnPoint(spawnPoints, botPositions);
+        // Get entity positions to spawn far from
+        const entityPositions = botManager.getAllEntityPositions();
 
-        // Adjust spawn position to valid ground
-        const spawnPos = collisionMeshRef.current
-          ? adjustSpawnPosition(rawSpawnPos, collisionMeshRef.current)
-          : rawSpawnPos;
+        // Use pre-computed spawn points - pick one far from entities
+        let spawnPos = getSpawnFarFromEntities(entityPositions);
+        let spawnAngle = Math.random() * 360;
 
-        // Find the matching spawn point for angle
-        const spawnIndex = spawnPoints.findIndex(s =>
-          Math.abs(s.x - rawSpawnPos.x) < 0.1 && Math.abs(s.z - rawSpawnPos.z) < 0.1
-        );
-        const spawnAngle = spawnIndex >= 0 ? mapSpawns[spawnIndex].angle : 0;
+        // Fallback to old method if no pre-computed spawns
+        if (!spawnPos) {
+          const mapSpawns = loadedMapRef.current.spawns;
+          const spawnPoints = mapSpawns.map(s => new Vector3(s.position[0], s.position[1], s.position[2]));
+
+          // Sort spawn points by distance from entities (furthest first)
+          const sortedSpawns = spawnPoints
+            .map((sp, idx) => {
+              let minDist = Infinity;
+              for (const ep of entityPositions) {
+                const dx = sp.x - ep.x;
+                const dz = sp.z - ep.z;
+                const dist = Math.sqrt(dx * dx + dz * dz);
+                if (dist < minDist) minDist = dist;
+              }
+              return { spawn: sp, idx, minDist };
+            })
+            .sort((a, b) => b.minDist - a.minDist);
+
+          for (const { spawn: rawSpawnPos, idx } of sortedSpawns) {
+            if (collisionMeshRef.current) {
+              const adjusted = adjustSpawnPosition(rawSpawnPos, collisionMeshRef.current);
+              if (adjusted !== null) {
+                spawnPos = adjusted;
+                spawnAngle = mapSpawns[idx]?.angle ?? Math.random() * 360;
+                break;
+              }
+            } else {
+              spawnPos = rawSpawnPos;
+              spawnAngle = mapSpawns[idx]?.angle ?? Math.random() * 360;
+              break;
+            }
+          }
+
+          // Final fallback
+          if (!spawnPos && spawnPoints.length > 0) {
+            spawnPos = new Vector3(spawnPoints[0].x, spawnPoints[0].y + 5.0, spawnPoints[0].z);
+          } else if (!spawnPos) {
+            spawnPos = new Vector3(0, 10, 0);
+          }
+        }
 
         player.respawn(spawnPos, degToRad(spawnAngle));
 
@@ -3234,7 +3417,7 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
 
         playSound('spawn');
         wasAliveRef.current = true;
-        gameMode.onPlayerRespawn();
+        gameMode.onPlayerRespawn(player);
       }
 
       // NOTE: interpState is updated in the render loop, not here
@@ -3396,7 +3579,7 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
           gameMode.config.roundsToWin,
           gameMode.matchWinner,
           gameMode.getRespawnCountdown(now),
-          Math.ceil(gameMode.getWarmupRemaining(now))
+          0  // No warmup
         );
 
         // Set freeze time for ALL modes (not just competitive)
@@ -3413,7 +3596,36 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
       // Update dropped weapons in renderer
       const droppedWeaponManager = getDroppedWeaponManager();
       droppedWeaponManager.update(now);
+
+      // Auto-pickup ammo for same weapon type when walking over dropped weapons
+      // Also track nearby weapons for pickup prompt
+      let nearbyPickupWeapon: string | null = null;
+
+      if (player.isAlive) {
+        const nearbyWeapons = droppedWeaponManager.getWeaponsNear(player.position, 2.5);
+        for (const dropped of nearbyWeapons) {
+          const weaponState = droppedWeaponManager.toWeaponState(dropped);
+          if (weaponState) {
+            if (player.wouldMergeAmmo(weaponState)) {
+              // Auto-pickup ammo for same weapon type (closer range)
+              const dx = dropped.position.x - player.position.x;
+              const dz = dropped.position.z - player.position.z;
+              const dist = Math.sqrt(dx * dx + dz * dz);
+              if (dist < 1.5) {
+                player.pickupWeapon(weaponState);
+                droppedWeaponManager.removeWeapon(dropped.id);
+                consoleLog(`Picked up ammo for ${weaponState.def.name}`);
+              }
+            } else {
+              // Different weapon - show pickup prompt
+              nearbyPickupWeapon = weaponState.def.name;
+            }
+          }
+        }
+      }
+
       renderer.setDroppedWeapons(droppedWeaponManager.getAll());
+      renderer.setNearbyWeapon(nearbyPickupWeapon);
 
       // Render
       const stats = renderer.render();

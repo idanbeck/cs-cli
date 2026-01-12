@@ -69,6 +69,9 @@ export class Bot extends Player {
   public stuckTime: number = 0;
   public lastPosition: Vector3;
   public verticalVelocity: number = 0;  // For gravity tracking
+  public lastSignificantMoveTime: number = 0;  // Track when bot last moved significantly
+  public stuckRecoveryDir: Vector3 | null = null;  // Direction to move when stuck
+  public stuckRecoveryUntil: number = 0;  // Time until stuck recovery ends
 
   constructor(
     difficulty: BotDifficulty = 'medium',
@@ -178,9 +181,27 @@ export class Bot extends Player {
       this.stuckTime += now - this.lastThinkTime;
     } else {
       this.stuckTime = 0;
+      this.lastSignificantMoveTime = now;  // Track significant movement
     }
     this.lastPosition = this.position.clone();
     return this.stuckTime > 1000; // Stuck for 1 second
+  }
+
+  // Check if bot has been stagnant (not moving for too long)
+  isStagnant(now: number): boolean {
+    // Initialize if not set
+    if (this.lastSignificantMoveTime === 0) {
+      this.lastSignificantMoveTime = now;
+      return false;
+    }
+    // Stagnant if hasn't moved significantly in 3 seconds
+    return now - this.lastSignificantMoveTime > 3000;
+  }
+
+  // Generate a random direction for stuck recovery
+  generateRandomEscapeDirection(): Vector3 {
+    const angle = Math.random() * Math.PI * 2;
+    return new Vector3(Math.cos(angle), 0, Math.sin(angle));
   }
 
   // Get next patrol waypoint

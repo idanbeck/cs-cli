@@ -177,18 +177,19 @@ export class BuyMenu {
   }
 
   // Handle key input
+  // Navigation: Q/E for category left/right, WASD/arrows for item selection
   handleKey(key: string): { action: 'close' | 'purchase' | 'navigate' | 'none'; result?: { success: boolean; message: string } } {
     if (!this.state.isOpen) return { action: 'none' };
 
     switch (key) {
-      case 'left':
-      case 'a':
+      // Q/E for category navigation (left/right)
+      case 'q':
         this.moveLeft();
         return { action: 'navigate' };
-      case 'right':
-      case 'd':
+      case 'e':
         this.moveRight();
         return { action: 'navigate' };
+      // Arrow keys and WASD for item selection (up/down)
       case 'up':
       case 'w':
         this.moveUp();
@@ -196,6 +197,15 @@ export class BuyMenu {
       case 'down':
       case 's':
         this.moveDown();
+        return { action: 'navigate' };
+      // Left/right arrows also work for category navigation
+      case 'left':
+      case 'a':
+        this.moveLeft();
+        return { action: 'navigate' };
+      case 'right':
+      case 'd':
+        this.moveRight();
         return { action: 'navigate' };
       case 'enter':
       case 'space':

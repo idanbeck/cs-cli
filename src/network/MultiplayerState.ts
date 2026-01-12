@@ -2,7 +2,7 @@
 // Handles server state, client-side prediction, and interpolation
 
 import { Vector3 } from '../engine/math/Vector3.js';
-import { getFileLogger } from '../utils/FileLogger.js';
+import { getFileLogger, debugLog } from '../utils/FileLogger.js';
 import {
   GameStateSnapshot,
   PlayerSnapshot,
@@ -349,7 +349,7 @@ export class MultiplayerState {
 
     // If drift is significant, snap to server position
     if (drift > 1.0) {
-      console.log(`[MP] Reconciliation: drift=${drift.toFixed(2)}, snapping to server position`);
+      debugLog(`[MP] Reconciliation: drift=${drift.toFixed(2)}, snapping to server position`);
       return reconciledPosition;
     }
 
@@ -476,7 +476,7 @@ export class MultiplayerState {
       }
     }
 
-    console.log(`[MultiplayerState] Lockstep initialized at tick ${message.tick} with ${message.players.length} players`);
+    debugLog(`[MultiplayerState] Lockstep initialized at tick ${message.tick} with ${message.players.length} players`);
   }
 
   /**
@@ -492,7 +492,7 @@ export class MultiplayerState {
    */
   addLockstepAction(action: LockstepAction): void {
     this.pendingLockstepActions.push(action);
-    console.log(`[MPSTATE] Added action: ${action.type}, pending count: ${this.pendingLockstepActions.length}`);
+    debugLog(`[MPSTATE] Added action: ${action.type}, pending count: ${this.pendingLockstepActions.length}`);
     getFileLogger().event('action_added', { type: action.type, pending: this.pendingLockstepActions.length });
   }
 
@@ -503,7 +503,7 @@ export class MultiplayerState {
   popPendingActions(): LockstepAction[] {
     const actions = [...this.pendingLockstepActions];
     if (actions.length > 0) {
-      console.log(`[MPSTATE] Popping ${actions.length} actions: ${actions.map(a => a.type).join(',')}`);
+      debugLog(`[MPSTATE] Popping ${actions.length} actions: ${actions.map(a => a.type).join(',')}`);
       getFileLogger().event('actions_sent', { count: actions.length, types: actions.map(a => a.type).join(',') });
     }
     this.pendingLockstepActions = [];
@@ -550,7 +550,7 @@ export class MultiplayerState {
 
     // Verify tick sequence
     if (message.tick !== this.currentTick) {
-      console.warn(`[MultiplayerState] Tick mismatch: expected ${this.currentTick}, got ${message.tick}`);
+      debugLog(`[MultiplayerState] Tick mismatch: expected ${this.currentTick}, got ${message.tick}`);
       // For now, accept it anyway to avoid desync
       this.currentTick = message.tick;
     }

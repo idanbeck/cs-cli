@@ -10,6 +10,7 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { Vector3 } from '../engine/math/Vector3.js';
 import { CollisionMesh } from '../physics/MeshCollision.js';
+import { debugLog } from '../utils/FileLogger.js';
 
 interface LOSQuery {
   id: number;
@@ -68,12 +69,12 @@ export class BotAIWorkerPool {
         });
 
         worker.on('error', (error) => {
-          console.error(`[BotAIWorkerPool] Worker ${i} error:`, error);
+          debugLog(`[BotAIWorkerPool] Worker ${i} error:`, error);
         });
 
         worker.on('exit', (code) => {
           if (code !== 0) {
-            console.error(`[BotAIWorkerPool] Worker ${i} exited with code ${code}`);
+            debugLog(`[BotAIWorkerPool] Worker ${i} exited with code ${code}`);
           }
         });
 
@@ -90,7 +91,7 @@ export class BotAIWorkerPool {
           })
         );
       } catch (error) {
-        console.error(`[BotAIWorkerPool] Failed to create worker ${i}:`, error);
+        debugLog(`[BotAIWorkerPool] Failed to create worker ${i}:`, error);
       }
     }
 
@@ -98,7 +99,7 @@ export class BotAIWorkerPool {
     this._isInitialized = this.workers.length > 0;
 
     if (this._isInitialized) {
-      console.log(`[BotAIWorkerPool] Initialized with ${this.workers.length} workers`);
+      debugLog(`[BotAIWorkerPool] Initialized with ${this.workers.length} workers`);
     }
   }
 
@@ -261,7 +262,7 @@ export class BotAIWorkerPool {
     this.meshReady = [];
     this.pendingBatch = null;
     this._isInitialized = false;
-    console.log('[BotAIWorkerPool] Shutdown complete');
+    debugLog('[BotAIWorkerPool] Shutdown complete');
   }
 }
 

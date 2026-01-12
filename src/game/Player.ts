@@ -276,10 +276,11 @@ export class Player {
   pickupWeapon(weapon: WeaponState): 'picked_up' | 'ammo_added' {
     const existingWeapon = this.weapons.get(weapon.def.slot);
 
-    // If we already have the same weapon type, just add the ammo
+    // If we already have the same weapon type, just add the ammo to reserve
     if (existingWeapon && existingWeapon.def.type === weapon.def.type) {
-      existingWeapon.currentAmmo += weapon.currentAmmo;
-      existingWeapon.reserveAmmo += weapon.reserveAmmo;
+      // Add all ammo from picked up weapon to reserve (magazine + reserve)
+      // Don't add to currentAmmo - that's what's in the magazine
+      existingWeapon.reserveAmmo += weapon.currentAmmo + weapon.reserveAmmo;
       return 'ammo_added';
     }
 

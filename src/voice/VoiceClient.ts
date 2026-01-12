@@ -19,6 +19,7 @@ import {
   isVoiceFrame,
 } from './types.js';
 import { voiceLog } from './voiceLog.js';
+import { debugLog } from '../utils/FileLogger.js';
 import { Codec2, getCodec2Encoder } from './Codec2.js';
 import { JitterBuffer, JitterBufferManager } from './JitterBuffer.js';
 
@@ -83,7 +84,7 @@ export class VoiceClient {
       try {
         callback(event);
       } catch (error) {
-        console.error('[VoiceClient] Event callback error:', error);
+        debugLog('[VoiceClient] Event callback error:', error);
       }
     }
   }
@@ -107,7 +108,7 @@ export class VoiceClient {
     try {
       payload = this.codec.encode(samples);
     } catch (error) {
-      console.error('[VoiceClient] Encode error:', error);
+      debugLog('[VoiceClient] Encode error:', error);
       return;
     }
 
@@ -152,7 +153,7 @@ export class VoiceClient {
 
     const frame = deserializeVoiceFrame(data);
     if (!frame) {
-      console.warn('[VoiceClient] Failed to deserialize voice frame');
+      debugLog('[VoiceClient] Failed to deserialize voice frame');
       return false;
     }
 

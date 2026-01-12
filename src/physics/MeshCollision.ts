@@ -10,6 +10,7 @@ import {
   createRay,
   getCollisionBVHStats,
 } from './BVH.js';
+import { debugLog } from '../utils/FileLogger.js';
 
 // A collision triangle
 export interface CollisionTriangle {
@@ -51,7 +52,7 @@ export class CollisionMesh {
     // Log BVH stats for debugging
     if (this.bvh) {
       const stats = getCollisionBVHStats(this.bvh);
-      console.log(`[BVH] Built: ${stats.nodeCount} nodes, ${stats.leafCount} leaves, depth ${stats.maxDepth}, avg ${stats.avgTrianglesPerLeaf.toFixed(1)} tris/leaf`);
+      debugLog(`[BVH] Built: ${stats.nodeCount} nodes, ${stats.leafCount} leaves, depth ${stats.maxDepth}, avg ${stats.avgTrianglesPerLeaf.toFixed(1)} tris/leaf`);
     }
   }
 
@@ -694,11 +695,42 @@ export function getGlobalCollisionMesh(): CollisionMesh {
   return globalCollisionMesh;
 }
 
+// Check if a spawn position has valid ground below it
+// Returns true if ground was found within reasonable distance
+export function isValidSpawnPoint(
+  spawnPos: Vector3,
+  mesh: CollisionMesh
+): boolean {
+  if (mesh.triangles.length === 0) {
+    return true; // No mesh to check against, assume valid
+  }
+
+  // Check from spawn position
+  const groundCheck = findGroundBelow(spawnPos, mesh);
+  if (groundCheck.found) {
+    return true;
+  }
+
+  // Try from higher up in case spawn is inside geometry
+  const highCheck = findGroundBelow(
+    new Vector3(spawnPos.x, spawnPos.y + 10.0, spawnPos.z),
+    mesh
+  );
+
+  return highCheck.found;
+}
+
 // Adjust a spawn position to be on valid ground (not clipping geometry)
+// Adds a small Y buffer to prevent falling through due to floating point precision
+// Returns null if no valid ground found
 export function adjustSpawnPosition(
   spawnPos: Vector3,
   mesh: CollisionMesh
-): Vector3 {
+): Vector3 | null {
+  // Buffer above ground to prevent Y-fighting/falling through
+  // Needs to be high enough to account for physics stepping
+  const SPAWN_Y_BUFFER = 1.0;
+
   if (mesh.triangles.length === 0) {
     return spawnPos.clone();
   }
@@ -707,20 +739,223 @@ export function adjustSpawnPosition(
   const groundCheck = findGroundBelow(spawnPos, mesh);
 
   if (groundCheck.found) {
-    // Position player on the ground
-    return new Vector3(spawnPos.x, groundCheck.groundY, spawnPos.z);
+    // Position player slightly above the ground
+    return new Vector3(spawnPos.x, groundCheck.groundY + SPAWN_Y_BUFFER, spawnPos.z);
   }
 
   // Try casting from higher up in case spawn is inside geometry
   const highCheck = findGroundBelow(
-    new Vector3(spawnPos.x, spawnPos.y + 5.0, spawnPos.z),
+    new Vector3(spawnPos.x, spawnPos.y + 10.0, spawnPos.z),
     mesh
   );
 
   if (highCheck.found) {
-    return new Vector3(spawnPos.x, highCheck.groundY, spawnPos.z);
+    return new Vector3(spawnPos.x, highCheck.groundY + SPAWN_Y_BUFFER, spawnPos.z);
   }
 
-  // No ground found, return original
-  return spawnPos.clone();
+  // No ground found - spawn point is invalid
+  return null;
+}
+
+// Pre-computed valid spawn points for the current map
+let precomputedSpawnPoints: Vector3[] = [];
+
+// Get pre-computed spawn points
+export function getPrecomputedSpawnPoints(): Vector3[] {
+  return precomputedSpawnPoints;
+}
+
+// Pre-compute valid spawn points using diffusion/repulsion
+// Spawns push away from each other until they stabilize or hit walls
+export function precomputeMapSpawnPoints(
+  existingSpawns: Vector3[],
+  mesh: CollisionMesh,
+  minSpacing: number = 8.0
+): void {
+  precomputedSpawnPoints = [];
+
+  if (existingSpawns.length === 0) {
+    debugLog(`[SpawnDiffuse] No existing spawns`);
+    return;
+  }
+
+  if (mesh.triangles.length === 0) {
+    precomputedSpawnPoints = existingSpawns.map(s => s.clone());
+    debugLog(`[SpawnDiffuse] No mesh, using ${precomputedSpawnPoints.length} existing spawns`);
+    return;
+  }
+
+  const DIFFUSION_CYCLES = 50; // Number of diffusion iterations
+  const STEP_SIZE = 1.0; // How far to move per step
+  const WALL_BUFFER = 1.5; // Minimum distance from walls
+  const REPULSION_RADIUS = 30.0; // Distance at which spawns repel each other
+  const SPAWN_Y_BUFFER = 1.0;
+
+  // Initialize spawn points from existing spawns, adjusted to ground
+  const spawns: Vector3[] = [];
+  for (const sp of existingSpawns) {
+    const groundCheck = findGroundBelow(
+      new Vector3(sp.x, sp.y + 2, sp.z),
+      mesh
+    );
+    if (groundCheck.found) {
+      spawns.push(new Vector3(sp.x, groundCheck.groundY, sp.z));
+    } else {
+      spawns.push(sp.clone());
+    }
+  }
+
+  debugLog(`[SpawnDiffuse] Starting diffusion with ${spawns.length} spawns for ${DIFFUSION_CYCLES} cycles`);
+
+  // Check if a position is valid (has ground and wall clearance)
+  const isValidPosition = (pos: Vector3): { valid: boolean; groundY: number } => {
+    // Check for ground
+    const groundCheck = findGroundBelow(new Vector3(pos.x, pos.y + 2, pos.z), mesh);
+    if (!groundCheck.found) {
+      return { valid: false, groundY: pos.y };
+    }
+
+    // Check wall clearance in cardinal directions
+    const rayOrigin = new Vector3(pos.x, groundCheck.groundY + 0.5, pos.z);
+    const directions = [
+      new Vector3(1, 0, 0),
+      new Vector3(-1, 0, 0),
+      new Vector3(0, 0, 1),
+      new Vector3(0, 0, -1),
+    ];
+
+    for (const dir of directions) {
+      const result = raycastMesh(rayOrigin, dir, mesh, WALL_BUFFER);
+      if (result.hit) {
+        return { valid: false, groundY: groundCheck.groundY };
+      }
+    }
+
+    return { valid: true, groundY: groundCheck.groundY };
+  };
+
+  // Run diffusion cycles
+  for (let cycle = 0; cycle < DIFFUSION_CYCLES; cycle++) {
+    let totalMovement = 0;
+
+    for (let i = 0; i < spawns.length; i++) {
+      const spawn = spawns[i];
+
+      // Calculate repulsion force from all other spawns
+      let forceX = 0;
+      let forceZ = 0;
+
+      for (let j = 0; j < spawns.length; j++) {
+        if (i === j) continue;
+
+        const other = spawns[j];
+        const dx = spawn.x - other.x;
+        const dz = spawn.z - other.z;
+        const distSq = dx * dx + dz * dz;
+        const dist = Math.sqrt(distSq);
+
+        if (dist < REPULSION_RADIUS && dist > 0.01) {
+          // Repulsion force inversely proportional to distance
+          const strength = (REPULSION_RADIUS - dist) / REPULSION_RADIUS;
+          forceX += (dx / dist) * strength;
+          forceZ += (dz / dist) * strength;
+        }
+      }
+
+      // Normalize and scale force
+      const forceMag = Math.sqrt(forceX * forceX + forceZ * forceZ);
+      if (forceMag > 0.01) {
+        forceX = (forceX / forceMag) * STEP_SIZE;
+        forceZ = (forceZ / forceMag) * STEP_SIZE;
+
+        // Try to move in the repulsion direction
+        const newPos = new Vector3(spawn.x + forceX, spawn.y, spawn.z + forceZ);
+        const check = isValidPosition(newPos);
+
+        if (check.valid) {
+          spawn.x = newPos.x;
+          spawn.z = newPos.z;
+          spawn.y = check.groundY;
+          totalMovement += STEP_SIZE;
+        }
+      }
+    }
+
+    // Early exit if spawns have stabilized
+    if (totalMovement < 0.1) {
+      debugLog(`[SpawnDiffuse] Converged after ${cycle + 1} cycles`);
+      break;
+    }
+  }
+
+  // Store final spawn positions with Y buffer
+  precomputedSpawnPoints = spawns.map(s => new Vector3(s.x, s.y + SPAWN_Y_BUFFER, s.z));
+
+  debugLog(`[SpawnDiffuse] Diffused ${precomputedSpawnPoints.length} spawn points`);
+}
+
+// Get spawn points for deathmatch - uses pre-computed if available
+export function generateBlueNoiseSpawns(
+  existingSpawns: Vector3[],
+  mesh: CollisionMesh,
+  count: number,
+  minSpacing: number = 8.0
+): Vector3[] {
+  // Use pre-computed spawn points if available
+  if (precomputedSpawnPoints.length > 0) {
+    // Shuffle and return requested count
+    const shuffled = [...precomputedSpawnPoints];
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+    }
+    return shuffled.slice(0, count);
+  }
+
+  // Fallback: return existing spawns if no pre-computed points
+  debugLog(`[BlueNoise] No pre-computed spawns, using ${existingSpawns.length} existing`);
+  const shuffled = [...existingSpawns];
+  for (let i = shuffled.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
+  }
+  return shuffled.slice(0, count);
+}
+
+// Get a single spawn point that is maximally far from all given entity positions
+// Uses pre-computed spawn points - ideal for respawning
+export function getSpawnFarFromEntities(entityPositions: Vector3[]): Vector3 | null {
+  if (precomputedSpawnPoints.length === 0) {
+    return null;
+  }
+
+  if (entityPositions.length === 0) {
+    // No entities to avoid, return random pre-computed spawn
+    return precomputedSpawnPoints[Math.floor(Math.random() * precomputedSpawnPoints.length)].clone();
+  }
+
+  // Find the spawn with the maximum minimum distance to any entity
+  let bestSpawn: Vector3 | null = null;
+  let bestMinDist = -1;
+
+  for (const spawn of precomputedSpawnPoints) {
+    // Find minimum distance from this spawn to any entity
+    let minDist = Infinity;
+    for (const entityPos of entityPositions) {
+      const dx = spawn.x - entityPos.x;
+      const dz = spawn.z - entityPos.z;
+      const dist = Math.sqrt(dx * dx + dz * dz);
+      if (dist < minDist) {
+        minDist = dist;
+      }
+    }
+
+    // If this spawn's minimum distance is greater, it's a better choice
+    if (minDist > bestMinDist) {
+      bestMinDist = minDist;
+      bestSpawn = spawn;
+    }
+  }
+
+  return bestSpawn ? bestSpawn.clone() : null;
 }

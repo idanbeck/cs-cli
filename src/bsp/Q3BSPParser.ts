@@ -2,6 +2,7 @@
 // Used by Quake 3 Arena, and many community maps
 
 import { readFileSync } from 'fs';
+import { debugLog } from '../utils/FileLogger.js';
 
 // Quake 3 BSP header
 const Q3BSP_MAGIC = 0x50534249; // "IBSP" in little-endian
@@ -140,7 +141,7 @@ export class Q3BSPParser {
     }
 
     if (version !== Q3BSP_VERSION) {
-      console.warn(`Q3 BSP version ${version}, expected ${Q3BSP_VERSION}`);
+      debugLog(`Q3 BSP version ${version}, expected ${Q3BSP_VERSION}`);
     }
 
     // Parse lump directory (17 lumps, 8 bytes each)

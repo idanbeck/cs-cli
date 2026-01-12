@@ -6,6 +6,7 @@ import { readFileSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { isVoiceFrame } from '../voice/types.js';
+import { debugLog } from '../utils/FileLogger.js';
 import {
   ClientMessage,
   ServerMessage,
@@ -417,7 +418,7 @@ export class GameClient {
       const message = JSON.parse(data) as ServerMessage;
       this.dispatchMessage(message);
     } catch (error) {
-      console.error('Failed to parse server message:', error);
+      debugLog('Failed to parse server message:', error);
     }
   }
 
@@ -544,7 +545,7 @@ export class GameClient {
         break;
 
       default:
-        console.warn('Unknown message type:', (message as any).type);
+        debugLog('Unknown message type:', (message as any).type);
     }
   }
 }

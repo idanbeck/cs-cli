@@ -97,6 +97,39 @@ export function getFileLogger(): FileLogger {
   return loggerInstance;
 }
 
+// Simple file-based debug log that doesn't interfere with terminal display
+// Always writes to a fixed location, useful for internal logging
+const DEBUG_LOG_DIR = path.join(os.homedir(), '.csterm', 'logs');
+const DEBUG_LOG_FILE = path.join(DEBUG_LOG_DIR, 'debug.log');
+let debugLogInitialized = false;
+
+function ensureDebugLog(): void {
+  if (!debugLogInitialized) {
+    try {
+      if (!fs.existsSync(DEBUG_LOG_DIR)) {
+        fs.mkdirSync(DEBUG_LOG_DIR, { recursive: true });
+      }
+      debugLogInitialized = true;
+    } catch {
+      // Ignore
+    }
+  }
+}
+
+/**
+ * Write a message to the debug log file (never to stdout/stderr).
+ * Use this for internal logging that shouldn't interfere with TUI/gameplay.
+ */
+export function debugLog(message: string): void {
+  ensureDebugLog();
+  try {
+    const timestamp = new Date().toISOString();
+    fs.appendFileSync(DEBUG_LOG_FILE, `[${timestamp}] ${message}\n`);
+  } catch {
+    // Silently ignore log failures
+  }
+}
+
 export function enableFileLogging(customPath?: string): string {
   const logger = getFileLogger();
   logger.enable(customPath);

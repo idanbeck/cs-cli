@@ -8,14 +8,14 @@ import { SpawnPoint } from '../maps/MapFormat.js';
 import { rayAABBIntersection } from '../physics/Collision.js';
 import { TeamId, getTeamManager } from '../game/Team.js';
 import { getDroppedWeaponManager } from '../game/DroppedWeapon.js';
-import { adjustSpawnPosition, getGlobalCollisionMesh } from '../physics/MeshCollision.js';
+import { adjustSpawnPosition, getGlobalCollisionMesh, raycastMesh, generateBlueNoiseSpawns, getSpawnFarFromEntities } from '../physics/MeshCollision.js';
 
 // Callback for tracer spawning
 export type TracerCallback = (origin: Vector3, endpoint: Vector3) => void;
 // Callback for kill registration
 export type KillCallback = (killerName: string, victimName: string, weaponName: string, headshot: boolean) => void;
-// Callback for player damage (for damage direction indicator)
-export type PlayerDamageCallback = (attackerPos: Vector3, damage: number, headshot: boolean) => void;
+// Callback for player damage (for damage direction indicator and death screen)
+export type PlayerDamageCallback = (attackerPos: Vector3, damage: number, headshot: boolean, attackerName: string, weaponName: string) => void;
 // Callback for bot sounds (shooting, hits, deaths)
 export type BotSoundCallback = (soundType: string, position: Vector3) => void;
 
@@ -94,13 +94,23 @@ export class BotManager {
   // Get a spawn point that's far from all given positions
   // Returns the spawn point with the maximum minimum distance to any entity
   getSpreadSpawnPoint(spawnPoints: Vector3[], avoidPositions: Vector3[]): Vector3 {
+    const result = this.getSpreadSpawnPointWithDistance(spawnPoints, avoidPositions);
+    return result.spawn;
+  }
+
+  // Get a spawn point that's far from all given positions, also returns the distance
+  // Returns the spawn point with the maximum minimum distance to any entity
+  getSpreadSpawnPointWithDistance(spawnPoints: Vector3[], avoidPositions: Vector3[]): { spawn: Vector3; distance: number } {
     if (spawnPoints.length === 0) {
-      return new Vector3(0, 0, 0);
+      return { spawn: new Vector3(0, 0, 0), distance: 0 };
     }
 
     if (avoidPositions.length === 0) {
       // No positions to avoid, pick random
-      return spawnPoints[Math.floor(Math.random() * spawnPoints.length)];
+      return {
+        spawn: spawnPoints[Math.floor(Math.random() * spawnPoints.length)],
+        distance: Infinity
+      };
     }
 
     // Find the spawn with maximum minimum distance to any entity
@@ -126,7 +136,38 @@ export class BotManager {
       }
     }
 
-    return bestSpawn;
+    return { spawn: bestSpawn, distance: bestMinDist };
+  }
+
+  // Generate a random position within map bounds (uses spawn point bounds)
+  getRandomMapPosition(spawnPoints: Vector3[]): Vector3 {
+    if (spawnPoints.length === 0) {
+      return new Vector3(0, 0, 0);
+    }
+
+    // Calculate bounds from spawn points
+    let minX = Infinity, maxX = -Infinity;
+    let minZ = Infinity, maxZ = -Infinity;
+    let avgY = 0;
+
+    for (const sp of spawnPoints) {
+      minX = Math.min(minX, sp.x);
+      maxX = Math.max(maxX, sp.x);
+      minZ = Math.min(minZ, sp.z);
+      maxZ = Math.max(maxZ, sp.z);
+      avgY += sp.y;
+    }
+    avgY /= spawnPoints.length;
+
+    // Add some padding to allow spawning outside spawn point area
+    const padX = (maxX - minX) * 0.3;
+    const padZ = (maxZ - minZ) * 0.3;
+
+    // Random position within expanded bounds
+    const x = minX - padX + Math.random() * (maxX - minX + 2 * padX);
+    const z = minZ - padZ + Math.random() * (maxZ - minZ + 2 * padZ);
+
+    return new Vector3(x, avgY, z);
   }
 
   // Get all entity positions (bots + optional player)
@@ -181,15 +222,31 @@ export class BotManager {
     }
 
     for (const bot of this.bots) {
-      const spawnPoints = this.getSpawnPointsForTeam(bot.team);
-      if (spawnPoints.length > 0) {
+      const teamSpawnPoints = this.getSpawnPointsForTeam(bot.team);
+      if (teamSpawnPoints.length > 0) {
         // Use spread spawning to place bots far from each other
-        const rawSpawn = this.getSpreadSpawnPoint(spawnPoints, spawnedPositions);
+        const rawSpawn = this.getSpreadSpawnPoint(teamSpawnPoints, spawnedPositions);
 
-        // Adjust spawn position for BSP collision mesh
-        const spawn = (collisionMesh && collisionMesh.triangles.length > 0)
-          ? adjustSpawnPosition(rawSpawn, collisionMesh)
-          : rawSpawn;
+        // Adjust spawn position for BSP collision mesh, trying alternatives if null
+        let spawn: Vector3 | null = null;
+        if (collisionMesh && collisionMesh.triangles.length > 0) {
+          spawn = adjustSpawnPosition(rawSpawn, collisionMesh);
+
+          // If first choice is invalid, try other spawn points
+          if (spawn === null) {
+            for (const altSpawn of teamSpawnPoints) {
+              spawn = adjustSpawnPosition(altSpawn, collisionMesh);
+              if (spawn !== null) break;
+            }
+          }
+
+          // If still null, use raw spawn as fallback
+          if (spawn === null) {
+            spawn = rawSpawn;
+          }
+        } else {
+          spawn = rawSpawn;
+        }
 
         spawnedPositions.push(spawn.clone());
 
@@ -251,19 +308,44 @@ export class BotManager {
   }
 
   // Spawn a new bot
-  spawnBot(difficulty: BotDifficulty = 'medium'): Bot {
+  spawnBot(difficulty: BotDifficulty = 'medium', playerPos?: Vector3): Bot {
     const bot = new Bot(difficulty);
 
-    // Pick a random spawn point
+    // Pick a spawn point far from existing entities
     if (this.spawnPoints.length > 0) {
-      const spawnIndex = Math.floor(Math.random() * this.spawnPoints.length);
-      const rawSpawn = this.spawnPoints[spawnIndex];
+      // Collect positions of all existing bots and player
+      const avoidPositions: Vector3[] = [];
+      for (const existingBot of this.bots) {
+        avoidPositions.push(existingBot.position.clone());
+      }
+      if (playerPos) {
+        avoidPositions.push(playerPos.clone());
+      }
 
-      // Adjust spawn position for BSP collision mesh
+      // Use spread spawning to find a spawn far from others
+      const rawSpawn = this.getSpreadSpawnPoint(this.spawnPoints, avoidPositions);
+
+      // Adjust spawn position for BSP collision mesh, trying alternatives if null
       const collisionMesh = getGlobalCollisionMesh();
-      const spawn = (collisionMesh && collisionMesh.triangles.length > 0)
-        ? adjustSpawnPosition(rawSpawn, collisionMesh)
-        : rawSpawn;
+      let spawn: Vector3 | null = null;
+      if (collisionMesh && collisionMesh.triangles.length > 0) {
+        spawn = adjustSpawnPosition(rawSpawn, collisionMesh);
+
+        // If first choice is invalid, try other spawn points
+        if (spawn === null) {
+          for (const altSpawn of this.spawnPoints) {
+            spawn = adjustSpawnPosition(altSpawn, collisionMesh);
+            if (spawn !== null) break;
+          }
+        }
+
+        // If still null, use raw spawn as fallback
+        if (spawn === null) {
+          spawn = rawSpawn;
+        }
+      } else {
+        spawn = rawSpawn;
+      }
 
       bot.position = new Vector3(spawn.x, spawn.y + bot.config.eyeHeight, spawn.z);
       bot.yaw = Math.random() * Math.PI * 2;
@@ -289,10 +371,113 @@ export class BotManager {
   }
 
   // Spawn multiple bots
-  spawnBots(count: number, difficulty: BotDifficulty = 'medium'): void {
+  spawnBots(count: number, difficulty: BotDifficulty = 'medium', playerPos?: Vector3): void {
     for (let i = 0; i < count; i++) {
-      this.spawnBot(difficulty);
+      this.spawnBot(difficulty, playerPos);
     }
+  }
+
+  // Spawn multiple bots using blue noise distribution for even spacing
+  // Use this for deathmatch initial spawns to spread players across the map
+  spawnBotsWithBlueNoise(count: number, difficulty: BotDifficulty = 'medium', playerPos?: Vector3): void {
+    const collisionMesh = getGlobalCollisionMesh();
+    if (!collisionMesh || collisionMesh.triangles.length === 0 || this.spawnPoints.length === 0) {
+      // Fall back to regular spawning
+      this.spawnBots(count, difficulty, playerPos);
+      return;
+    }
+
+    // Generate blue noise distributed spawn positions
+    // Request extra spawns to account for player position
+    const totalNeeded = count + (playerPos ? 1 : 0);
+    const blueNoiseSpawns = generateBlueNoiseSpawns(
+      this.spawnPoints,
+      collisionMesh,
+      totalNeeded + 5, // Extra buffer
+      8.0 // Minimum spacing between spawns
+    );
+
+    if (blueNoiseSpawns.length === 0) {
+      // Fall back to regular spawning
+      this.spawnBots(count, difficulty, playerPos);
+      return;
+    }
+
+    // Filter out spawns too close to player if provided
+    let availableSpawns = blueNoiseSpawns;
+    if (playerPos) {
+      const MIN_PLAYER_DISTANCE = 10.0;
+      availableSpawns = blueNoiseSpawns.filter(sp => {
+        const dx = sp.x - playerPos.x;
+        const dz = sp.z - playerPos.z;
+        return dx * dx + dz * dz >= MIN_PLAYER_DISTANCE * MIN_PLAYER_DISTANCE;
+      });
+
+      // If we filtered too many, use all spawns sorted by distance from player
+      if (availableSpawns.length < count) {
+        availableSpawns = [...blueNoiseSpawns].sort((a, b) => {
+          const distA = (a.x - playerPos.x) ** 2 + (a.z - playerPos.z) ** 2;
+          const distB = (b.x - playerPos.x) ** 2 + (b.z - playerPos.z) ** 2;
+          return distB - distA; // Furthest first
+        });
+      }
+    }
+
+    // Spawn bots at blue noise positions
+    for (let i = 0; i < count && i < availableSpawns.length; i++) {
+      const spawn = availableSpawns[i];
+      const bot = new Bot(difficulty);
+
+      bot.position = new Vector3(spawn.x, spawn.y + bot.config.eyeHeight, spawn.z);
+      bot.yaw = Math.random() * Math.PI * 2;
+
+      // Give bot weapons
+      bot.giveWeapon('pistol');
+      if (Math.random() > 0.5) {
+        bot.giveWeapon('rifle');
+        bot.selectWeapon(1);
+      } else {
+        bot.selectWeapon(2);
+      }
+
+      // Set patrol route and state
+      bot.setPatrolRoute(this.spawnPoints);
+      bot.setState('patrol', performance.now());
+
+      this.bots.push(bot);
+    }
+
+    // If we didn't have enough blue noise spawns, spawn remaining normally
+    const remaining = count - Math.min(count, availableSpawns.length);
+    if (remaining > 0) {
+      for (let i = 0; i < remaining; i++) {
+        this.spawnBot(difficulty, playerPos);
+      }
+    }
+  }
+
+  // Get a blue noise spawn position for the player
+  // Returns a spawn position that's well distributed across the map
+  getBlueNoisePlayerSpawn(): Vector3 | null {
+    const collisionMesh = getGlobalCollisionMesh();
+    if (!collisionMesh || collisionMesh.triangles.length === 0 || this.spawnPoints.length === 0) {
+      return null;
+    }
+
+    // Generate blue noise spawns
+    const blueNoiseSpawns = generateBlueNoiseSpawns(
+      this.spawnPoints,
+      collisionMesh,
+      10, // Generate several options
+      8.0
+    );
+
+    if (blueNoiseSpawns.length === 0) {
+      return null;
+    }
+
+    // Return a random one from the generated spawns
+    return blueNoiseSpawns[Math.floor(Math.random() * blueNoiseSpawns.length)];
   }
 
   // Get all bots
@@ -344,13 +529,31 @@ export class BotManager {
 
       // Safety check - respawn bot if they fell out of the world
       if (bot.position.y < -50) {
-        const spawnPoints = this.getSpawnPointsForTeam(bot.team);
-        if (spawnPoints.length > 0) {
-          const rawSpawn = spawnPoints[Math.floor(Math.random() * spawnPoints.length)];
+        const teamSpawnPoints = this.getSpawnPointsForTeam(bot.team);
+        if (teamSpawnPoints.length > 0) {
+          const rawSpawn = teamSpawnPoints[Math.floor(Math.random() * teamSpawnPoints.length)];
           const collisionMesh = getGlobalCollisionMesh();
-          const spawn = (collisionMesh && collisionMesh.triangles.length > 0)
-            ? adjustSpawnPosition(rawSpawn, collisionMesh)
-            : rawSpawn;
+
+          let spawn: Vector3 | null = null;
+          if (collisionMesh && collisionMesh.triangles.length > 0) {
+            spawn = adjustSpawnPosition(rawSpawn, collisionMesh);
+
+            // If first choice is invalid, try other spawn points
+            if (spawn === null) {
+              for (const altSpawn of teamSpawnPoints) {
+                spawn = adjustSpawnPosition(altSpawn, collisionMesh);
+                if (spawn !== null) break;
+              }
+            }
+
+            // If still null, use raw spawn as fallback
+            if (spawn === null) {
+              spawn = rawSpawn;
+            }
+          } else {
+            spawn = rawSpawn;
+          }
+
           bot.position = new Vector3(spawn.x, spawn.y + bot.config.eyeHeight, spawn.z);
           bot.verticalVelocity = 0;
         }
@@ -433,14 +636,26 @@ export class BotManager {
     }
 
     // Check what we hit (walls first for endpoint calculation)
+    // Use BSP mesh collision if available, otherwise fall back to AABB
     let wallHitPoint: Vector3 | null = null;
     let wallHitDist = maxRange;
 
-    for (const collider of colliders) {
-      const result = rayAABBIntersection(origin, direction, collider);
-      if (result.hit && result.distance < wallHitDist) {
-        wallHitDist = result.distance;
-        wallHitPoint = result.point;
+    const collisionMesh = getGlobalCollisionMesh();
+    if (collisionMesh && collisionMesh.triangles.length > 0) {
+      // Use BSP mesh raycast for accurate wall collision
+      const meshResult = raycastMesh(origin, direction, collisionMesh, maxRange);
+      if (meshResult.hit) {
+        wallHitDist = meshResult.distance;
+        wallHitPoint = meshResult.point;
+      }
+    } else {
+      // Fallback to AABB collision
+      for (const collider of colliders) {
+        const result = rayAABBIntersection(origin, direction, collider);
+        if (result.hit && result.distance < wallHitDist) {
+          wallHitDist = result.distance;
+          wallHitPoint = result.point;
+        }
       }
     }
 
@@ -494,7 +709,7 @@ export class BotManager {
       // Call player damage callback if target is the human player
       // (check if target is not a Bot - player doesn't have botConfig)
       if (this.onPlayerDamage && target === player) {
-        this.onPlayerDamage(bot.position, damage, headshot);
+        this.onPlayerDamage(bot.position, damage, headshot, bot.name, weapon.def.name);
       }
 
       // Check for kill
@@ -520,17 +735,29 @@ export class BotManager {
     // Check if enough time has passed since death
     // (using stateStartTime as death time)
     if (now - bot.stateStartTime > this.respawnDelay) {
-      // Respawn at spawn point far from other entities
-      if (this.spawnPoints.length > 0) {
-        const avoidPositions = this.getAllEntityPositions(player);
-        const rawSpawn = this.getSpreadSpawnPoint(this.spawnPoints, avoidPositions);
+      // Get all alive entity positions to spawn far from
+      const avoidPositions = this.getAllEntityPositions(player);
 
-        // Adjust spawn position for BSP collision mesh
+      // Try to use pre-computed spawn points first (maximally far from entities)
+      let spawn = getSpawnFarFromEntities(avoidPositions);
+
+      // Fallback to old method if no pre-computed spawns available
+      if (!spawn && this.spawnPoints.length > 0) {
+        const spawnResult = this.getSpreadSpawnPointWithDistance(this.spawnPoints, avoidPositions);
+        const rawSpawn = spawnResult.spawn;
+
         const collisionMesh = getGlobalCollisionMesh();
-        const spawn = (collisionMesh && collisionMesh.triangles.length > 0)
-          ? adjustSpawnPosition(rawSpawn, collisionMesh)
-          : rawSpawn;
+        if (collisionMesh && collisionMesh.triangles.length > 0) {
+          spawn = adjustSpawnPosition(rawSpawn, collisionMesh);
+          if (spawn === null) {
+            spawn = rawSpawn;
+          }
+        } else {
+          spawn = rawSpawn;
+        }
+      }
 
+      if (spawn) {
         bot.respawn(spawn, Math.random() * Math.PI * 2);
         bot.setState('idle', now);
       }

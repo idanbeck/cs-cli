@@ -5,6 +5,7 @@ import { Texture } from './Texture.js';
 import { WAD3Parser, MipTexture, ParsedWAD3 } from '../bsp/WAD3Parser.js';
 import { WAD2Parser, QuakeMipTexture, ParsedWAD2, QUAKE_PALETTE } from '../bsp/WAD2Parser.js';
 import { readFileSync } from 'fs';
+import { debugLog } from '../utils/FileLogger.js';
 
 export class TextureManager {
   private textures: Map<string, Texture> = new Map();
@@ -34,10 +35,10 @@ export class TextureManager {
       } else if (magic === 'WAD2') {
         this.loadWAD2(path, data);
       } else {
-        console.error(`Unknown WAD format: ${magic}`);
+        debugLog(`Unknown WAD format: ${magic}`);
       }
     } catch (e) {
-      console.error(`Failed to load WAD ${path}:`, e);
+      debugLog(`Failed to load WAD ${path}:`, e);
     }
   }
 
@@ -54,7 +55,7 @@ export class TextureManager {
       this.textures.set(name.toLowerCase(), texture);
     }
 
-    console.log(`Loaded WAD3: ${path} (${parsed.textures.size} textures)`);
+    debugLog(`Loaded WAD3: ${path} (${parsed.textures.size} textures)`);
   }
 
   // Load WAD2 format (Quake 1)
@@ -68,7 +69,7 @@ export class TextureManager {
       this.textures.set(name.toLowerCase(), texture);
     }
 
-    console.log(`Loaded WAD2: ${path} (${parsed.textures.size} textures)`);
+    debugLog(`Loaded WAD2: ${path} (${parsed.textures.size} textures)`);
   }
 
   // Create texture from Quake miptex using shared palette
@@ -166,9 +167,9 @@ export class TextureManager {
 
   // Debug: list all loaded textures
   listTextures(): void {
-    console.log(`TextureManager: ${this.textures.size} textures loaded`);
+    debugLog(`TextureManager: ${this.textures.size} textures loaded`);
     for (const [name, tex] of this.textures) {
-      console.log(`  ${name}: ${tex.width}x${tex.height}`);
+      debugLog(`  ${name}: ${tex.width}x${tex.height}`);
     }
   }
 

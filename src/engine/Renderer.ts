@@ -137,6 +137,8 @@ export class Renderer {
   private deathRollDirection: number = 1; // 1 or -1
   private deathFadeToRed: number = 0; // 0-1 fade amount
   private isPlayerDead: boolean = false;
+  private killerName: string | null = null;
+  private killerWeapon: string | null = null;
 
   // Team-based display data
   private playerTeam: TeamId = 'SPECTATOR';
@@ -163,6 +165,12 @@ export class Renderer {
 
   // Dropped weapons to render
   private droppedWeapons: DroppedWeapon[] = [];
+
+  // Nearby weapon for pickup prompt
+  private nearbyWeaponName: string | null = null;
+
+  // Sniper scope state
+  private isScoped: boolean = false;
 
   // Native SIMD renderer (optional, for performance)
   private nativeRenderer: NativeRenderer | null = null;
@@ -701,6 +709,9 @@ export class Renderer {
       // Render bots as billboards - drawn on top of resolved 3D scene
       this.renderBots(viewProjection);
 
+      // Render dropped weapons
+      this.renderDroppedWeapons(viewProjection);
+
       // Render bullet tracers - drawn on top of resolved 3D scene
       this.renderTracers(viewProjection);
     }
@@ -844,17 +855,80 @@ export class Renderer {
     const fg = Color.white();
     const bg = new Color(0, 0, 0, 0); // Transparent background
 
-    // Draw a simple + crosshair
-    // Horizontal line
-    this.framebuffer.setPixel(centerX - 2, centerY, '-', fg, bg);
-    this.framebuffer.setPixel(centerX - 1, centerY, '-', fg, bg);
-    this.framebuffer.setPixel(centerX, centerY, '+', fg, bg);
-    this.framebuffer.setPixel(centerX + 1, centerY, '-', fg, bg);
-    this.framebuffer.setPixel(centerX + 2, centerY, '-', fg, bg);
+    if (this.isScoped) {
+      // Draw scope overlay
+      this.drawScopeOverlay(centerX, centerY);
+    } else {
+      // Draw a simple + crosshair
+      // Horizontal line
+      this.framebuffer.setPixel(centerX - 2, centerY, '-', fg, bg);
+      this.framebuffer.setPixel(centerX - 1, centerY, '-', fg, bg);
+      this.framebuffer.setPixel(centerX, centerY, '+', fg, bg);
+      this.framebuffer.setPixel(centerX + 1, centerY, '-', fg, bg);
+      this.framebuffer.setPixel(centerX + 2, centerY, '-', fg, bg);
 
-    // Vertical line (terminal chars are ~2:1, so use fewer)
-    this.framebuffer.setPixel(centerX, centerY - 1, '|', fg, bg);
-    this.framebuffer.setPixel(centerX, centerY + 1, '|', fg, bg);
+      // Vertical line (terminal chars are ~2:1, so use fewer)
+      this.framebuffer.setPixel(centerX, centerY - 1, '|', fg, bg);
+      this.framebuffer.setPixel(centerX, centerY + 1, '|', fg, bg);
+    }
+  }
+
+  private drawScopeOverlay(centerX: number, centerY: number): void {
+    const black = Color.black();
+    const scopeColor = Color.white();
+    const bg = new Color(0, 0, 0, 0);
+
+    // Calculate scope circle radius (fit within screen)
+    const radiusX = Math.min(centerX - 2, 40);
+    const radiusY = Math.min(centerY - 2, 20);
+
+    // Draw black borders around edges (vignette effect)
+    for (let y = 0; y < this.height; y++) {
+      for (let x = 0; x < this.width; x++) {
+        // Check if pixel is outside the scope circle
+        const dx = (x - centerX) / radiusX;
+        const dy = (y - centerY) / radiusY;
+        const dist = dx * dx + dy * dy;
+
+        if (dist > 1.0) {
+          // Outside scope - make it black
+          this.framebuffer.setPixel(x, y, ' ', black, black);
+        }
+      }
+    }
+
+    // Draw scope crosshairs (finer than regular crosshair)
+    // Horizontal line across full scope
+    for (let x = centerX - radiusX; x <= centerX + radiusX; x++) {
+      const dx = (x - centerX) / radiusX;
+      if (dx * dx <= 1.0) {
+        // Draw hash marks at regular intervals
+        if (Math.abs(x - centerX) % 10 === 0 && x !== centerX) {
+          this.framebuffer.setPixel(x, centerY - 1, '|', scopeColor, bg);
+          this.framebuffer.setPixel(x, centerY, '+', scopeColor, bg);
+          this.framebuffer.setPixel(x, centerY + 1, '|', scopeColor, bg);
+        } else {
+          this.framebuffer.setPixel(x, centerY, '-', scopeColor, bg);
+        }
+      }
+    }
+
+    // Vertical line
+    for (let y = centerY - radiusY; y <= centerY + radiusY; y++) {
+      const dy = (y - centerY) / radiusY;
+      if (dy * dy <= 1.0) {
+        if (Math.abs(y - centerY) % 5 === 0 && y !== centerY) {
+          this.framebuffer.setPixel(centerX - 1, y, '-', scopeColor, bg);
+          this.framebuffer.setPixel(centerX, y, '+', scopeColor, bg);
+          this.framebuffer.setPixel(centerX + 1, y, '-', scopeColor, bg);
+        } else {
+          this.framebuffer.setPixel(centerX, y, '|', scopeColor, bg);
+        }
+      }
+    }
+
+    // Center dot
+    this.framebuffer.setPixel(centerX, centerY, '+', new Color(255, 50, 50), bg);
   }
 
   // Set HUD data (will be drawn on next render)
@@ -1042,7 +1116,15 @@ export class Renderer {
       this.deathVelocityY = 0;
       this.deathPhase = 'falling';
       this.deathFadeToRed = 0;
+      this.killerName = null;
+      this.killerWeapon = null;
     }
+  }
+
+  // Set killer info for death screen
+  setKillerInfo(killerName: string | null, weaponName: string | null): void {
+    this.killerName = killerName;
+    this.killerWeapon = weaponName;
   }
 
   // Get death camera rotations for external use
@@ -1433,6 +1515,87 @@ export class Renderer {
     }
   }
 
+  // Render dropped weapons as small boxes on the ground
+  private renderDroppedWeapons(viewProjection: Matrix4): void {
+    for (const dropped of this.droppedWeapons) {
+      // Dropped weapon dimensions
+      const boxWidth = 0.6;
+      const boxHeight = 0.3;
+
+      // Position is at ground level
+      const centerY = dropped.position.y + boxHeight / 2;
+      const weaponCenter = new Vector3(dropped.position.x, centerY, dropped.position.z);
+
+      // Check distance from camera
+      const toWeapon = Vector3.sub(weaponCenter, this.camera.position);
+      const distance = toWeapon.length();
+
+      // Skip if too close or too far
+      if (distance < 0.3 || distance > 30) continue;
+
+      // Project corners as billboard
+      const cameraRight = this.camera.getRight();
+      const halfWidth = boxWidth / 2;
+
+      const topLeft = new Vector3(
+        dropped.position.x - cameraRight.x * halfWidth,
+        dropped.position.y + boxHeight,
+        dropped.position.z - cameraRight.z * halfWidth
+      );
+      const bottomRight = new Vector3(
+        dropped.position.x + cameraRight.x * halfWidth,
+        dropped.position.y,
+        dropped.position.z + cameraRight.z * halfWidth
+      );
+
+      // Transform to NDC
+      const ndcTL = viewProjection.transformPoint(topLeft);
+      const ndcBR = viewProjection.transformPoint(bottomRight);
+
+      // Skip if behind camera
+      if (ndcTL.z < -1 && ndcBR.z < -1) continue;
+      if (ndcTL.z > 1 && ndcBR.z > 1) continue;
+
+      // Convert to screen coordinates
+      const screenTLx = Math.floor((ndcTL.x + 1) * 0.5 * this.width);
+      const screenTLy = Math.floor((1 - ndcTL.y) * 0.5 * this.height);
+      const screenBRx = Math.floor((ndcBR.x + 1) * 0.5 * this.width);
+      const screenBRy = Math.floor((1 - ndcBR.y) * 0.5 * this.height);
+
+      // Calculate bounding box on screen
+      const minX = Math.max(0, Math.min(screenTLx, screenBRx));
+      const maxX = Math.min(this.width - 1, Math.max(screenTLx, screenBRx));
+      const minY = Math.max(0, Math.min(screenTLy, screenBRy));
+      const maxY = Math.min(this.height - 1, Math.max(screenTLy, screenBRy));
+
+      // Use center depth for depth testing
+      const ndcCenter = viewProjection.transformPoint(weaponCenter);
+      const depth = ndcCenter.z;
+
+      // Color based on weapon slot (green for rifles, yellow for pistols)
+      const boxColor = dropped.slot === 1
+        ? new Color(100, 200, 100)  // Green for primary
+        : new Color(200, 200, 100); // Yellow for secondary
+
+      // Draw filled box
+      for (let y = minY; y <= maxY; y++) {
+        for (let x = minX; x <= maxX; x++) {
+          // Depth test
+          if (!this.depthBuffer.testAndSet(x, y, depth)) continue;
+          this.framebuffer.setPixel(x, y, '▪', boxColor, new Color(0, 0, 0, 0));
+        }
+      }
+
+      // Draw weapon name above
+      const labelY = minY - 1;
+      if (labelY >= 0 && distance < 15) {
+        const label = dropped.weaponName.substring(0, 8);
+        const labelX = Math.floor((minX + maxX) / 2) - Math.floor(label.length / 2);
+        this.framebuffer.drawText(labelX, labelY, label, Color.white(), new Color(0, 0, 0, 0.5));
+      }
+    }
+  }
+
   // Draw weapon sprite at bottom center of screen
   private drawWeaponSprite(): void {
     if (!this.weaponSprite || this.weaponSprite.length === 0) return;
@@ -1505,6 +1668,14 @@ export class Renderer {
     // Team scores (top center) if in team mode
     if (this.tScore > 0 || this.ctScore > 0 || this.roundNumber > 0) {
       this.drawTeamScores();
+    }
+
+    // Pickup prompt (center of screen) if near a weapon
+    if (this.nearbyWeaponName) {
+      const pickupText = `Press E to pickup ${this.nearbyWeaponName}`;
+      const pickupX = Math.floor((this.width - pickupText.length) / 2);
+      const pickupY = Math.floor(this.height / 2) + 3;
+      this.framebuffer.drawText(pickupX, pickupY, pickupText, new Color(255, 255, 100), bgDark);
     }
 
     // Note: Voice indicator is now drawn in render() outside of drawHUD()
@@ -1762,6 +1933,33 @@ export class Renderer {
         const edgeColor = new Color(Math.floor(vignetteIntensity * fade), 0, 0);
         this.framebuffer.setPixel(x, y, '░', edgeColor, new Color(0, 0, 0, 0));
         this.framebuffer.setPixel(this.width - 1 - x, y, '░', edgeColor, new Color(0, 0, 0, 0));
+      }
+    }
+
+    // Show killer info after fade starts
+    if (this.deathFadeToRed > 0.3 && this.killerName) {
+      const centerX = Math.floor(this.width / 2);
+      const centerY = Math.floor(this.height / 2);
+      const bgDark = new Color(0, 0, 0, 0.8);
+      const deathColor = new Color(200, 50, 50);
+      const killerColor = new Color(255, 100, 100);
+      const weaponColor = new Color(255, 180, 100);
+
+      // "YOU DIED" text
+      const diedText = 'YOU DIED';
+      const diedX = centerX - Math.floor(diedText.length / 2);
+      this.framebuffer.drawText(diedX, centerY - 2, diedText, deathColor, bgDark);
+
+      // "Killed by [name]" text
+      const killedByText = `Killed by ${this.killerName}`;
+      const killedByX = centerX - Math.floor(killedByText.length / 2);
+      this.framebuffer.drawText(killedByX, centerY, killedByText, killerColor, bgDark);
+
+      // "with [weapon]" text if we have weapon info
+      if (this.killerWeapon) {
+        const weaponText = `with ${this.killerWeapon}`;
+        const weaponX = centerX - Math.floor(weaponText.length / 2);
+        this.framebuffer.drawText(weaponX, centerY + 1, weaponText, weaponColor, bgDark);
       }
     }
   }
@@ -2681,6 +2879,21 @@ export class Renderer {
   // Dropped weapons
   setDroppedWeapons(weapons: DroppedWeapon[]): void {
     this.droppedWeapons = weapons;
+  }
+
+  // Set nearby weapon for pickup prompt (null if none nearby)
+  setNearbyWeapon(weaponName: string | null): void {
+    this.nearbyWeaponName = weaponName;
+  }
+
+  // Set sniper scope state
+  setScoped(scoped: boolean): void {
+    this.isScoped = scoped;
+  }
+
+  // Get sniper scope state
+  getScoped(): boolean {
+    return this.isScoped;
   }
 
   // Enter fullscreen mode

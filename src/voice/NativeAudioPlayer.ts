@@ -9,6 +9,7 @@ import { spawn, ChildProcess } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { debugLog } from '../utils/FileLogger.js';
 
 // Audio format
 const SAMPLE_RATE = 22050;
@@ -71,11 +72,11 @@ export class NativeAudioPlayer {
    * Play audio samples (16-bit signed stereo at 22050Hz)
    */
   play(samples: Int16Array): void {
-    console.log(`[NativeAudioPlayer] play() called with ${samples.length} samples`);
+    debugLog(`[NativeAudioPlayer] play() called with ${samples.length} samples`);
     // Convert Int16Array to Buffer
     const buffer = Buffer.from(samples.buffer, samples.byteOffset, samples.byteLength);
     this.audioQueue.push(buffer);
-    console.log(`[NativeAudioPlayer] Queue size: ${this.audioQueue.length}, isPlaying: ${this.isPlaying}`);
+    debugLog(`[NativeAudioPlayer] Queue size: ${this.audioQueue.length}, isPlaying: ${this.isPlaying}`);
 
     // Start playback if not already playing
     if (!this.isPlaying) {
@@ -107,7 +108,7 @@ export class NativeAudioPlayer {
     const totalLength = buffers.reduce((sum, b) => sum + b.length, 0);
     const combined = Buffer.concat(buffers, totalLength);
 
-    console.log(`[NativeAudioPlayer] processQueue: ${buffers.length} buffers, ${totalLength} bytes total`);
+    debugLog(`[NativeAudioPlayer] processQueue: ${buffers.length} buffers, ${totalLength} bytes total`);
 
     // Create WAV file
     const header = createWavHeader(combined.length);
@@ -118,7 +119,7 @@ export class NativeAudioPlayer {
 
     try {
       fs.writeFileSync(filename, wavData);
-      console.log(`[NativeAudioPlayer] Wrote ${wavData.length} bytes to ${filename}`);
+      debugLog(`[NativeAudioPlayer] Wrote ${wavData.length} bytes to ${filename}`);
 
       // Play with afplay
       const proc = spawn('afplay', [filename], {
@@ -126,7 +127,7 @@ export class NativeAudioPlayer {
         detached: true
       });
 
-      console.log(`[NativeAudioPlayer] Spawned afplay for ${filename}`);
+      debugLog(`[NativeAudioPlayer] Spawned afplay for ${filename}`);
       this.activeProcesses.add(proc);
 
       proc.on('exit', () => {
@@ -138,14 +139,14 @@ export class NativeAudioPlayer {
       });
 
       proc.on('error', (err) => {
-        console.log(`[NativeAudioPlayer] afplay error: ${err.message}`);
+        debugLog(`[NativeAudioPlayer] afplay error: ${err.message}`);
         this.activeProcesses.delete(proc);
       });
 
       // Unref so it doesn't keep process alive
       proc.unref();
     } catch (err) {
-      console.log(`[NativeAudioPlayer] Error: ${err}`);
+      debugLog(`[NativeAudioPlayer] Error: ${err}`);
     }
   }
 

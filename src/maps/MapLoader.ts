@@ -12,6 +12,7 @@ import { Q3BSPLoader, Q3BSPLoadResult } from '../bsp/Q3BSPLoader.js';
 import { TextureManager } from '../engine/TextureManager.js';
 import { readFileSync } from 'fs';
 import { CollisionMesh } from '../physics/MeshCollision.js';
+import { debugLog } from '../utils/FileLogger.js';
 
 // Q3 BSP magic number "IBSP" in little-endian
 const Q3BSP_MAGIC = 0x50534249;
@@ -137,17 +138,17 @@ export class MapLoader {
 
     if (magic === Q3BSP_MAGIC) {
       // Quake 3 BSP (IBSP)
-      console.log(`Loading Quake 3 BSP: ${bspPath} (version ${version})`);
+      debugLog(`Loading Quake 3 BSP: ${bspPath} (version ${version})`);
       const loader = new Q3BSPLoader();
       result = await loader.load(bspPath);
     } else if (magic === 29) {
       // Quake 1 BSP (version number is first, not magic)
-      console.log(`Loading Quake 1 BSP: ${bspPath}`);
+      debugLog(`Loading Quake 1 BSP: ${bspPath}`);
       const loader = new QuakeBSPLoader();
       result = await loader.load(bspPath, wadPaths);
     } else if (magic === 30) {
       // GoldSrc BSP (Half-Life/CS) - version number is first
-      console.log(`Loading GoldSrc BSP: ${bspPath}`);
+      debugLog(`Loading GoldSrc BSP: ${bspPath}`);
       const loader = new BSPLoader();
       result = await loader.load(bspPath, wadPaths);
     } else {

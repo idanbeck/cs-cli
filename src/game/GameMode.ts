@@ -48,13 +48,14 @@ export interface GameModeConfig {
 
   // Legacy deathmatch settings (for DM mode)
   respawnDelay: number;       // ms before respawn (DM only)
+  respawnBonus: number;       // Money given on respawn (DM only)
 }
 
 export const DEFAULT_COMPETITIVE_CONFIG: GameModeConfig = {
   type: 'competitive',
   roundsToWin: 7,             // First to 7 wins (MR13)
   maxRounds: 13,              // 13 rounds per half
-  freezeTime: 15,
+  freezeTime: 15,             // 15 seconds for buy phase
   roundTime: 115,
   roundEndDelay: 5,
   warmupTime: 0,
@@ -62,20 +63,22 @@ export const DEFAULT_COMPETITIVE_CONFIG: GameModeConfig = {
   friendlyFire: true,
   economy: DEFAULT_ECONOMY_CONFIG,
   respawnDelay: 0,            // No respawn in competitive
+  respawnBonus: 0,            // No respawn bonus in competitive
 };
 
 export const DEFAULT_DEATHMATCH_CONFIG: GameModeConfig = {
   type: 'deathmatch',
   roundsToWin: 10,            // First to 10 round wins
   maxRounds: 0,               // No max (no halftime)
-  freezeTime: 10,             // Shorter freeze for DM
+  freezeTime: 15,             // 15 seconds for buy phase
   roundTime: 120,
   roundEndDelay: 3,
   warmupTime: 0,
   halftimeRound: 0,           // No halftime in DM
   friendlyFire: true,
   economy: DEFAULT_ECONOMY_CONFIG,
-  respawnDelay: 3000,         // 3 second respawn in DM warmup
+  respawnDelay: 3000,         // 3 second respawn in DM
+  respawnBonus: 200,          // $200 on respawn in DM
 };
 
 // Solo mode - just walking around, no bots, no game mechanics
@@ -91,6 +94,7 @@ export const DEFAULT_SOLO_CONFIG: GameModeConfig = {
   friendlyFire: false,
   economy: DEFAULT_ECONOMY_CONFIG,
   respawnDelay: 0,
+  respawnBonus: 0,
 };
 
 export interface RoundState {
@@ -159,7 +163,7 @@ export class GameMode {
 
     // Reset round state
     this.round = {
-      roundNumber: 0,
+      roundNumber: 1,
       tScore: 0,
       ctScore: 0,
       roundWinner: null,
@@ -167,11 +171,8 @@ export class GameMode {
       mvp: null,
     };
 
-    // Start warmup phase
-    this.phase = this.config.warmupTime > 0 ? 'warmup' : 'freeze';
-    if (this.phase === 'freeze') {
-      this.round.roundNumber = 1;
-    }
+    // Start directly in freeze (buy) phase
+    this.phase = 'freeze';
   }
 
   // Start a new round (freeze phase)
@@ -236,12 +237,6 @@ export class GameMode {
     const elapsed = (now - this.phaseStartTime) / 1000;
 
     switch (this.phase) {
-      case 'warmup':
-        if (elapsed >= this.config.warmupTime) {
-          this.startRound(now);
-        }
-        break;
-
       case 'freeze':
         if (elapsed >= this.config.freezeTime) {
           this.endFreezePhase(now);
@@ -440,18 +435,17 @@ export class GameMode {
   }
 
   areBotsFrozen(): boolean {
-    return this.phase === 'freeze' || this.phase === 'warmup' ||
-           this.phase === 'round_end' || this.phase === 'halftime' ||
-           this.phase === 'match_end';
+    return this.phase === 'freeze' || this.phase === 'round_end' ||
+           this.phase === 'halftime' || this.phase === 'match_end';
   }
 
   canBuy(): boolean {
-    // In deathmatch, can buy anytime (no economy pressure)
+    // In deathmatch, can buy anytime during freeze or live
     if (this.config.type === 'deathmatch') {
-      return this.phase === 'live' || this.phase === 'warmup';
+      return this.phase === 'live' || this.phase === 'freeze';
     }
-    // In competitive, only during freeze or warmup
-    return this.phase === 'freeze' || this.phase === 'warmup';
+    // In competitive, only during freeze phase
+    return this.phase === 'freeze';
   }
 
   isRoundLive(): boolean {
@@ -470,12 +464,6 @@ export class GameMode {
     if (this.phase !== 'live') return this.config.roundTime;
     const elapsed = (now - this.phaseStartTime) / 1000;
     return Math.max(0, this.config.roundTime - elapsed);
-  }
-
-  getWarmupRemaining(now: number): number {
-    if (this.phase !== 'warmup') return 0;
-    const elapsed = (now - this.phaseStartTime) / 1000;
-    return Math.max(0, this.config.warmupTime - elapsed);
   }
 
   formatTime(seconds: number): string {
@@ -545,8 +533,8 @@ export class GameMode {
 
     if (player.isAlive) return false;
 
-    // Only respawn in warmup or DM mode
-    if (this.phase !== 'warmup' && this.config.type !== 'deathmatch') {
+    // Only respawn in DM mode during live phase
+    if (this.config.type !== 'deathmatch') {
       return false;
     }
 
@@ -569,8 +557,13 @@ export class GameMode {
     return Math.max(0, Math.ceil(remaining / 1000));
   }
 
-  onPlayerRespawn(): void {
+  onPlayerRespawn(player?: Player): void {
     this.playerDeathTime = 0;
+
+    // Award respawn bonus in deathmatch mode
+    if (player && this.config.respawnBonus > 0) {
+      player.economy.addMoney(this.config.respawnBonus);
+    }
   }
 
   // ========== MATCH CONTROL ==========

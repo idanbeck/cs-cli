@@ -6,6 +6,7 @@ import { createRequire } from 'module';
 import { fileURLToPath } from 'url';
 import path from 'path';
 import fs from 'fs';
+import { debugLog } from '../utils/FileLogger.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -106,6 +107,9 @@ interface NativeKeyboardModule {
   // Cursor capture
   setCursorCaptured(captured: boolean): boolean;
   isCursorCaptured(): boolean;
+  // Stderr suppression (for native audio libraries)
+  suppressStderr(): boolean;
+  restoreStderr(): boolean;
 }
 
 let nativeModule: NativeKeyboardModule | null = null;
@@ -113,7 +117,8 @@ let useNative = false;
 
 // Try to load native module
 export function initNativeKeyboard(): boolean {
-  if (nativeModule) return useNative;
+  // If already running, return true
+  if (useNative && nativeModule) return true;
 
   try {
     // __dirname in compiled JS is dist/input, so go up to project root
@@ -121,21 +126,24 @@ export function initNativeKeyboard(): boolean {
     const modulePath = path.join(projectRoot, 'native/build/Release/keyboard.node');
 
     if (!fs.existsSync(modulePath)) {
-      console.warn(`Native keyboard module not found at: ${modulePath}`);
+      debugLog(`Native keyboard module not found at: ${modulePath}`);
       return false;
     }
 
-    nativeModule = require(modulePath) as NativeKeyboardModule;
+    // Load module if not already loaded (might have been loaded by suppressStderr)
+    if (!nativeModule) {
+      nativeModule = require(modulePath) as NativeKeyboardModule;
+    }
 
     if (nativeModule.start()) {
       useNative = true;
       return true;
     } else {
-      console.warn('Native keyboard failed to start (need accessibility permissions?)');
+      debugLog('Native keyboard failed to start (need accessibility permissions?)');
       return false;
     }
   } catch (e: any) {
-    console.warn('Native keyboard error:', e.message);
+    debugLog('Native keyboard error:', e.message);
     return false;
   }
 }
@@ -312,4 +320,59 @@ export function setNativeCursorCaptured(captured: boolean): boolean {
 export function isNativeCursorCaptured(): boolean {
   if (!useNative || !nativeModule) return false;
   return nativeModule.isCursorCaptured();
+}
+
+// ============ Native Stderr Suppression ============
+// Used to suppress stderr from native audio libraries (portaudio, etc.)
+// This uses dup2() at the OS level to redirect fd 2 to /dev/null
+
+/**
+ * Load native module without starting keyboard (just for stderr suppression)
+ */
+function ensureNativeModuleLoaded(): boolean {
+  if (nativeModule) return true;
+
+  try {
+    const projectRoot = path.resolve(__dirname, '../..');
+    const modulePath = path.join(projectRoot, 'native/build/Release/keyboard.node');
+
+    if (!fs.existsSync(modulePath)) {
+      return false;
+    }
+
+    nativeModule = require(modulePath) as NativeKeyboardModule;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Suppress stderr at the OS level using dup2.
+ * This captures stderr from native C code that bypasses Node.js.
+ * Returns true if suppression was successful or already active.
+ */
+export function nativeSuppressStderr(): boolean {
+  // Try to load native module if not already loaded
+  if (!nativeModule && !ensureNativeModuleLoaded()) {
+    return false;
+  }
+  try {
+    return nativeModule!.suppressStderr();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Restore stderr to its original destination.
+ * Call this if you need to see stderr output again.
+ */
+export function nativeRestoreStderr(): boolean {
+  if (!nativeModule) return false;
+  try {
+    return nativeModule.restoreStderr();
+  } catch {
+    return false;
+  }
 }

@@ -9,6 +9,7 @@ import { readFile, writeFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
+import { debugLog } from '../utils/FileLogger.js';
 
 // Settings file path
 const SETTINGS_DIR = join(homedir(), '.csterm');
@@ -57,7 +58,7 @@ export async function loadVoiceSettings(): Promise<VoiceSettings> {
       voiceSpatialEnabled: settings.voiceSpatialEnabled ?? DEFAULT_VOICE_SETTINGS.voiceSpatialEnabled,
     };
   } catch (error) {
-    console.warn('[VoiceSettings] Failed to load settings:', error);
+    debugLog('[VoiceSettings] Failed to load settings:', error);
     return { ...DEFAULT_VOICE_SETTINGS };
   }
 }
@@ -115,7 +116,7 @@ export async function saveVoiceSettings(voiceSettings: Partial<VoiceSettings>): 
     // Write settings
     await writeFile(SETTINGS_FILE, JSON.stringify(settings, null, 2));
   } catch (error) {
-    console.error('[VoiceSettings] Failed to save settings:', error);
+    debugLog('[VoiceSettings] Failed to save settings:', error);
   }
 }
 

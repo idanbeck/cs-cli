@@ -110,10 +110,11 @@ export class DroppedWeaponManager {
 
   // Convert dropped weapon back to WeaponState for pickup
   toWeaponState(dropped: DroppedWeapon): WeaponState | null {
-    const def = WEAPONS[dropped.weaponName.toLowerCase()];
+    const weaponKey = dropped.weaponName.toLowerCase();
+    const def = WEAPONS[weaponKey];
     if (!def) return null;
 
-    const state = createWeaponState(dropped.weaponName);
+    const state = createWeaponState(weaponKey);
     if (!state) return null;
 
     state.currentAmmo = dropped.currentAmmo;

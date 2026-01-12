@@ -6,6 +6,7 @@
  */
 
 import { appendFileSync, writeFileSync } from 'fs';
+import { suppressStderr } from '../audio/SoundEngine.js';
 
 // Speaker is optional - dynamically loaded
 let SpeakerClass: any = null;
@@ -15,6 +16,7 @@ async function loadSpeaker(): Promise<boolean> {
   if (speakerLoaded) return SpeakerClass !== null;
   speakerLoaded = true;
   try {
+    await suppressStderr(); // Suppress portaudio stderr output
     const mod = await import('speaker');
     SpeakerClass = mod.default;
     return true;

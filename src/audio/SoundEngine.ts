@@ -7,10 +7,40 @@ import { Readable, Writable } from 'stream';
 let SpeakerClass: any = null;
 let speakerLoaded = false;
 
+// Suppress native stderr output (C code writes directly to fd 2)
+// We redirect fd 2 to /dev/null at the OS level
+let stderrSuppressed = false;
+
+export async function suppressStderr(): Promise<void> {
+  if (stderrSuppressed) return;
+  stderrSuppressed = true;
+
+  try {
+    // Method 1: Try native dup2-based suppression (works for C code writing to fd 2)
+    // This is the only reliable way to suppress native audio library output
+    try {
+      const { nativeSuppressStderr } = await import('../input/NativeKeyboard.js');
+      nativeSuppressStderr();
+    } catch {
+      // Native module not available, fall through to JS-level suppression
+    }
+
+    // Method 2: Suppress Node.js stderr as backup
+    process.stderr.write = (() => true) as any;
+  } catch {
+    // Ignore errors
+  }
+}
+
+export function restoreStderr(): void {
+  // Keep suppressed for the session
+}
+
 async function loadSpeaker(): Promise<boolean> {
   if (speakerLoaded) return SpeakerClass !== null;
   speakerLoaded = true;
   try {
+    await suppressStderr(); // Suppress during import
     const mod = await import('speaker');
     SpeakerClass = mod.default;
     return true;

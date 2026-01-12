@@ -11,6 +11,7 @@
  */
 
 import { Vector3 } from '../engine/math/Vector3.js';
+import { debugLog } from '../utils/FileLogger.js';
 import {
   VoiceSettings,
   DEFAULT_VOICE_SETTINGS,
@@ -478,7 +479,7 @@ export class VoiceManager {
       try {
         callback(event);
       } catch (error) {
-        console.error('[VoiceManager] Event callback error:', error);
+        debugLog('[VoiceManager] Event callback error:', error);
       }
     }
   }
