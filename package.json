@@ -1,6 +1,6 @@
 {
   "name": "csterm",
-  "version": "1.0.19",
+  "version": "1.0.20",
   "description": "Counter-Strike in your terminal - true 3D FPS with software rendering",
   "type": "module",
   "main": "dist/index.js",
