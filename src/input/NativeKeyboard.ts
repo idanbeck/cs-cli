@@ -69,6 +69,7 @@ export const GameKeyMap = {
   B: MacKeyCode.B,         // Buy menu
   C: MacKeyCode.C,         // Toggle mouse capture
   P: MacKeyCode.P,         // Possess bot (single player)
+  M: MacKeyCode.M,         // Money cheat (single player)
   Tab: MacKeyCode.Tab,     // Scoreboard
   Escape: MacKeyCode.Escape,
   Q: MacKeyCode.Q,         // Quit

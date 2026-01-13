@@ -2929,6 +2929,13 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
           }
         }
       }
+
+      // M for money cheat (single player only) - stdin fallback
+      if (key === 'm' && !useNative && !isMultiplayerRef.current && appModeRef.current === 'playing') {
+        const player = playerRef.current;
+        player.economy.addMoney(5000);
+        consoleLog(`+$5000 (Total: $${player.economy.getMoney()})`);
+      }
     };
 
     // Enable mouse tracking (user must click to capture)
@@ -3221,6 +3228,13 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
               consoleLog('No alive teammates to possess');
             }
           }
+        }
+
+        // M for money cheat (single player only)
+        if (wasGameKeyJustPressed('M') && !isMultiplayerRef.current && appModeRef.current === 'playing') {
+          const player = playerRef.current;
+          player.economy.addMoney(5000);
+          consoleLog(`+$5000 (Total: $${player.economy.getMoney()})`);
         }
 
         if (wasGameKeyJustPressed('E')) {
