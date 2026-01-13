@@ -73,6 +73,21 @@ export class Bot extends Player {
   public stuckRecoveryDir: Vector3 | null = null;  // Direction to move when stuck
   public stuckRecoveryUntil: number = 0;  // Time until stuck recovery ends
 
+  // Momentum-based movement
+  public velocity: Vector3 = Vector3.zero();  // Current movement velocity (persists between frames)
+  public wantsToJump: boolean = false;  // Flag to trigger jump
+  public lastMoveCheck: Vector3 = Vector3.zero();  // Position at last movement check
+  public stuckFrames: number = 0;  // How many frames we've been stuck
+  public smoothedAngle: number = 0;  // EMA-smoothed movement direction (radians)
+  public hasInitializedAngle: boolean = false;  // Whether we've set initial angle
+
+  // Distance-based stuck detection
+  public lastStuckCheckTime: number = 0;  // When we last measured distance
+  public lastStuckCheckPos: Vector3 = Vector3.zero();  // Position at last stuck check
+  public escapeDirection: number | null = null;  // Committed escape angle (radians)
+  public escapeUntil: number = 0;  // Time until escape direction expires
+  public escapeAttempt: number = 0;  // Which escape direction we're trying (0-7)
+
   constructor(
     difficulty: BotDifficulty = 'medium',
     playerConfig: PlayerConfig = DEFAULT_PLAYER_CONFIG
@@ -202,6 +217,56 @@ export class Bot extends Player {
   generateRandomEscapeDirection(): Vector3 {
     const angle = Math.random() * Math.PI * 2;
     return new Vector3(Math.cos(angle), 0, Math.sin(angle));
+  }
+
+  // Set velocity toward a direction at given speed
+  setVelocity(direction: Vector3, speed: number): void {
+    const dir = direction.normalize();
+    this.velocity = new Vector3(dir.x * speed, 0, dir.z * speed);
+  }
+
+  // Set velocity toward a position at given speed
+  setVelocityToward(targetPos: Vector3, speed: number): void {
+    const dir = Vector3.sub(targetPos, this.position);
+    dir.y = 0;
+    if (dir.length() > 0.1) {
+      this.setVelocity(dir, speed);
+    }
+  }
+
+  // Pick a random direction and go
+  setRandomVelocity(speed: number): void {
+    const angle = Math.random() * Math.PI * 2;
+    this.velocity = new Vector3(Math.sin(angle) * speed, 0, Math.cos(angle) * speed);
+  }
+
+  // Rotate velocity by angle (for obstacle avoidance)
+  rotateVelocity(angle: number): void {
+    const cos = Math.cos(angle);
+    const sin = Math.sin(angle);
+    const newX = this.velocity.x * cos - this.velocity.z * sin;
+    const newZ = this.velocity.x * sin + this.velocity.z * cos;
+    this.velocity.x = newX;
+    this.velocity.z = newZ;
+  }
+
+  // Check if we're actually moving (position changed since last check)
+  checkIfMoving(): boolean {
+    const moved = Vector3.sub(this.position, this.lastMoveCheck).length();
+    this.lastMoveCheck = this.position.clone();
+
+    if (moved < 0.05) {
+      this.stuckFrames++;
+      return false;
+    } else {
+      this.stuckFrames = 0;
+      return true;
+    }
+  }
+
+  // Get current speed
+  getSpeed(): number {
+    return Math.sqrt(this.velocity.x * this.velocity.x + this.velocity.z * this.velocity.z);
   }
 
   // Get next patrol waypoint

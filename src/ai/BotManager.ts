@@ -9,6 +9,7 @@ import { rayAABBIntersection } from '../physics/Collision.js';
 import { TeamId, getTeamManager } from '../game/Team.js';
 import { getDroppedWeaponManager } from '../game/DroppedWeapon.js';
 import { adjustSpawnPosition, getGlobalCollisionMesh, raycastMesh, generateBlueNoiseSpawns, getSpawnFarFromEntities } from '../physics/MeshCollision.js';
+import { debugLog } from '../utils/FileLogger.js';
 
 // Callback for tracer spawning
 export type TracerCallback = (origin: Vector3, endpoint: Vector3) => void;
@@ -64,6 +65,9 @@ export class BotManager {
     this.ctSpawnPoints = [];
     this.spawnPoints = [];
 
+    // First pass: collect dedicated T/CT spawns and gather DM spawns
+    const dmSpawns: Vector3[] = [];
+
     for (const s of spawns) {
       const pos = new Vector3(s.position[0], s.position[1], s.position[2]);
       if (s.team === 'T') {
@@ -71,10 +75,38 @@ export class BotManager {
       } else if (s.team === 'CT') {
         this.ctSpawnPoints.push(pos);
       } else {
-        // DM spawns go to both
+        // DM spawns collected separately
         this.spawnPoints.push(pos);
-        this.tSpawnPoints.push(pos);
-        this.ctSpawnPoints.push(pos);
+        dmSpawns.push(pos);
+      }
+    }
+
+    // If we have dedicated T/CT spawns, don't use DM spawns for teams
+    // If we only have DM spawns, split them geographically between teams
+    if (this.tSpawnPoints.length === 0 && this.ctSpawnPoints.length === 0 && dmSpawns.length > 0) {
+      // Sort DM spawns by X coordinate to geographically split them
+      const sorted = [...dmSpawns].sort((a, b) => a.x - b.x);
+      const midpoint = Math.ceil(sorted.length / 2);
+
+      // First half goes to T, second half goes to CT
+      for (let i = 0; i < sorted.length; i++) {
+        if (i < midpoint) {
+          this.tSpawnPoints.push(sorted[i]);
+        } else {
+          this.ctSpawnPoints.push(sorted[i]);
+        }
+      }
+      console.log(`[BotManager] Split ${dmSpawns.length} DM spawns: T=${this.tSpawnPoints.length}, CT=${this.ctSpawnPoints.length}`);
+    } else {
+      console.log(`[BotManager] Team spawns: T=${this.tSpawnPoints.length}, CT=${this.ctSpawnPoints.length}, DM=${dmSpawns.length}`);
+      // Log first spawn of each team for debugging
+      if (this.tSpawnPoints.length > 0) {
+        const t = this.tSpawnPoints[0];
+        console.log(`[BotManager] T spawn example: ${t.x.toFixed(1)}, ${t.z.toFixed(1)}`);
+      }
+      if (this.ctSpawnPoints.length > 0) {
+        const ct = this.ctSpawnPoints[0];
+        console.log(`[BotManager] CT spawn example: ${ct.x.toFixed(1)}, ${ct.z.toFixed(1)}`);
       }
     }
   }
@@ -189,16 +221,22 @@ export class BotManager {
     const teamManager = getTeamManager();
     const botNames = this.bots.map(b => b.name);
 
+    debugLog(`[BotManager] assignBotsToTeams: ${botNames.length} bots to assign`);
+
     // Auto-balance teams (player + bots)
     teamManager.autoBalance(playerName, botNames);
 
     // Update bot team assignments
+    let tCount = 0, ctCount = 0;
     for (const bot of this.bots) {
       const team = teamManager.getTeam(bot.name);
       if (team) {
         bot.team = team;
+        if (team === 'T') tCount++;
+        else if (team === 'CT') ctCount++;
       }
     }
+    debugLog(`[BotManager] assignBotsToTeams complete: T=${tCount}, CT=${ctCount}`);
   }
 
   // Execute buy phase for all bots
@@ -210,50 +248,106 @@ export class BotManager {
     }
   }
 
+  // Track player's spawn point to exclude from bot spawning
+  private playerSpawnPoint: Vector3 | null = null;
+
+  // Set which spawn point the player used (call before respawnAllBots)
+  setPlayerSpawnPoint(spawn: Vector3 | null): void {
+    this.playerSpawnPoint = spawn ? spawn.clone() : null;
+  }
+
   // Respawn all bots for a new round (with spread spawning)
+  // CRITICAL: Each spawn point should only be used ONCE per team
   respawnAllBots(now: number, player?: Player): void {
-    // Track positions as we spawn to spread bots out
-    const spawnedPositions: Vector3[] = [];
     const collisionMesh = getGlobalCollisionMesh();
+
+    // Separate bots by team
+    const tBots = this.bots.filter(b => b.team === 'T');
+    const ctBots = this.bots.filter(b => b.team === 'CT');
+
+    debugLog(`[BotManager] respawnAllBots: totalBots=${this.bots.length}, T=${tBots.length}, CT=${ctBots.length}`);
+
+    // Get COPIES of spawn points so we can remove used ones
+    let availableTSpawns = [...this.tSpawnPoints];
+    let availableCTSpawns = [...this.ctSpawnPoints];
+
+    // Remove player's spawn point from their team's available spawns
+    if (this.playerSpawnPoint && player) {
+      const playerTeamSpawns = player.team === 'T' ? availableTSpawns : availableCTSpawns;
+      const MIN_DIST = 2.0; // Consider spawns within 2 units as "same spawn"
+      const idxToRemove = playerTeamSpawns.findIndex(sp => {
+        const dx = sp.x - this.playerSpawnPoint!.x;
+        const dz = sp.z - this.playerSpawnPoint!.z;
+        return Math.sqrt(dx * dx + dz * dz) < MIN_DIST;
+      });
+      if (idxToRemove >= 0) {
+        playerTeamSpawns.splice(idxToRemove, 1);
+      }
+    }
+
+    // Track all used positions for spread calculation
+    const usedPositions: Vector3[] = [];
 
     // Include player position if provided
     if (player && player.isAlive) {
-      spawnedPositions.push(player.position.clone());
+      usedPositions.push(player.position.clone());
     }
 
-    for (const bot of this.bots) {
-      const teamSpawnPoints = this.getSpawnPointsForTeam(bot.team);
-      if (teamSpawnPoints.length > 0) {
-        // Use spread spawning to place bots far from each other
-        const rawSpawn = this.getSpreadSpawnPoint(teamSpawnPoints, spawnedPositions);
+    // Helper to spawn a bot at a unique position from available spawns
+    const spawnBotAtUnique = (bot: Bot, availableSpawns: Vector3[]): void => {
+      if (availableSpawns.length === 0) return;
 
-        // Adjust spawn position for BSP collision mesh, trying alternatives if null
-        let spawn: Vector3 | null = null;
-        if (collisionMesh && collisionMesh.triangles.length > 0) {
-          spawn = adjustSpawnPosition(rawSpawn, collisionMesh);
+      // Find best spawn (furthest from used positions)
+      let bestIdx = 0;
+      let bestMinDist = -1;
 
-          // If first choice is invalid, try other spawn points
-          if (spawn === null) {
-            for (const altSpawn of teamSpawnPoints) {
-              spawn = adjustSpawnPosition(altSpawn, collisionMesh);
-              if (spawn !== null) break;
-            }
-          }
+      for (let i = 0; i < availableSpawns.length; i++) {
+        const spawn = availableSpawns[i];
+        let minDist = Infinity;
 
-          // If still null, use raw spawn as fallback
-          if (spawn === null) {
-            spawn = rawSpawn;
-          }
-        } else {
-          spawn = rawSpawn;
+        for (const pos of usedPositions) {
+          const dx = spawn.x - pos.x;
+          const dz = spawn.z - pos.z;
+          const dist = Math.sqrt(dx * dx + dz * dz);
+          if (dist < minDist) minDist = dist;
         }
 
-        spawnedPositions.push(spawn.clone());
-
-        // keepInventory = true if bot was alive, false if dead
-        bot.respawn(spawn, Math.random() * Math.PI * 2, bot.isAlive);
-        bot.setState('idle', now);
+        if (minDist > bestMinDist) {
+          bestMinDist = minDist;
+          bestIdx = i;
+        }
       }
+
+      // Remove the chosen spawn from available list (prevent reuse!)
+      const rawSpawn = availableSpawns.splice(bestIdx, 1)[0];
+
+      // Adjust spawn position for BSP collision mesh
+      let spawn: Vector3 = rawSpawn;
+      if (collisionMesh && collisionMesh.triangles.length > 0) {
+        const adjusted = adjustSpawnPosition(rawSpawn, collisionMesh);
+        if (adjusted) spawn = adjusted;
+      }
+
+      usedPositions.push(spawn.clone());
+      bot.respawn(spawn, Math.random() * Math.PI * 2, bot.isAlive);
+    };
+
+    // Spawn T bots at T spawns, patrol towards CT spawns
+    for (const bot of tBots) {
+      spawnBotAtUnique(bot, availableTSpawns);
+      console.log(`[Spawn] Bot ${bot.name} (T) at: ${bot.position.x.toFixed(1)}, ${bot.position.z.toFixed(1)}`);
+      // Set patrol route towards enemy spawns so bots hunt enemies
+      bot.setPatrolRoute(this.ctSpawnPoints.length > 0 ? this.ctSpawnPoints : this.spawnPoints);
+      bot.setState('patrol', now);
+    }
+
+    // Spawn CT bots at CT spawns, patrol towards T spawns
+    for (const bot of ctBots) {
+      spawnBotAtUnique(bot, availableCTSpawns);
+      console.log(`[Spawn] Bot ${bot.name} (CT) at: ${bot.position.x.toFixed(1)}, ${bot.position.z.toFixed(1)}`);
+      // Set patrol route towards enemy spawns so bots hunt enemies
+      bot.setPatrolRoute(this.tSpawnPoints.length > 0 ? this.tSpawnPoints : this.spawnPoints);
+      bot.setState('patrol', now);
     }
   }
 
@@ -372,9 +466,11 @@ export class BotManager {
 
   // Spawn multiple bots
   spawnBots(count: number, difficulty: BotDifficulty = 'medium', playerPos?: Vector3): void {
+    const beforeCount = this.bots.length;
     for (let i = 0; i < count; i++) {
       this.spawnBot(difficulty, playerPos);
     }
+    debugLog(`[BotManager] spawnBots: requested=${count}, before=${beforeCount}, after=${this.bots.length}`);
   }
 
   // Spawn multiple bots using blue noise distribution for even spacing
@@ -497,7 +593,8 @@ export class BotManager {
     now: number,
     deltaTime: number,
     isFrozen: boolean = false,
-    teamMode: boolean = false
+    teamMode: boolean = false,
+    possessedBot: Bot | null = null // Bot being controlled by player (skip AI)
   ): void {
     const ctx: BotThinkContext = {
       player,
@@ -518,6 +615,24 @@ export class BotManager {
         continue;
       }
 
+      // Skip AI for possessed bot - player controls it directly
+      // But still check for falling through floor
+      if (bot === possessedBot) {
+        // Safety check for possessed bot falling through floor
+        if (bot.position.y < -10) {
+          const teamSpawnPoints = this.getSpawnPointsForTeam(bot.team);
+          if (teamSpawnPoints.length > 0) {
+            const rawSpawn = teamSpawnPoints[Math.floor(Math.random() * teamSpawnPoints.length)];
+            const collisionMesh = getGlobalCollisionMesh();
+            let spawn = collisionMesh ? adjustSpawnPosition(rawSpawn, collisionMesh) : rawSpawn;
+            if (!spawn) spawn = rawSpawn;
+            bot.position = new Vector3(spawn.x, spawn.y + bot.config.eyeHeight, spawn.z);
+            bot.verticalVelocity = 0;
+          }
+        }
+        continue;
+      }
+
       // Run AI and get new position
       const newPos = BotBrain.think(bot, ctx);
       if (newPos.x !== 0 || newPos.y !== 0 || newPos.z !== 0) {
@@ -528,7 +643,8 @@ export class BotManager {
       this.snapToGround(bot, colliders);
 
       // Safety check - respawn bot if they fell out of the world
-      if (bot.position.y < -50) {
+      // Use -10 as threshold - most maps have floors at y >= 0
+      if (bot.position.y < -10) {
         const teamSpawnPoints = this.getSpawnPointsForTeam(bot.team);
         if (teamSpawnPoints.length > 0) {
           const rawSpawn = teamSpawnPoints[Math.floor(Math.random() * teamSpawnPoints.length)];

@@ -1,6 +1,8 @@
 // Team management for CS-style game
 // Handles team assignments, balance, and scoring
 
+import { debugLog } from '../../utils/FileLogger.js';
+
 export type TeamId = 'T' | 'CT' | 'SPECTATOR';
 
 export interface TeamConfig {
@@ -16,7 +18,7 @@ export const TEAMS: Record<TeamId, TeamConfig> = {
     id: 'T',
     name: 'Terrorists',
     shortName: 'T',
-    color: [255, 180, 80],  // Orange
+    color: [255, 80, 80],   // Red
     spawnFilter: 'T',
   },
   CT: {
@@ -110,48 +112,65 @@ export class TeamManager {
     return team1 !== team2;
   }
 
-  // Auto-balance: assign player and bots to teams
-  // Player gets random team, bots fill to balance
+  // Auto-balance: assign bots to teams to create equal teams
+  // Player's team should already be assigned before calling this
   autoBalance(playerName: string, botNames: string[]): void {
-    // Clear existing assignments
-    this.assignments.clear();
-
-    // Randomly assign player to T or CT
-    const playerTeam: TeamId = Math.random() < 0.5 ? 'T' : 'CT';
-    this.assignToTeam(playerName, playerTeam);
-
-    // Distribute bots evenly
-    const totalBots = botNames.length;
-    const botsPerTeam = Math.floor(totalBots / 2);
-    const extraBot = totalBots % 2;
-
-    // Determine how many bots go to each team
-    // Give extra bot to team without player if odd number
-    let tBots = botsPerTeam;
-    let ctBots = botsPerTeam;
-
-    if (extraBot > 0) {
-      // Add extra bot to smaller team (opposite of player)
-      if (playerTeam === 'T') {
-        ctBots++;
-      } else {
-        tBots++;
-      }
+    // Get player's already-assigned team (don't override it!)
+    const playerTeam = this.getTeam(playerName);
+    if (!playerTeam || playerTeam === 'SPECTATOR') {
+      // Player team not assigned before autoBalance - skip
+      debugLog(`[Team] autoBalance: Player team not set (${playerTeam}), skipping`);
+      return;
     }
+
+    // Calculate total players per team for balance
+    // For 4v4: player + 7 bots = 8 total, 4 per team
+    const totalPlayers = 1 + botNames.length; // player + bots
+    const playersPerTeam = Math.ceil(totalPlayers / 2);
+
+    // Player counts as 1 on their team
+    // So we need (playersPerTeam - 1) bots on player's team
+    // And playersPerTeam bots on enemy team
+    const botsNeededOnPlayerTeam = playersPerTeam - 1;
+    const botsNeededOnEnemyTeam = totalPlayers - playersPerTeam;
+
+    let tBots: number;
+    let ctBots: number;
+
+    if (playerTeam === 'T') {
+      tBots = botsNeededOnPlayerTeam;
+      ctBots = botsNeededOnEnemyTeam;
+    } else {
+      tBots = botsNeededOnEnemyTeam;
+      ctBots = botsNeededOnPlayerTeam;
+    }
+
+    debugLog(`[Team] autoBalance: player=${playerName} (${playerTeam}), botCount=${botNames.length}, total=${totalPlayers}, perTeam=${playersPerTeam}`);
+    debugLog(`[Team] autoBalance: botsNeededOnPlayerTeam=${botsNeededOnPlayerTeam}, botsNeededOnEnemyTeam=${botsNeededOnEnemyTeam}`);
+    debugLog(`[Team] autoBalance: assigning tBots=${tBots}, ctBots=${ctBots}`);
 
     // Assign bots
     let tAssigned = 0;
     let ctAssigned = 0;
+    const tBotNames: string[] = [];
+    const ctBotNames: string[] = [];
 
     for (const botName of botNames) {
       if (tAssigned < tBots) {
         this.assignToTeam(botName, 'T');
+        tBotNames.push(botName);
         tAssigned++;
       } else {
         this.assignToTeam(botName, 'CT');
+        ctBotNames.push(botName);
         ctAssigned++;
       }
     }
+
+    // Final team totals
+    const tTotal = playerTeam === 'T' ? tAssigned + 1 : tAssigned;
+    const ctTotal = playerTeam === 'CT' ? ctAssigned + 1 : ctAssigned;
+    debugLog(`[Team] autoBalance complete: T=${tTotal} (${tAssigned} bots: ${tBotNames.join(', ')}), CT=${ctTotal} (${ctAssigned} bots: ${ctBotNames.join(', ')})`);
   }
 
   // Swap all team assignments (for halftime)

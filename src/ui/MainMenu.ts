@@ -12,7 +12,7 @@ export type TextureFilterMode = 'normal' | 'pixelated' | 'blockavg';
 // Settings tab types
 export type SettingsTab = 'controls' | 'graphics' | 'audio' | 'network';
 
-export type MenuScreen = 'main' | 'mode_select' | 'map_select' | 'settings' | 'help';
+export type MenuScreen = 'main' | 'mode_select' | 'team_select' | 'map_select' | 'settings' | 'help';
 
 export interface MapInfo {
   id: string;
@@ -21,10 +21,13 @@ export interface MapInfo {
   supportedModes: GameModeType[];
 }
 
+export type TeamSelection = 'T' | 'CT' | 'random';
+
 export interface MainMenuState {
   screen: MenuScreen;
   selectedIndex: number;
   selectedMode: GameModeType;
+  selectedTeam: TeamSelection;
   selectedMap: string;
 }
 
@@ -239,9 +242,15 @@ export class MainMenu {
     'Press any key to go back...',
   ];
   private modeMenuItems: { label: string; mode: GameModeType }[] = [
-    { label: 'Solo (Explore)', mode: 'solo' },
-    { label: 'Deathmatch (FFA)', mode: 'deathmatch' },
     { label: 'Competitive (Team)', mode: 'competitive' },
+    { label: 'Deathmatch (FFA)', mode: 'deathmatch' },
+    { label: 'Solo (Explore)', mode: 'solo' },
+  ];
+
+  private teamMenuItems: { label: string; team: TeamSelection }[] = [
+    { label: 'Terrorists (T)', team: 'T' },
+    { label: 'Counter-Terrorists (CT)', team: 'CT' },
+    { label: 'Random', team: 'random' },
   ];
 
   // Settings menu items organized by tab
@@ -287,8 +296,9 @@ export class MainMenu {
     this.state = {
       screen: 'main',
       selectedIndex: 0,
-      selectedMode: 'solo',  // Default to solo for easier testing
-      selectedMap: 'de_dust2',  // Default to dust2 if available
+      selectedMode: 'competitive',  // Default to team mode (first in list)
+      selectedTeam: 'random',       // Default to random team
+      selectedMap: 'de_dust2',      // Default to dust2 if available
     };
     // Load persisted settings from disk
     const savedSettings = loadSettingsFromDisk();
@@ -330,6 +340,8 @@ export class MainMenu {
         return this.mainMenuItems;
       case 'mode_select':
         return this.modeMenuItems.map(m => m.label);
+      case 'team_select':
+        return this.teamMenuItems.map(t => t.label);
       case 'map_select':
         return this.getAvailableMaps().map(m => m.name);
       case 'settings':
@@ -461,12 +473,14 @@ export class MainMenu {
   }
 
   // Selection - returns true if game should start
-  select(): { action: 'start_game' | 'quit' | 'navigate' | 'back' | 'multiplayer'; mode?: GameModeType; map?: string } {
+  select(): { action: 'start_game' | 'quit' | 'navigate' | 'back' | 'multiplayer'; mode?: GameModeType; map?: string; team?: TeamSelection } {
     switch (this.state.screen) {
       case 'main':
         return this.handleMainSelect();
       case 'mode_select':
         return this.handleModeSelect();
+      case 'team_select':
+        return this.handleTeamSelect();
       case 'map_select':
         return this.handleMapSelect();
       case 'settings':
@@ -507,6 +521,22 @@ export class MainMenu {
     const mode = this.modeMenuItems[this.state.selectedIndex];
     if (mode) {
       this.state.selectedMode = mode.mode;
+      // Competitive mode goes to team selection first
+      if (mode.mode === 'competitive') {
+        this.state.screen = 'team_select';
+      } else {
+        this.state.screen = 'map_select';
+      }
+      this.state.selectedIndex = 0;
+      this.scrollOffset = 0;
+    }
+    return { action: 'navigate' };
+  }
+
+  private handleTeamSelect(): { action: 'start_game' | 'quit' | 'navigate' | 'back'; mode?: GameModeType; map?: string; team?: TeamSelection } {
+    const team = this.teamMenuItems[this.state.selectedIndex];
+    if (team) {
+      this.state.selectedTeam = team.team;
       this.state.screen = 'map_select';
       this.state.selectedIndex = 0;
       this.scrollOffset = 0;
@@ -514,7 +544,7 @@ export class MainMenu {
     return { action: 'navigate' };
   }
 
-  private handleMapSelect(): { action: 'start_game' | 'quit' | 'navigate' | 'back'; mode?: GameModeType; map?: string } {
+  private handleMapSelect(): { action: 'start_game' | 'quit' | 'navigate' | 'back'; mode?: GameModeType; map?: string; team?: TeamSelection } {
     const maps = this.getAvailableMaps();
     const selectedMap = maps[this.state.selectedIndex];
     if (selectedMap) {
@@ -523,6 +553,7 @@ export class MainMenu {
         action: 'start_game',
         mode: this.state.selectedMode,
         map: this.state.selectedMap,
+        team: this.state.selectedTeam,
       };
     }
     return { action: 'navigate' };
@@ -1011,8 +1042,17 @@ export class MainMenu {
         this.state.screen = 'main';
         this.state.selectedIndex = 0;
         break;
-      case 'map_select':
+      case 'team_select':
         this.state.screen = 'mode_select';
+        this.state.selectedIndex = 0;
+        break;
+      case 'map_select':
+        // Go back to team_select if competitive, otherwise mode_select
+        if (this.state.selectedMode === 'competitive') {
+          this.state.screen = 'team_select';
+        } else {
+          this.state.screen = 'mode_select';
+        }
         this.state.selectedIndex = 0;
         break;
       case 'help':
@@ -1041,6 +1081,8 @@ export class MainMenu {
         return 'CS-CLI';
       case 'mode_select':
         return 'Select Game Mode';
+      case 'team_select':
+        return 'Select Team';
       case 'map_select':
         return 'Select Map';
       case 'help':
@@ -1060,8 +1102,22 @@ export class MainMenu {
         if (mode) {
           if (mode.mode === 'deathmatch') {
             return 'Free-for-all - First to 10 round wins';
+          } else if (mode.mode === 'solo') {
+            return 'Explore the map alone - no enemies';
           } else {
             return 'Team vs Team - First to 7 round wins';
+          }
+        }
+        break;
+      case 'team_select':
+        const team = this.teamMenuItems[this.state.selectedIndex];
+        if (team) {
+          if (team.team === 'T') {
+            return 'Attack the objective - plant the bomb';
+          } else if (team.team === 'CT') {
+            return 'Defend the objective - stop the terrorists';
+          } else {
+            return 'Randomly assigned to a team';
           }
         }
         break;
@@ -1077,7 +1133,7 @@ export class MainMenu {
   }
 
   // Handle key input - returns result of selection if any
-  handleKey(key: string): { action: 'start_game' | 'quit' | 'navigate' | 'back' | 'none' | 'multiplayer'; mode?: GameModeType; map?: string } {
+  handleKey(key: string): { action: 'start_game' | 'quit' | 'navigate' | 'back' | 'none' | 'multiplayer'; mode?: GameModeType; map?: string; team?: TeamSelection } {
     // Help screen - any key goes back
     if (this.state.screen === 'help') {
       this.back();

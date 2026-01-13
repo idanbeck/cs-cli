@@ -140,6 +140,14 @@ export class Renderer {
   private killerName: string | null = null;
   private killerWeapon: string | null = null;
 
+  // Spectator mode
+  private spectatorTarget: string | null = null;
+  private spectatorTeam: TeamId | null = null;
+
+  // Possession mode
+  private possessedBotName: string | null = null;
+  private possessedBotTeam: TeamId | null = null;
+
   // Team-based display data
   private playerTeam: TeamId = 'SPECTATOR';
   private tScore: number = 0;
@@ -761,16 +769,18 @@ export class Renderer {
     }
 
     // Draw overlays on top of the 3D scene (MSAA already resolved above)
+    // Order matters - later overlays appear on top
     this.drawWarmupOverlay();
     this.drawRespawnOverlay();
-    this.drawScoreboardOverlay();
     this.drawGameOverOverlay();
     this.drawFreezeTimeOverlay();
+    this.drawPossessionOverlay();
     this.drawBuyMenuOverlay();
     this.drawMainMenuOverlay();
     this.drawServerBrowserOverlay();
     this.drawLobbyScreenOverlay();
-    this.drawConsoleOverlay();
+    this.drawScoreboardOverlay();  // Scoreboard on top of game overlays
+    this.drawConsoleOverlay();     // Console always on top
 
     // Draw voice indicator in ALL modes (including lobby)
     // Show indicator whenever voice system is active (even if mic not capturing yet)
@@ -1127,6 +1137,56 @@ export class Renderer {
     this.killerWeapon = weaponName;
   }
 
+  // Set spectator target info
+  setSpectatorTarget(name: string | null, team: TeamId | null): void {
+    this.spectatorTarget = name;
+    this.spectatorTeam = team;
+  }
+
+  // Set possessed bot info
+  setPossessedBot(name: string | null, team: TeamId | null): void {
+    this.possessedBotName = name;
+    this.possessedBotTeam = team;
+  }
+
+  // Check if death animation is complete (ready for spectator mode)
+  isDeathAnimationComplete(): boolean {
+    return this.isPlayerDead && this.deathPhase === 'resting' && this.deathFadeToRed >= 0.5;
+  }
+
+  // Set whether we're in spectator mode (affects overlay rendering)
+  private inSpectatorMode: boolean = false;
+  private spectatorOrbitYaw: number = 0;
+  private spectatorOrbitPitch: number = 0.3; // Slight downward angle
+  private spectatorDistance: number = 8; // Distance behind player
+
+  setSpectatorMode(active: boolean): void {
+    this.inSpectatorMode = active;
+    if (active) {
+      // Reset orbit angles when entering spectator mode
+      this.spectatorOrbitYaw = 0;
+      this.spectatorOrbitPitch = 0.3;
+    }
+  }
+
+  isInSpectatorMode(): boolean {
+    return this.inSpectatorMode;
+  }
+
+  // Update spectator orbit based on mouse movement
+  updateSpectatorOrbit(deltaYaw: number, deltaPitch: number): void {
+    this.spectatorOrbitYaw += deltaYaw;
+    this.spectatorOrbitPitch = Math.max(-0.5, Math.min(1.2, this.spectatorOrbitPitch + deltaPitch));
+  }
+
+  getSpectatorOrbit(): { yaw: number; pitch: number; distance: number } {
+    return {
+      yaw: this.spectatorOrbitYaw,
+      pitch: this.spectatorOrbitPitch,
+      distance: this.spectatorDistance,
+    };
+  }
+
   // Get death camera rotations for external use
   getDeathCameraRoll(): number {
     return this.deathCameraRoll;
@@ -1422,21 +1482,61 @@ export class Renderer {
       const ndcCenter = viewProjection.transformPoint(botCenter);
       const depth = ndcCenter.z;
 
-      // Color based on state and health
+      // Color based on team, state, and health
       let bodyColor: Color;
       let outlineColor: Color;
+
+      // Get team colors
+      const botTeam = bot.team;
+      const isTeammate = botTeam === this.playerTeam && this.playerTeam !== 'SPECTATOR';
+      const teamConfig = TEAMS[botTeam] || TEAMS.SPECTATOR;
+      const [tr, tg, tb] = teamConfig.color;
+
       if (!bot.isAlive) {
+        // Dead - gray
         bodyColor = new Color(80, 80, 80);
         outlineColor = new Color(60, 60, 60);
+      } else if (isTeammate) {
+        // Teammate - use team color with green tint
+        const greenTint = 0.4;
+        bodyColor = new Color(
+          Math.floor(tr * (1 - greenTint)),
+          Math.floor(tg * (1 - greenTint) + 200 * greenTint),
+          Math.floor(tb * (1 - greenTint))
+        );
+        outlineColor = new Color(
+          Math.floor(tr * 0.7),
+          Math.floor(Math.min(255, tg * 0.7 + 100)),
+          Math.floor(tb * 0.7)
+        );
       } else if (bot.state === 'attack') {
-        bodyColor = new Color(200, 50, 50);
-        outlineColor = new Color(255, 100, 100);
+        // Enemy attacking - brighter team color
+        bodyColor = new Color(
+          Math.min(255, Math.floor(tr * 1.1)),
+          Math.min(255, Math.floor(tg * 0.8)),
+          Math.min(255, Math.floor(tb * 0.8))
+        );
+        outlineColor = new Color(
+          Math.min(255, tr + 50),
+          Math.min(255, tg + 30),
+          Math.min(255, tb + 30)
+        );
       } else if (bot.health < 50) {
-        bodyColor = new Color(200, 150, 50);
-        outlineColor = new Color(255, 200, 100);
+        // Enemy low health - slightly dimmer
+        bodyColor = new Color(
+          Math.floor(tr * 0.85),
+          Math.floor(tg * 0.85),
+          Math.floor(tb * 0.85)
+        );
+        outlineColor = new Color(tr, tg, tb);
       } else {
-        bodyColor = new Color(180, 60, 60);
-        outlineColor = new Color(255, 80, 80);
+        // Enemy normal - team color
+        bodyColor = new Color(
+          Math.floor(tr * 0.7),
+          Math.floor(tg * 0.7),
+          Math.floor(tb * 0.7)
+        );
+        outlineColor = new Color(tr, tg, tb);
       }
 
       // Draw filled hitbox rectangle
@@ -1771,10 +1871,13 @@ export class Renderer {
     if (this.killFeed.length === 0) return;
 
     const bgDark = new Color(0, 0, 0, 0.7);
-    const killerColor = new Color(255, 100, 100);
-    const victimColor = new Color(100, 150, 255);
     const weaponColor = new Color(200, 200, 200);
     const headshotColor = new Color(255, 215, 0); // Gold for headshot
+
+    // Team colors
+    const tColor = new Color(TEAMS.T.color[0], TEAMS.T.color[1], TEAMS.T.color[2]);
+    const ctColor = new Color(TEAMS.CT.color[0], TEAMS.CT.color[1], TEAMS.CT.color[2]);
+    const defaultColor = new Color(200, 200, 200);
 
     for (let i = 0; i < this.killFeed.length; i++) {
       const kill = this.killFeed[i];
@@ -1782,6 +1885,12 @@ export class Renderer {
       const text = `${kill.killer} [${kill.weapon}] ${kill.victim}${hsMarker}`;
       const x = this.width - text.length - 2;
       const y = 1 + i;
+
+      // Get team-based colors for killer and victim
+      const killerColor = kill.killerTeam === 'T' ? tColor :
+                          kill.killerTeam === 'CT' ? ctColor : defaultColor;
+      const victimColor = kill.victimTeam === 'T' ? tColor :
+                          kill.victimTeam === 'CT' ? ctColor : defaultColor;
 
       // Draw with color coding
       let xPos = x;
@@ -1892,6 +2001,12 @@ export class Renderer {
   private drawDeathEffect(): void {
     if (!this.isPlayerDead) return;
 
+    // If in spectator mode, only draw spectator UI (no death overlay)
+    if (this.inSpectatorMode) {
+      this.drawSpectatorOverlay();
+      return;
+    }
+
     // Fade to red overlay - only fades in AFTER head hits ground (resting phase)
     if (this.deathFadeToRed > 0) {
       // Create a red overlay that increases with fade amount
@@ -1937,6 +2052,28 @@ export class Renderer {
     }
 
     // Show killer info after fade starts
+    // Show spectator UI if spectating someone
+    if (this.spectatorTarget) {
+      const bgDark = new Color(0, 0, 0, 0.7);
+      const teamColor = this.spectatorTeam === 'T'
+        ? new Color(TEAMS.T.color[0], TEAMS.T.color[1], TEAMS.T.color[2])
+        : this.spectatorTeam === 'CT'
+        ? new Color(TEAMS.CT.color[0], TEAMS.CT.color[1], TEAMS.CT.color[2])
+        : Color.white();
+
+      // "SPECTATING" at bottom center
+      const specText = `SPECTATING: ${this.spectatorTarget}`;
+      const specX = Math.floor((this.width - specText.length) / 2);
+      const specY = this.height - 3;
+      this.framebuffer.drawText(specX, specY, specText, teamColor, bgDark);
+
+      // "[CLICK] to switch" hint
+      const hintText = '[CLICK] to switch player';
+      const hintX = Math.floor((this.width - hintText.length) / 2);
+      this.framebuffer.drawText(hintX, specY + 1, hintText, new Color(150, 150, 150), bgDark);
+      return; // Don't show death text when spectating
+    }
+
     if (this.deathFadeToRed > 0.3 && this.killerName) {
       const centerX = Math.floor(this.width / 2);
       const centerY = Math.floor(this.height / 2);
@@ -1964,6 +2101,61 @@ export class Renderer {
     }
   }
 
+  // Draw spectator mode overlay (3rd person view UI)
+  private drawSpectatorOverlay(): void {
+    if (!this.spectatorTarget) return;
+
+    const bgDark = new Color(0, 0, 0, 0.7);
+    const teamColor = this.spectatorTeam === 'T'
+      ? new Color(TEAMS.T.color[0], TEAMS.T.color[1], TEAMS.T.color[2])
+      : this.spectatorTeam === 'CT'
+      ? new Color(TEAMS.CT.color[0], TEAMS.CT.color[1], TEAMS.CT.color[2])
+      : Color.white();
+
+    // "SPECTATOR MODE" header at top
+    const headerText = '[ SPECTATOR MODE ]';
+    const headerX = Math.floor((this.width - headerText.length) / 2);
+    this.framebuffer.drawText(headerX, 1, headerText, new Color(200, 200, 200), bgDark);
+
+    // Player name with team color at bottom
+    const nameText = this.spectatorTarget;
+    const nameX = Math.floor((this.width - nameText.length) / 2);
+    const nameY = this.height - 4;
+    this.framebuffer.drawText(nameX, nameY, nameText, teamColor, bgDark);
+
+    // Team indicator
+    const teamText = this.spectatorTeam === 'T' ? 'TERRORISTS' : 'COUNTER-TERRORISTS';
+    const teamX = Math.floor((this.width - teamText.length) / 2);
+    this.framebuffer.drawText(teamX, nameY + 1, teamText, teamColor, bgDark);
+
+    // Controls hint
+    const hintText = '[CLICK] Switch  [MOUSE] Orbit  [P] Possess';
+    const hintX = Math.floor((this.width - hintText.length) / 2);
+    this.framebuffer.drawText(hintX, this.height - 2, hintText, new Color(120, 120, 120), bgDark);
+  }
+
+  // Draw possession mode overlay (first person control of bot)
+  private drawPossessionOverlay(): void {
+    if (!this.possessedBotName) return;
+
+    const bgDark = new Color(0, 0, 0, 0.7);
+    const teamColor = this.possessedBotTeam === 'T'
+      ? new Color(TEAMS.T.color[0], TEAMS.T.color[1], TEAMS.T.color[2])
+      : this.possessedBotTeam === 'CT'
+      ? new Color(TEAMS.CT.color[0], TEAMS.CT.color[1], TEAMS.CT.color[2])
+      : Color.white();
+
+    // "POSSESSING" header at top
+    const headerText = `[ POSSESSING: ${this.possessedBotName} ]`;
+    const headerX = Math.floor((this.width - headerText.length) / 2);
+    this.framebuffer.drawText(headerX, 1, headerText, teamColor, bgDark);
+
+    // Controls hint at bottom
+    const hintText = '[P] Release Control';
+    const hintX = Math.floor((this.width - hintText.length) / 2);
+    this.framebuffer.drawText(hintX, this.height - 2, hintText, new Color(120, 120, 120), bgDark);
+  }
+
   // Draw game timer (top center)
   private drawGameTimer(): void {
     const fg = Color.white();
@@ -1987,13 +2179,21 @@ export class Renderer {
 
     const bgDark = new Color(0, 0, 0, 0.9);
     const headerColor = new Color(255, 215, 0); // Gold
-    const playerColor = new Color(100, 255, 100); // Green for player
-    const botColor = new Color(200, 200, 200); // Gray for bots
-    const deadColor = new Color(150, 150, 150);
+    const deadColor = new Color(100, 100, 100);
+
+    // Team colors from config
+    const tColor = new Color(TEAMS.T.color[0], TEAMS.T.color[1], TEAMS.T.color[2]);
+    const ctColor = new Color(TEAMS.CT.color[0], TEAMS.CT.color[1], TEAMS.CT.color[2]);
+
+    // Separate entries by team for team mode display
+    const tEntries = this.scoreboard.filter(e => e.team === 'T');
+    const ctEntries = this.scoreboard.filter(e => e.team === 'CT');
+    const isTeamMode = tEntries.length > 0 && ctEntries.length > 0;
 
     // Calculate dimensions
-    const boxWidth = 40;
-    const boxHeight = Math.min(this.scoreboard.length + 4, this.height - 4);
+    const boxWidth = 44;
+    const entriesCount = isTeamMode ? Math.max(tEntries.length, ctEntries.length) * 2 + 3 : this.scoreboard.length;
+    const boxHeight = Math.min(entriesCount + 5, this.height - 4);
     const startX = Math.floor((this.width - boxWidth) / 2);
     const startY = Math.floor((this.height - boxHeight) / 2);
 
@@ -2010,35 +2210,89 @@ export class Renderer {
     const header = '   SCOREBOARD';
     this.framebuffer.drawText(startX + 2, startY + 1, header, headerColor, bgDark);
 
-    const columnHeader = 'Name                 K    D';
-    this.framebuffer.drawText(startX + 2, startY + 2, columnHeader, new Color(150, 150, 150), bgDark);
+    if (isTeamMode) {
+      // Team mode: show teams separately
+      let y = startY + 3;
 
-    // Draw separator
-    const separator = '-'.repeat(boxWidth - 4);
-    this.framebuffer.drawText(startX + 2, startY + 3, separator, new Color(100, 100, 100), bgDark);
+      // Terrorists header
+      const tHeader = `TERRORISTS (${this.tScore})`;
+      this.framebuffer.drawText(startX + 2, y, tHeader, tColor, bgDark);
+      y++;
 
-    // Draw entries
-    for (let i = 0; i < this.scoreboard.length && i < boxHeight - 5; i++) {
-      const entry = this.scoreboard[i];
-      const y = startY + 4 + i;
+      // T entries
+      for (const entry of tEntries) {
+        if (y >= startY + boxHeight - 1) break;
+        const isMe = entry.isPlayer;
+        const name = entry.name.substring(0, 14).padEnd(14);
+        const kills = entry.kills.toString().padStart(3);
+        const deaths = entry.deaths.toString().padStart(3);
+        const line = ` ${name} ${kills}/${deaths}`;
 
-      // Format: rank, name, kills, deaths
-      const rank = `${i + 1}.`;
-      const name = entry.name.substring(0, 16).padEnd(16);
-      const kills = entry.kills.toString().padStart(4);
-      const deaths = entry.deaths.toString().padStart(4);
-
-      const line = `${rank.padEnd(3)} ${name} ${kills} ${deaths}`;
-
-      // Choose color based on player/bot and alive status
-      let color: Color;
-      if (entry.isPlayer) {
-        color = entry.isAlive ? playerColor : new Color(100, 200, 100);
-      } else {
-        color = entry.isAlive ? botColor : deadColor;
+        let color: Color;
+        if (!entry.isAlive) {
+          color = deadColor;
+        } else if (isMe) {
+          color = new Color(255, 255, 100); // Yellow highlight for self
+        } else {
+          color = tColor;
+        }
+        this.framebuffer.drawText(startX + 2, y, line, color, bgDark);
+        y++;
       }
 
-      this.framebuffer.drawText(startX + 2, y, line, color, bgDark);
+      y++; // Gap between teams
+
+      // Counter-Terrorists header
+      const ctHeader = `COUNTER-TERRORISTS (${this.ctScore})`;
+      this.framebuffer.drawText(startX + 2, y, ctHeader, ctColor, bgDark);
+      y++;
+
+      // CT entries
+      for (const entry of ctEntries) {
+        if (y >= startY + boxHeight - 1) break;
+        const isMe = entry.isPlayer;
+        const name = entry.name.substring(0, 14).padEnd(14);
+        const kills = entry.kills.toString().padStart(3);
+        const deaths = entry.deaths.toString().padStart(3);
+        const line = ` ${name} ${kills}/${deaths}`;
+
+        let color: Color;
+        if (!entry.isAlive) {
+          color = deadColor;
+        } else if (isMe) {
+          color = new Color(255, 255, 100); // Yellow highlight for self
+        } else {
+          color = ctColor;
+        }
+        this.framebuffer.drawText(startX + 2, y, line, color, bgDark);
+        y++;
+      }
+    } else {
+      // Non-team mode (deathmatch/solo): simple list
+      const columnHeader = 'Name                 K    D';
+      this.framebuffer.drawText(startX + 2, startY + 2, columnHeader, new Color(150, 150, 150), bgDark);
+
+      const separator = '-'.repeat(boxWidth - 4);
+      this.framebuffer.drawText(startX + 2, startY + 3, separator, new Color(100, 100, 100), bgDark);
+
+      for (let i = 0; i < this.scoreboard.length && i < boxHeight - 5; i++) {
+        const entry = this.scoreboard[i];
+        const y = startY + 4 + i;
+
+        const rank = `${i + 1}.`;
+        const name = entry.name.substring(0, 16).padEnd(16);
+        const kills = entry.kills.toString().padStart(4);
+        const deaths = entry.deaths.toString().padStart(4);
+        const line = `${rank.padEnd(3)} ${name} ${kills} ${deaths}`;
+
+        let color: Color;
+        if (entry.isPlayer) {
+          color = entry.isAlive ? new Color(100, 255, 100) : new Color(100, 200, 100);
+        } else {
+          color = entry.isAlive ? new Color(200, 200, 200) : deadColor;
+        }
+        this.framebuffer.drawText(startX + 2, y, line, color, bgDark);
+      }
     }
   }
 

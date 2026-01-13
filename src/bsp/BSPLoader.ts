@@ -371,6 +371,12 @@ export class BSPLoader {
       }
     }
 
+    // Log spawn breakdown
+    const tCount = spawns.filter(s => s.team === 'T').length;
+    const ctCount = spawns.filter(s => s.team === 'CT').length;
+    const dmCount = spawns.filter(s => s.team === 'DM').length;
+    console.log(`[BSPLoader] Parsed spawns: T=${tCount}, CT=${ctCount}, DM=${dmCount}`);
+
     return spawns;
   }
 

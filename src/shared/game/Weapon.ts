@@ -92,13 +92,13 @@ export const WEAPONS: Record<string, WeaponDef> = {
     name: 'Shotgun',
     type: 'shotgun',
     slot: 1,
-    damage: 20,
+    damage: 32,          // Per pellet - 8 pellets = 256 max damage at point blank
     fireRate: 70,
     reloadTime: 0.5, // Per shell
     magazineSize: 8,
     reserveAmmo: 32,
     spread: 8,
-    range: 20,
+    range: 25,           // Slightly increased effective range
     moveSpeed: 0.9,
     pellets: 8,
     isAutomatic: false,

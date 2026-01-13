@@ -42,8 +42,10 @@ import { Player } from './game/Player.js';
 import { WeaponSlot } from './game/Weapon.js';
 import { getWeaponSprite } from './game/WeaponSprites.js';
 import { BotManager } from './ai/BotManager.js';
+import { Bot } from './ai/Bot.js';
+import { initNavGrid } from './ai/Navigation.js';
 import { GameMode, DEFAULT_DEATHMATCH_CONFIG, DEFAULT_COMPETITIVE_CONFIG, DEFAULT_SOLO_CONFIG, GameModeType } from './game/GameMode.js';
-import { getSoundEngine, playSound, playSoundAt, SoundType } from './audio/SoundEngine.js';
+import { getSoundEngine, playSound, playSoundAt, playRandomRadioCommand, SoundType } from './audio/SoundEngine.js';
 import { getGameConsole, consoleLog, consoleWarn, consoleError, consoleDebug } from './ui/Console.js';
 import { getMainMenu, MainMenu, RenderMode, MSAAMode } from './ui/MainMenu.js';
 import { getBuyMenu, BuyMenu } from './ui/BuyMenu.js';
@@ -1140,6 +1142,9 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
   // Player ref
   const playerRef = useRef<Player>(new Player());
 
+  // Store player's original team (never changes after game start)
+  const playerOriginalTeamRef = useRef<TeamId | null>(null);
+
   // Mouse handler
   const [mouseHandler] = useState(() => {
     const width = stdout?.columns || 80;
@@ -1196,6 +1201,9 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
       }
       collisionMeshRef.current = newMap.collisionMesh;
       setGlobalCollisionMesh(newMap.collisionMesh);
+
+      // Initialize A* navigation grid for bot pathfinding
+      initNavGrid({ min: newMap.bounds.min, max: newMap.bounds.max });
 
       // Update renderer with new map
       renderer.clearObjects();
@@ -1254,6 +1262,13 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
 
   // Track player alive state for death sound
   const wasAliveRef = useRef(true);
+
+  // Spectator mode state (for competitive mode when dead)
+  const spectatingRef = useRef<Bot | null>(null);
+  const spectatorModeRef = useRef(false);
+
+  // Bot possession state (single player only - take control of a bot)
+  const possessedBotRef = useRef<Bot | null>(null);
 
   // Stdin-based key states (key -> last press timestamp) - fallback
   const keyTimesRef = useRef<Map<string, number>>(new Map());
@@ -1732,9 +1747,110 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
             }
             gameModeRef.current = new GameMode(config);
 
+            // Set up phase change callback for round events
+            gameModeRef.current.onPhaseChange = (oldPhase, newPhase) => {
+              const now = performance.now();
+              const gameMode = gameModeRef.current;
+              const player = playerRef.current;
+
+              // Play radio command when freeze time ends (round goes live)
+              if (oldPhase === 'freeze' && newPhase === 'live') {
+                playRandomRadioCommand();
+              }
+
+              // Handle new round start (round_end -> freeze)
+              if (oldPhase === 'round_end' && newPhase === 'freeze') {
+                // Restore player's original team (in case it was somehow changed)
+                const originalTeam = playerOriginalTeamRef.current;
+                if (originalTeam && player.team !== originalTeam) {
+                  console.log(`[Spawn] Restoring player team from ${player.team} to ${originalTeam}`);
+                  player.team = originalTeam;
+                }
+
+                // Award money based on round result
+                const roundWinner = gameMode.round.roundWinner;
+                if (roundWinner) {
+                  botManager.awardBotRoundMoney(roundWinner);
+                  // Award player money (use original team)
+                  const playerTeam = originalTeam || player.team;
+                  if (playerTeam === roundWinner) {
+                    player.economy.awardRoundWin();
+                  } else {
+                    player.economy.awardRoundLoss();
+                  }
+                }
+
+                // Clear dropped weapons
+                resetDroppedWeaponManager();
+
+                // Respawn player at team spawn - use BotManager's spawn points
+                // which correctly split DM spawns geographically between teams
+                // Use original team to ensure correct spawn location
+                const playerTeamForSpawn = originalTeam || player.team;
+                const teamSpawnPoints = botManager.getSpawnPointsForTeam(playerTeamForSpawn);
+                if (teamSpawnPoints.length > 0) {
+                  const spawnIdx = Math.floor(Math.random() * teamSpawnPoints.length);
+                  const rawSpawnPos = teamSpawnPoints[spawnIdx];
+
+                  let spawnPos = rawSpawnPos.clone();
+                  if (collisionMeshRef.current) {
+                    const adjusted = adjustSpawnPosition(rawSpawnPos, collisionMeshRef.current);
+                    if (adjusted) spawnPos = adjusted;
+                  }
+
+                  // Get angle from raw map spawn if available, otherwise random
+                  const matchingMapSpawn = loadedMapRef.current.spawns.find(s => {
+                    const dx = Math.abs(s.position[0] - rawSpawnPos.x);
+                    const dz = Math.abs(s.position[2] - rawSpawnPos.z);
+                    return dx < 1 && dz < 1;
+                  });
+                  const spawnAngle = matchingMapSpawn?.angle ?? Math.random() * 360;
+
+                  player.respawn(spawnPos, degToRad(spawnAngle));
+
+                  // Update camera
+                  const camera = renderer.getCamera();
+                  camera.setPosition(spawnPos.x, spawnPos.y + PLAYER_HEIGHT, spawnPos.z);
+                  camera.setYaw(degToRad(spawnAngle));
+                  camera.setPitch(0);
+                  camera.setRoll(0);
+
+                  // Reset scoped state
+                  scopedRef.current = false;
+                  camera.setFov(90);
+                  renderer.setScoped(false);
+
+                  // Tell bot manager which spawn the player used so bots don't spawn there
+                  botManager.setPlayerSpawnPoint(spawnPos);
+                }
+
+                // Clear possession on round start - player is back in control
+                if (possessedBotRef.current) {
+                  renderer.setPossessedBot(null, null);
+                  possessedBotRef.current = null;
+                }
+
+                // Exit spectator mode on round start
+                if (spectatorModeRef.current) {
+                  spectatorModeRef.current = false;
+                  spectatingRef.current = null;
+                  renderer.setSpectatorMode(false);
+                  renderer.setSpectatorTarget(null, null);
+                }
+
+                // Respawn all bots at team spawns
+                botManager.respawnAllBots(now, player);
+
+                // Reset death effect
+                renderer.setPlayerDead(false, null, null);
+                wasAliveRef.current = true;
+              }
+            };
+
             // Reset team manager
             resetTeamManager();
             resetDroppedWeaponManager();
+            playerOriginalTeamRef.current = null; // Clear saved team for new game
 
             // Clear any existing bots first
             botManager.clear();
@@ -1748,15 +1864,35 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
 
             // FIRST: Spawn player at a random spawn point (no bots yet to avoid)
             const player = playerRef.current;
+
+            // For team mode, assign player to a team first
             if (isTeamMode) {
-              botManager.assignBotsToTeams(player.name);
-              const playerTeam = getTeamManager().getTeam(player.name);
-              player.team = playerTeam || 'T';
+              // Use selected team or random if 'random' was chosen
+              let playerTeam: TeamId;
+              if (result.team === 'T' || result.team === 'CT') {
+                playerTeam = result.team;
+              } else {
+                // Random assignment
+                playerTeam = Math.random() < 0.5 ? 'T' : 'CT';
+              }
+              getTeamManager().assignToTeam(player.name, playerTeam);
+              player.team = playerTeam;
+              playerOriginalTeamRef.current = playerTeam; // Save original team - never changes
+              console.log(`[Spawn] Player assigned to team: ${playerTeam}`);
             }
 
+            // For team mode, use team-specific spawns from BotManager (handles DM split)
+            // For other modes, use all spawns
             const spawns = isTeamMode
-              ? loadedMapRef.current.spawns.filter(s => s.team === player.team || s.team === 'DM')
+              ? loadedMapRef.current.spawns.filter(s => s.team === player.team)
               : loadedMapRef.current.spawns;
+
+            // If no dedicated team spawns, fall back to BotManager's split spawns
+            const useManagerSpawns = isTeamMode && spawns.length === 0;
+
+            if (isTeamMode) {
+              console.log(`[Spawn] Player team: ${player.team}, dedicated spawns: ${spawns.length}, useManagerSpawns: ${useManagerSpawns}`);
+            }
 
             // Pick a valid spawn for player
             let spawnPos: Vector3 | null = null;
@@ -1770,7 +1906,10 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
 
             // Fall back to regular spawn selection if blue noise didn't work or for team modes
             if (!spawnPos) {
-              const spawnPoints = spawns.map(s => new Vector3(s.position[0], s.position[1], s.position[2]));
+              // Use BotManager's split spawns if no dedicated team spawns in map
+              const spawnPoints = useManagerSpawns
+                ? botManager.getSpawnPointsForTeam(player.team)
+                : spawns.map(s => new Vector3(s.position[0], s.position[1], s.position[2]));
 
               // Shuffle spawn points for randomness
               const shuffledIndices = [...Array(spawnPoints.length).keys()];
@@ -1811,6 +1950,15 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
 
             player.respawn(spawnPos, degToRad(spawnAngle));
 
+            if (isTeamMode) {
+              // Player spawned at their team spawn point
+            }
+
+            // Track player's spawn point so bots don't use it
+            if (isTeamMode) {
+              botManager.setPlayerSpawnPoint(spawnPos);
+            }
+
             // Update camera
             const camera = renderer.getCamera();
             camera.setPosition(spawnPos.x, spawnPos.y + PLAYER_HEIGHT, spawnPos.z);
@@ -1823,14 +1971,15 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
                 // Deathmatch: Use blue noise distributed spawns for even distribution
                 botManager.spawnBotsWithBlueNoise(6, 'medium', player.position);
               } else {
-                // Team mode: Use regular spread spawning
-                botManager.spawnBots(6, 'medium', player.position);
-              }
-            }
+                // Team mode: 4v4 = player + 7 bots
+                botManager.spawnBots(7, 'medium', player.position);
 
-            // Respawn bots at team spawns in competitive mode
-            if (isTeamMode) {
-              botManager.respawnAllBots(now, player);
+                // NOW assign teams after bots exist
+                botManager.assignBotsToTeams(player.name);
+
+                // Respawn bots at their team spawn points (each spawn used ONCE)
+                botManager.respawnAllBots(now, player);
+              }
             }
 
             // Disable respawns for round-based mode
@@ -2729,6 +2878,57 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
           renderer.setScoped(false);
         }
       }
+
+      // P for bot possession (single player only) - skip if native keyboard handles it
+      if (key === 'p' && !useNative && !isMultiplayerRef.current && appModeRef.current === 'playing') {
+        const bots = botManager.getBots();
+
+        if (possessedBotRef.current) {
+          // Already possessing - unpossess
+          consoleLog(`Released control of ${possessedBotRef.current.name}`);
+          renderer.setPossessedBot(null, null);
+          possessedBotRef.current = null;
+        } else {
+          // Not possessing - find a teammate bot to possess
+          // Only allow possessing teammates to avoid team confusion on respawn
+          const player = playerRef.current;
+          const originalTeam = playerOriginalTeamRef.current || player.team;
+          let targetBot: Bot | null = null;
+
+          // If spectating a teammate, possess them
+          if (spectatingRef.current && spectatingRef.current.isAlive && spectatingRef.current.team === originalTeam) {
+            targetBot = spectatingRef.current;
+          } else {
+            // Find nearest alive teammate
+            const aliveTeammates = bots.filter(b => b.isAlive && b.team === originalTeam);
+
+            if (aliveTeammates.length > 0) {
+              // Sort by distance
+              aliveTeammates.sort((a, b) => {
+                const distA = Vector3.sub(a.position, player.position).length();
+                const distB = Vector3.sub(b.position, player.position).length();
+                return distA - distB;
+              });
+              targetBot = aliveTeammates[0];
+            }
+          }
+
+          if (targetBot) {
+            possessedBotRef.current = targetBot;
+            renderer.setPossessedBot(targetBot.name, targetBot.team);
+            consoleLog(`Possessing ${targetBot.name} - Press P to release`);
+
+            // Exit spectator mode if active
+            if (spectatorModeRef.current) {
+              spectatorModeRef.current = false;
+              spectatingRef.current = null;
+              renderer.setSpectatorMode(false);
+            }
+          } else {
+            consoleLog('No alive teammates to possess');
+          }
+        }
+      }
     };
 
     // Enable mouse tracking (user must click to capture)
@@ -2930,7 +3130,13 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
           if (nativeDelta.x !== 0 || nativeDelta.y !== 0) {
             const yawDelta = -nativeDelta.x * mouseSensitivityRef.current;
             const pitchDelta = -nativeDelta.y * mouseSensitivityRef.current;
-            camera.rotate(pitchDelta, yawDelta);
+
+            // In spectator mode, use mouse for orbit control
+            if (spectatorModeRef.current) {
+              renderer.updateSpectatorOrbit(yawDelta, pitchDelta);
+            } else {
+              camera.rotate(pitchDelta, yawDelta);
+            }
           }
         }
 
@@ -2966,6 +3172,54 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
             mouseHandler.release();
           } else {
             mouseHandler.capture();
+          }
+        }
+
+        // P for bot possession (single player only) - teammates only
+        if (wasGameKeyJustPressed('P') && !isMultiplayerRef.current && appModeRef.current === 'playing') {
+          const bots = botManager.getBots();
+          const player = playerRef.current;
+          const originalTeam = playerOriginalTeamRef.current || player.team;
+
+          if (possessedBotRef.current) {
+            // Already possessing - unpossess
+            consoleLog(`Released control of ${possessedBotRef.current.name}`);
+            renderer.setPossessedBot(null, null);
+            possessedBotRef.current = null;
+          } else {
+            // Not possessing - find a teammate bot to possess
+            let targetBot: Bot | null = null;
+
+            // If spectating a teammate, possess them
+            if (spectatingRef.current && spectatingRef.current.isAlive && spectatingRef.current.team === originalTeam) {
+              targetBot = spectatingRef.current;
+            } else {
+              // Find nearest alive teammate
+              const aliveTeammates = bots.filter(b => b.isAlive && b.team === originalTeam);
+
+              if (aliveTeammates.length > 0) {
+                aliveTeammates.sort((a, b) => {
+                  const distA = Vector3.sub(a.position, player.position).length();
+                  const distB = Vector3.sub(b.position, player.position).length();
+                  return distA - distB;
+                });
+                targetBot = aliveTeammates[0];
+              }
+            }
+
+            if (targetBot) {
+              possessedBotRef.current = targetBot;
+              renderer.setPossessedBot(targetBot.name, targetBot.team);
+              consoleLog(`Possessing ${targetBot.name} - Press P to release`);
+
+              if (spectatorModeRef.current) {
+                spectatorModeRef.current = false;
+                spectatingRef.current = null;
+                renderer.setSpectatorMode(false);
+              }
+            } else {
+              consoleLog('No alive teammates to possess');
+            }
           }
         }
 
@@ -3055,6 +3309,145 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
       const playerFrozen = isSoloModeMove ? false :
         (isMultiplayerRef.current && mpState.isActive() ? mpState.isPlayerFrozen() : gameModeRef.current.isPlayerFrozen());
 
+      // Handle bot possession (single player only)
+      const possessedBot = possessedBotRef.current;
+      if (possessedBot && !isMultiplayerRef.current) {
+        // Check if possessed bot is still alive
+        if (!possessedBot.isAlive) {
+          consoleLog(`${possessedBot.name} died - released control`);
+          renderer.setPossessedBot(null, null);
+          possessedBotRef.current = null;
+        } else {
+          // Apply player movement to possessed bot
+          const botYaw = camera.yaw;
+          const botForwardDir = new Vector3(-Math.sin(botYaw), 0, -Math.cos(botYaw));
+          const botRightDir = new Vector3(Math.cos(botYaw), 0, -Math.sin(botYaw));
+
+          const effectiveFwd = playerFrozen ? 0 : forward;
+          const effectiveStr = playerFrozen ? 0 : strafe;
+          const botVelX = botForwardDir.x * effectiveFwd * MOVE_SPEED + botRightDir.x * effectiveStr * MOVE_SPEED;
+          const botVelZ = botForwardDir.z * effectiveFwd * MOVE_SPEED + botRightDir.z * effectiveStr * MOVE_SPEED;
+
+          // Update bot position using collision mesh
+          const collisionMesh = collisionMeshRef.current;
+          if (collisionMesh && collisionMesh.triangles.length > 0) {
+            const botFeetPos = possessedBot.getFeetPosition();
+            const botVelocity = new Vector3(botVelX, possessedBot.verticalVelocity || 0, botVelZ);
+
+            // Apply gravity to bot
+            if (possessedBot.verticalVelocity === undefined) possessedBot.verticalVelocity = 0;
+            possessedBot.verticalVelocity -= GRAVITY * dt;
+
+            const botResult = moveWithMeshCollision(botFeetPos, botVelocity, collisionMesh, dt);
+            possessedBot.position = new Vector3(
+              botResult.newPosition.x,
+              botResult.newPosition.y + possessedBot.config.eyeHeight,
+              botResult.newPosition.z
+            );
+
+            if (botResult.onGround) {
+              possessedBot.verticalVelocity = 0;
+              // Handle jump for possessed bot
+              if (jumpPressed && !playerFrozen && (now - lastJumpTime) > 300) {
+                possessedBot.verticalVelocity = JUMP_VELOCITY;
+                lastJumpTime = now;
+                playSound('jump');
+              }
+            }
+          }
+
+          // Update bot facing direction
+          possessedBot.yaw = camera.yaw;
+          possessedBot.pitch = camera.pitch;
+
+          // Update camera to follow possessed bot (first person view)
+          camera.setPosition(possessedBot.position.x, possessedBot.position.y, possessedBot.position.z);
+          camera.setRoll(0); // Reset any death roll
+
+          // Handle firing with possessed bot's weapon
+          if (firePressed && !playerFrozen && !spectatorModeRef.current) {
+            const botWeapon = possessedBot.getCurrentWeapon();
+            if (botWeapon && possessedBot.canFire(now)) {
+              const isAuto = botWeapon.def.isAutomatic;
+              if (isAuto || !hasFiredRef.current) {
+                if (possessedBot.fire(now)) {
+                  if (!isAuto) hasFiredRef.current = true;
+                  // Play fire sound
+                  const weaponType = botWeapon.def.type;
+                  if (weaponType === 'pistol') playSound('shoot_pistol');
+                  else if (weaponType === 'rifle') playSound('shoot_rifle');
+                  else if (weaponType === 'shotgun') playSound('shoot_shotgun');
+                  else if (weaponType === 'sniper') playSound('shoot_sniper');
+                  renderer.triggerMuzzleFlash(80);
+
+                  // Handle possessed bot shooting - raycast for hits
+                  const origin = possessedBot.getEyePosition();
+                  const aimDir = new Vector3(
+                    -Math.sin(camera.yaw) * Math.cos(camera.pitch),
+                    Math.sin(camera.pitch),
+                    -Math.cos(camera.yaw) * Math.cos(camera.pitch)
+                  );
+                  const maxRange = botWeapon.def.range;
+                  const isTeamMode = gameModeTypeRef.current === 'competitive';
+
+                  // Spawn tracer
+                  const tracerEnd = Vector3.add(origin, Vector3.scale(aimDir, maxRange));
+                  renderer.spawnTracer(origin, tracerEnd, 150);
+
+                  // Check hits against enemy bots
+                  const bots = botManager.getBots();
+                  for (const target of bots) {
+                    if (target === possessedBot || !target.isAlive) continue;
+                    // In team mode, don't hit teammates
+                    if (isTeamMode && target.team === possessedBot.team) continue;
+
+                    // Simple sphere hit detection (body)
+                    const bodyRadius = 0.4;
+                    const toTarget = Vector3.sub(target.position, origin);
+                    const dist = toTarget.length();
+                    if (dist > maxRange) continue;
+
+                    // Project target position onto aim ray
+                    const dot = toTarget.x * aimDir.x + toTarget.y * aimDir.y + toTarget.z * aimDir.z;
+                    if (dot < 0) continue; // Behind us
+
+                    const closestPoint = Vector3.add(origin, Vector3.scale(aimDir, dot));
+                    const perpDist = Vector3.sub(closestPoint, target.position).length();
+
+                    // Check headshot (smaller sphere at eye level)
+                    const headPos = target.getEyePosition();
+                    const toHead = Vector3.sub(headPos, origin);
+                    const headDot = toHead.x * aimDir.x + toHead.y * aimDir.y + toHead.z * aimDir.z;
+                    const headClosest = Vector3.add(origin, Vector3.scale(aimDir, headDot));
+                    const headPerpDist = Vector3.sub(headClosest, headPos).length();
+                    const isHeadshot = headPerpDist < 0.2 && headDot > 0;
+
+                    if (perpDist < bodyRadius || isHeadshot) {
+                      const damage = botWeapon.def.damage * (isHeadshot ? botWeapon.def.headshotMultiplier : 1);
+                      const wasAlive = target.isAlive;
+                      target.takeDamage(damage, isHeadshot);
+                      playSound(isHeadshot ? 'hit_headshot' : 'hit_enemy');
+
+                      if (wasAlive && !target.isAlive) {
+                        consoleLog(`${possessedBot.name} killed ${target.name}`);
+                        possessedBot.kills++;
+                      }
+                      break; // Only hit one target per shot
+                    }
+                  }
+                }
+              }
+            }
+          }
+
+          // Update possessed bot's weapon
+          possessedBot.updateWeapon?.(now);
+
+          // Update player position to match possessed bot (for game logic)
+          playerRef.current.position = possessedBot.position.clone();
+        }
+      }
+
       // Calculate movement direction (blocked during freeze phase)
       let moveForward = 0;
       let moveRight = 0;
@@ -3064,7 +3457,8 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
       }
 
       // Handle jump (with cooldown to prevent spam from key repeat)
-      if (jumpPressed && physics.onGround && (now - lastJumpTime) > 300) {
+      // Also blocked during freeze phase
+      if (jumpPressed && physics.onGround && !playerFrozen && (now - lastJumpTime) > 300) {
         physics.velocityY = JUMP_VELOCITY;
         physics.onGround = false;
         lastJumpTime = now;
@@ -3086,11 +3480,28 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
           hasFiredRef.current = false;
         }
 
+        // Handle spectator mode click to switch targets (only cycle through teammates)
+        if (spectatorModeRef.current && firePressed && !hasFiredRef.current) {
+          hasFiredRef.current = true; // Prevent repeated switches
+
+          const bots = botManager.getBots();
+          const originalTeam = playerOriginalTeamRef.current || player.team;
+          const teammates = bots.filter(b => b.isAlive && b.team === originalTeam);
+
+          if (teammates.length > 1 && spectatingRef.current) {
+            // Find current index and switch to next teammate
+            const currentIdx = teammates.indexOf(spectatingRef.current);
+            const nextIdx = (currentIdx + 1) % teammates.length;
+            spectatingRef.current = teammates[nextIdx];
+          }
+        }
+
         // Determine if we should fire
         // Automatic weapons: fire while held
         // Semi-auto weapons: only fire on initial press (hasn't fired since pressing)
+        // Don't fire when in spectator mode
         const isAuto = weapon?.def.isAutomatic ?? false;
-        const shouldFire = firePressed && !isFrozen && (isAuto || !hasFiredRef.current);
+        const shouldFire = firePressed && !isFrozen && !spectatorModeRef.current && (isAuto || !hasFiredRef.current);
 
         if (shouldFire && weapon) {
           if (isMultiplayerRef.current) {
@@ -3144,70 +3555,76 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
         }
       }
 
-      // Get movement vector in world space
-      const yaw = camera.yaw;
-      const forwardDir = new Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
-      const rightDir = new Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
+      // Skip player movement when possessing a bot (bot movement is handled above)
+      if (!possessedBotRef.current) {
+        // Get movement vector in world space
+        const yaw = camera.yaw;
+        const forwardDir = new Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
+        const rightDir = new Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
 
-      // Build horizontal velocity (units per second)
-      const horizontalSpeed = MOVE_SPEED;
-      let velocityX = forwardDir.x * forward * horizontalSpeed + rightDir.x * strafe * horizontalSpeed;
-      let velocityZ = forwardDir.z * forward * horizontalSpeed + rightDir.z * strafe * horizontalSpeed;
+        // Build horizontal velocity (units per second)
+        // Use playerFrozen check to block movement during freeze phase
+        const horizontalSpeed = MOVE_SPEED;
+        const effectiveForward = playerFrozen ? 0 : forward;
+        const effectiveStrafe = playerFrozen ? 0 : strafe;
+        let velocityX = forwardDir.x * effectiveForward * horizontalSpeed + rightDir.x * effectiveStrafe * horizontalSpeed;
+        let velocityZ = forwardDir.z * effectiveForward * horizontalSpeed + rightDir.z * effectiveStrafe * horizontalSpeed;
 
-      // Apply gravity
-      if (!physics.onGround) {
-        physics.velocityY -= GRAVITY * dt;
-      }
+        // Apply gravity
+        if (!physics.onGround) {
+          physics.velocityY -= GRAVITY * dt;
+        }
 
-      // Get feet position (camera is at eye level)
-      const feetPos = new Vector3(
-        camera.position.x,
-        camera.position.y - PLAYER_HEIGHT,
-        camera.position.z
-      );
+        // Get feet position (camera is at eye level)
+        const feetPos = new Vector3(
+          camera.position.x,
+          camera.position.y - PLAYER_HEIGHT,
+          camera.position.z
+        );
 
-      // Use BSP mesh collision (required)
-      const collisionMesh = collisionMeshRef.current;
-      let newFeetPos: Vector3;
-      let newOnGround: boolean;
+        // Use BSP mesh collision (required)
+        const collisionMesh = collisionMeshRef.current;
+        let newFeetPos: Vector3;
+        let newOnGround: boolean;
 
-      if (collisionMesh && collisionMesh.triangles.length > 0 && collisionEnabledRef.current) {
-        // Use triangle-based collision for BSP maps
-        const velocity = new Vector3(velocityX, physics.velocityY, velocityZ);
-        const result = moveWithMeshCollision(feetPos, velocity, collisionMesh, dt);
-        newFeetPos = result.newPosition;
-        physics.velocityY = result.newVelocity.y;
-        newOnGround = result.onGround;
-      } else {
-        // No collision mesh - just apply movement directly (for loading screens, etc)
-        newFeetPos = Vector3.add(feetPos, new Vector3(velocityX * dt, physics.velocityY * dt, velocityZ * dt));
-        newOnGround = newFeetPos.y <= 0.1;
-        if (newFeetPos.y < 0) newFeetPos.y = 0;
-      }
+        if (collisionMesh && collisionMesh.triangles.length > 0 && collisionEnabledRef.current) {
+          // Use triangle-based collision for BSP maps
+          const velocity = new Vector3(velocityX, physics.velocityY, velocityZ);
+          const result = moveWithMeshCollision(feetPos, velocity, collisionMesh, dt);
+          newFeetPos = result.newPosition;
+          physics.velocityY = result.newVelocity.y;
+          newOnGround = result.onGround;
+        } else {
+          // No collision mesh - just apply movement directly (for loading screens, etc)
+          newFeetPos = Vector3.add(feetPos, new Vector3(velocityX * dt, physics.velocityY * dt, velocityZ * dt));
+          newOnGround = newFeetPos.y <= 0.1;
+          if (newFeetPos.y < 0) newFeetPos.y = 0;
+        }
 
-      // Update camera position (convert feet to eye level)
-      // Must use setPosition or translate to mark camera as dirty for matrix recalculation
-      const newCameraY = newFeetPos.y + PLAYER_HEIGHT;
-      camera.setPosition(newFeetPos.x, newCameraY, newFeetPos.z);
+        // Update camera position (convert feet to eye level)
+        // Must use setPosition or translate to mark camera as dirty for matrix recalculation
+        const newCameraY = newFeetPos.y + PLAYER_HEIGHT;
+        camera.setPosition(newFeetPos.x, newCameraY, newFeetPos.z);
 
-      // Update ground state
-      const wasOnGround = physics.onGround;
-      physics.onGround = newOnGround;
+        // Update ground state
+        const wasOnGround = physics.onGround;
+        physics.onGround = newOnGround;
 
-      // Reset vertical velocity when landing
-      if (physics.onGround && !wasOnGround) {
-        physics.velocityY = 0;
-      }
+        // Reset vertical velocity when landing
+        if (physics.onGround && !wasOnGround) {
+          physics.velocityY = 0;
+        }
 
-      // Safety fallback - respawn if fell out of world
-      // BSP maps can have floors at negative Y coordinates, but -50 is definitely out of bounds
-      if (camera.position.y < -50) {
-        // Player fell out of the world - reset to spawn
-        const spawn = loadedMapRef.current.spawns[0] || { position: [0, 2, 0], angle: 0 };
-        camera.setPosition(spawn.position[0], spawn.position[1] + PLAYER_HEIGHT, spawn.position[2]);
-        physics.velocityY = 0;
-        physics.onGround = true;
-      }
+        // Safety fallback - respawn if fell out of world
+        // BSP maps can have floors at negative Y coordinates, but -50 is definitely out of bounds
+        if (camera.position.y < -50) {
+          // Player fell out of the world - reset to spawn
+          const spawn = loadedMapRef.current.spawns[0] || { position: [0, 2, 0], angle: 0 };
+          camera.setPosition(spawn.position[0], spawn.position[1] + PLAYER_HEIGHT, spawn.position[2]);
+          physics.velocityY = 0;
+          physics.onGround = true;
+        }
+      } // End of !possessedBotRef.current block
 
       // Update player state
       const player = playerRef.current;
@@ -3272,8 +3689,11 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
         }
       }
 
-      // Get weapon state for HUD
-      const weapon = player.getCurrentWeapon();
+      // Get weapon state for HUD - use possessed bot's weapon if possessing
+      const possessedBotForWeapon = possessedBotRef.current;
+      const weapon = (possessedBotForWeapon && possessedBotForWeapon.isAlive)
+        ? possessedBotForWeapon.getCurrentWeapon()
+        : player.getCurrentWeapon();
 
       // Set weapon sprite (use fire sprite if muzzle flash active)
       if (weapon) {
@@ -3304,7 +3724,7 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
         } else {
           // Single player mode: run local bot simulation
           // Bots use getGlobalCollisionMesh() for BSP collision, AABB param is deprecated
-          botManager.update(player, [], now, dt, areBotsFrozen, isTeamMode);
+          botManager.update(player, [], now, dt, areBotsFrozen, isTeamMode, possessedBotRef.current);
 
           // Bot combat is now handled by BotManager.update() via callbacks
 
@@ -3313,9 +3733,12 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
         }
       }
 
-      // Handle death camera effect
-      renderer.setPlayerDead(!player.isAlive, dt);
-      if (!player.isAlive) {
+      // Handle death camera effect (but not in spectator mode or possession mode)
+      const showDeathEffect = !player.isAlive && !spectatorModeRef.current && !possessedBotRef.current;
+      renderer.setPlayerDead(showDeathEffect, dt);
+
+      // Skip death handling when possessing a bot - we're controlling the bot now
+      if (!player.isAlive && !possessedBotRef.current) {
         // Play death sound and drop weapons on transition to dead
         if (wasAliveRef.current) {
           playSound('player_death');
@@ -3333,27 +3756,117 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
             player.dropAllWeapons(now);
           }
         }
-        // Apply death camera rotations - deliberate fall to side
-        camera.setRoll(renderer.getDeathCameraRoll());
 
-        // Apply death pitch - looking down at ground when head hits
-        const deathPitch = renderer.getDeathCameraPitch();
-        if (deathPitch > 0) {
-          // Override pitch to look at ground (positive = looking down)
-          camera.setPitch(-deathPitch);
+        // Check if death animation is complete and we should enter spectator mode
+        // Only spectate teammates - use original team to avoid confusion after possessing enemies
+        if (isTeamMode && !spectatorModeRef.current && renderer.isDeathAnimationComplete()) {
+          const bots = botManager.getBots();
+          const originalTeam = playerOriginalTeamRef.current || player.team;
+          const teammates = bots.filter(b => b.isAlive && b.team === originalTeam);
+
+          // Only enter spectator mode if we have living teammates
+          // If no teammates left, stay on death screen until round ends
+          if (teammates.length > 0) {
+            spectatingRef.current = teammates[0];
+            spectatorModeRef.current = true;
+            renderer.setSpectatorMode(true);
+          }
         }
 
-        // Lower camera toward ground with physics
-        const dropAmount = renderer.getDeathCameraYDrop();
-        if (dropAmount > 0) {
-          const minY = 0.3; // Ground level for head
-          const targetY = camera.position.y - dropAmount;
-          const newY = Math.max(minY, targetY);
-          camera.setPosition(camera.position.x, newY, camera.position.z);
+        // Spectator mode - 3rd person view following spectated player
+        if (spectatorModeRef.current && spectatingRef.current) {
+          const spec = spectatingRef.current;
+
+          // Check if spectated bot died - switch to another teammate only
+          if (!spec.isAlive) {
+            const bots = botManager.getBots();
+            const originalTeam = playerOriginalTeamRef.current || player.team;
+            const teammates = bots.filter(b => b.isAlive && b.team === originalTeam);
+
+            if (teammates.length > 0) {
+              spectatingRef.current = teammates[0];
+            } else {
+              // No teammates left - exit spectator mode, stay on death screen
+              spectatingRef.current = null;
+              spectatorModeRef.current = false;
+              renderer.setSpectatorMode(false);
+              renderer.setSpectatorTarget(null, null);
+            }
+          }
+
+          // 3rd person camera orbit around spectated player
+          if (spectatingRef.current && spectatingRef.current.isAlive) {
+            const specBot = spectatingRef.current;
+            const orbit = renderer.getSpectatorOrbit();
+
+            // Calculate 3rd person camera position - orbit is INDEPENDENT of bot facing direction
+            // User controls orbit with mouse, bot's yaw doesn't affect camera
+            const targetPos = specBot.getEyePosition();
+            const orbitYaw = orbit.yaw; // Don't add specBot.yaw - orbit stays fixed unless user moves mouse
+            const orbitPitch = orbit.pitch;
+            let distance = orbit.distance;
+
+            // Calculate camera direction from target
+            const dirX = -Math.sin(orbitYaw) * Math.cos(orbitPitch);
+            const dirY = Math.sin(orbitPitch);
+            const dirZ = -Math.cos(orbitYaw) * Math.cos(orbitPitch);
+
+            // Raycast from target toward camera to check for walls
+            if (collisionMeshRef.current) {
+              const rayDir = new Vector3(dirX, dirY, dirZ);
+              const wallHit = raycastMesh(targetPos, rayDir, collisionMeshRef.current, distance + 0.5);
+              if (wallHit.hit && wallHit.distance < distance) {
+                // Wall in the way - zoom in to avoid clipping (leave small buffer)
+                distance = Math.max(1.0, wallHit.distance - 0.3);
+              }
+            }
+
+            // Calculate camera position on orbit sphere
+            const camX = targetPos.x + dirX * distance;
+            const camY = targetPos.y + dirY * distance + 1;
+            const camZ = targetPos.z + dirZ * distance;
+
+            camera.setPosition(camX, camY, camZ);
+            // Look at the spectated player
+            camera.setYaw(orbitYaw + Math.PI); // Face toward the player
+            camera.setPitch(-orbitPitch);
+            camera.setRoll(0);
+
+            // Show spectator UI
+            renderer.setSpectatorTarget(specBot.name, specBot.team);
+          }
+        } else if (!player.isAlive) {
+          // Not in spectator mode - do normal death camera
+          // Apply death camera rotations - deliberate fall to side
+          camera.setRoll(renderer.getDeathCameraRoll());
+
+          // Apply death pitch - looking down at ground when head hits
+          const deathPitch = renderer.getDeathCameraPitch();
+          if (deathPitch > 0) {
+            // Override pitch to look at ground (positive = looking down)
+            camera.setPitch(-deathPitch);
+          }
+
+          // Lower camera toward ground with physics
+          const dropAmount = renderer.getDeathCameraYDrop();
+          if (dropAmount > 0) {
+            const minY = 0.3; // Ground level for head
+            const targetY = camera.position.y - dropAmount;
+            const newY = Math.max(minY, targetY);
+            camera.setPosition(camera.position.x, newY, camera.position.z);
+          }
         }
       } else {
         // Reset roll when alive
         camera.setRoll(0);
+
+        // Exit spectator mode when alive
+        if (spectatorModeRef.current) {
+          spectatorModeRef.current = false;
+          spectatingRef.current = null;
+          renderer.setSpectatorMode(false);
+          renderer.setSpectatorTarget(null, null);
+        }
       }
 
       // Handle player respawn (not in solo mode - player is always alive)
@@ -3405,6 +3918,12 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
           } else if (!spawnPos) {
             spawnPos = new Vector3(0, 10, 0);
           }
+        }
+
+        // Clear possession on respawn - player is back in control
+        if (possessedBotRef.current) {
+          renderer.setPossessedBot(null, null);
+          possessedBotRef.current = null;
         }
 
         player.respawn(spawnPos, degToRad(spawnAngle));
@@ -3506,15 +4025,28 @@ function Game({ initialRenderMode = 'halfblock', initialMSAAMode = '4x' }: GameP
         renderer.setBots(botManager.getBots());
       }
 
-      // Set HUD data before rendering
-      renderer.setHUD(
-        player.health,
-        player.armor,
-        weapon?.currentAmmo ?? 0,
-        weapon?.reserveAmmo ?? 0,
-        weapon?.def.name ?? 'None',
-        weapon?.isReloading ?? false
-      );
+      // Set HUD data before rendering - use possessed bot's data if possessing
+      const possessedBot = possessedBotRef.current;
+      if (possessedBot && possessedBot.isAlive) {
+        const botWeapon = possessedBot.getCurrentWeapon();
+        renderer.setHUD(
+          possessedBot.health,
+          possessedBot.armor || 0,
+          botWeapon?.currentAmmo ?? 0,
+          botWeapon?.reserveAmmo ?? 0,
+          botWeapon?.def.name ?? 'None',
+          botWeapon?.isReloading ?? false
+        );
+      } else {
+        renderer.setHUD(
+          player.health,
+          player.armor,
+          weapon?.currentAmmo ?? 0,
+          weapon?.reserveAmmo ?? 0,
+          weapon?.def.name ?? 'None',
+          weapon?.isReloading ?? false
+        );
+      }
 
       // Update voice chat speaking indicators
       if (voiceManagerRef.current) {

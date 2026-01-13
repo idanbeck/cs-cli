@@ -786,10 +786,11 @@ export function precomputeMapSpawnPoints(
   }
 
   const DIFFUSION_CYCLES = 50; // Number of diffusion iterations
-  const STEP_SIZE = 1.0; // How far to move per step
+  const STEP_SIZE = 0.25; // Reduced: smaller steps for tighter collision checks
   const WALL_BUFFER = 1.5; // Minimum distance from walls
   const REPULSION_RADIUS = 30.0; // Distance at which spawns repel each other
   const SPAWN_Y_BUFFER = 1.0;
+  const MAX_HEIGHT_CHANGE = 0.6; // Max Y change per step (stairs only, not walls)
 
   // Initialize spawn points from existing spawns, adjusted to ground
   const spawns: Vector3[] = [];
@@ -807,15 +808,28 @@ export function precomputeMapSpawnPoints(
 
   debugLog(`[SpawnDiffuse] Starting diffusion with ${spawns.length} spawns for ${DIFFUSION_CYCLES} cycles`);
 
-  // Check if a position is valid (has ground and wall clearance)
-  const isValidPosition = (pos: Vector3): { valid: boolean; groundY: number } => {
-    // Check for ground
+  // Check if a position is valid for diffusion movement
+  // currentY is the current spawn height - we reject moves that climb too high
+  const isValidMove = (pos: Vector3, currentY: number): { valid: boolean; groundY: number } => {
+    // Check for ground below the new position
     const groundCheck = findGroundBelow(new Vector3(pos.x, pos.y + 2, pos.z), mesh);
     if (!groundCheck.found) {
       return { valid: false, groundY: pos.y };
     }
 
-    // Check wall clearance in cardinal directions
+    // CRITICAL: Reject if ground is significantly higher than current position
+    // This prevents climbing up walls - only stairs/small steps allowed
+    const heightChange = groundCheck.groundY - currentY;
+    if (heightChange > MAX_HEIGHT_CHANGE) {
+      return { valid: false, groundY: groundCheck.groundY };
+    }
+
+    // Also reject if dropping too far (falling off ledges into void areas)
+    if (heightChange < -3.0) {
+      return { valid: false, groundY: groundCheck.groundY };
+    }
+
+    // Check wall clearance in cardinal directions from new ground position
     const rayOrigin = new Vector3(pos.x, groundCheck.groundY + 0.5, pos.z);
     const directions = [
       new Vector3(1, 0, 0),
@@ -840,6 +854,7 @@ export function precomputeMapSpawnPoints(
 
     for (let i = 0; i < spawns.length; i++) {
       const spawn = spawns[i];
+      const currentY = spawn.y;
 
       // Calculate repulsion force from all other spawns
       let forceX = 0;
@@ -868,9 +883,19 @@ export function precomputeMapSpawnPoints(
         forceX = (forceX / forceMag) * STEP_SIZE;
         forceZ = (forceZ / forceMag) * STEP_SIZE;
 
+        // Check for wall in movement direction before attempting move
+        const moveDir = new Vector3(forceX, 0, forceZ).normalize();
+        const rayOrigin = new Vector3(spawn.x, spawn.y + 0.5, spawn.z);
+        const wallCheck = raycastMesh(rayOrigin, moveDir, mesh, STEP_SIZE + 0.5);
+
+        if (wallCheck.hit) {
+          // Wall blocking movement - skip this move
+          continue;
+        }
+
         // Try to move in the repulsion direction
         const newPos = new Vector3(spawn.x + forceX, spawn.y, spawn.z + forceZ);
-        const check = isValidPosition(newPos);
+        const check = isValidMove(newPos, currentY);
 
         if (check.valid) {
           spawn.x = newPos.x;

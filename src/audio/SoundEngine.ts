@@ -90,7 +90,10 @@ export type SoundType =
   | 'pickup'
   | 'menu_select'
   | 'round_start'
-  | 'round_end';
+  | 'round_end'
+  | 'radio_go'
+  | 'radio_move_out'
+  | 'radio_lets_go';
 
 // Waveform generators
 type WaveformFn = (t: number, freq: number) => number;
@@ -265,6 +268,72 @@ const soundDefs: Record<SoundType, SoundDef | SoundDef[]> = {
     waveform: 'triangle',
     volume: 0.6,
   },
+  // Radio alert sounds - classic CS-style beeps/alerts for round start
+  // Three ascending beeps - classic "GO" signal
+  radio_go: [
+    {
+      duration: 0.08,
+      envelope: { attack: 0.005, decay: 0.02, sustain: 0.6, release: 0.03 },
+      frequency: 600,
+      waveform: 'square',
+      volume: 0.5,
+    },
+    {
+      duration: 0.08,
+      envelope: { attack: 0.005, decay: 0.02, sustain: 0.6, release: 0.03 },
+      frequency: 750,
+      waveform: 'square',
+      volume: 0.55,
+    },
+    {
+      duration: 0.15,
+      envelope: { attack: 0.005, decay: 0.03, sustain: 0.6, release: 0.08 },
+      frequency: 900,
+      waveform: 'square',
+      volume: 0.6,
+    },
+  ],
+  // Two-tone alert - urgent beep
+  radio_move_out: [
+    {
+      duration: 0.1,
+      envelope: { attack: 0.005, decay: 0.02, sustain: 0.6, release: 0.04 },
+      frequency: 800,
+      waveform: 'square',
+      volume: 0.55,
+    },
+    {
+      duration: 0.15,
+      envelope: { attack: 0.005, decay: 0.03, sustain: 0.6, release: 0.08 },
+      frequency: 1000,
+      waveform: 'square',
+      volume: 0.6,
+    },
+  ],
+  // Quick double-beep then sustained tone
+  radio_lets_go: [
+    {
+      duration: 0.06,
+      envelope: { attack: 0.005, decay: 0.015, sustain: 0.6, release: 0.02 },
+      frequency: 700,
+      waveform: 'square',
+      volume: 0.5,
+    },
+    {
+      duration: 0.06,
+      envelope: { attack: 0.005, decay: 0.015, sustain: 0.6, release: 0.02 },
+      frequency: 700,
+      waveform: 'square',
+      volume: 0.5,
+    },
+    {
+      duration: 0.2,
+      envelope: { attack: 0.01, decay: 0.05, sustain: 0.5, release: 0.1 },
+      frequency: 850,
+      waveform: 'triangle',
+      volume: 0.55,
+    },
+  ],
 };
 
 // Null writable stream to suppress speaker errors
@@ -533,4 +602,11 @@ export function playSound(sound: SoundType): void {
 
 export function playSoundAt(sound: SoundType, position: Vector3): void {
   getSoundEngine().playAt(sound, position);
+}
+
+// Play a random radio command (for round start)
+const radioCommands: SoundType[] = ['radio_go', 'radio_move_out', 'radio_lets_go'];
+export function playRandomRadioCommand(): void {
+  const command = radioCommands[Math.floor(Math.random() * radioCommands.length)];
+  getSoundEngine().play(command);
 }

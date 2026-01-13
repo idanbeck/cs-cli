@@ -35,6 +35,7 @@ export interface GameModeConfig {
 
   // Round timing
   freezeTime: number;         // Seconds for buy phase
+  firstRoundFreezeTime: number; // Shorter freeze for round 1 (no money to spend)
   roundTime: number;          // Seconds per round
   roundEndDelay: number;      // Seconds after round end
   warmupTime: number;         // Seconds for pre-match warmup
@@ -56,6 +57,7 @@ export const DEFAULT_COMPETITIVE_CONFIG: GameModeConfig = {
   roundsToWin: 7,             // First to 7 wins (MR13)
   maxRounds: 13,              // 13 rounds per half
   freezeTime: 15,             // 15 seconds for buy phase
+  firstRoundFreezeTime: 5,    // 5 seconds for round 1 (no money yet)
   roundTime: 115,
   roundEndDelay: 5,
   warmupTime: 0,
@@ -71,6 +73,7 @@ export const DEFAULT_DEATHMATCH_CONFIG: GameModeConfig = {
   roundsToWin: 10,            // First to 10 round wins
   maxRounds: 0,               // No max (no halftime)
   freezeTime: 15,             // 15 seconds for buy phase
+  firstRoundFreezeTime: 5,    // 5 seconds for round 1 (no money yet)
   roundTime: 120,
   roundEndDelay: 3,
   warmupTime: 0,
@@ -87,6 +90,7 @@ export const DEFAULT_SOLO_CONFIG: GameModeConfig = {
   roundsToWin: 0,             // No rounds
   maxRounds: 0,
   freezeTime: 0,              // No freeze
+  firstRoundFreezeTime: 0,    // No freeze
   roundTime: 0,               // Unlimited
   roundEndDelay: 0,
   warmupTime: 0,              // No warmup
@@ -148,6 +152,9 @@ export class GameMode {
   // Round kills for MVP tracking
   private roundKills: Map<string, number> = new Map();
 
+  // Phase change callback
+  public onPhaseChange: ((oldPhase: GamePhase, newPhase: GamePhase) => void) | null = null;
+
   constructor(config: GameModeConfig = DEFAULT_COMPETITIVE_CONFIG) {
     this.config = config;
   }
@@ -177,6 +184,7 @@ export class GameMode {
 
   // Start a new round (freeze phase)
   startRound(now: number): void {
+    const oldPhase = this.phase;
     this.phase = 'freeze';
     this.phaseStartTime = now;
     this.round.roundNumber++;
@@ -184,12 +192,19 @@ export class GameMode {
     this.round.roundWinReason = '';
     this.round.mvp = null;
     this.roundKills.clear();
+    if (this.onPhaseChange) {
+      this.onPhaseChange(oldPhase, 'freeze');
+    }
   }
 
   // End freeze phase, start live round
   endFreezePhase(now: number): void {
+    const oldPhase = this.phase;
     this.phase = 'live';
     this.phaseStartTime = now;
+    if (this.onPhaseChange) {
+      this.onPhaseChange(oldPhase, 'live');
+    }
   }
 
   // End current round
@@ -238,7 +253,7 @@ export class GameMode {
 
     switch (this.phase) {
       case 'freeze':
-        if (elapsed >= this.config.freezeTime) {
+        if (elapsed >= this.getEffectiveFreezeTime()) {
           this.endFreezePhase(now);
         }
         break;
@@ -454,10 +469,18 @@ export class GameMode {
 
   // ========== TIMING ==========
 
+  // Get effective freeze time for current round (shorter for round 1)
+  getEffectiveFreezeTime(): number {
+    if (this.round.roundNumber === 1) {
+      return this.config.firstRoundFreezeTime;
+    }
+    return this.config.freezeTime;
+  }
+
   getFreezeTimeRemaining(now: number): number {
     if (this.phase !== 'freeze') return 0;
     const elapsed = (now - this.phaseStartTime) / 1000;
-    return Math.max(0, this.config.freezeTime - elapsed);
+    return Math.max(0, this.getEffectiveFreezeTime() - elapsed);
   }
 
   getRoundTimeRemaining(now: number): number {
